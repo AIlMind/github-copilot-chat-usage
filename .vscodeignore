@@ -8,4 +8,5 @@ tsconfig.json
 *.vsix
 .DS_Store
 **/.DS_Store
+images/usage-screenshot.png
 node_modules/**/.cache/**
