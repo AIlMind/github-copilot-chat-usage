@@ -10,523 +10,511 @@
  */
 
 import {
-  SessionSummary,
-  UserMessageSummary,
-  ModelTurnSummary,
-  ToolCallSummary,
-  PromptComposition,
-  formatNumber,
-  formatAic,
-  formatDuration,
-  estimateTokens,
+    SessionSummary,
+    UserMessageSummary,
+    ModelTurnSummary,
+    ToolCallSummary,
+    PromptComposition,
+    formatNumber,
+    formatAic,
+    formatDuration,
+    estimateTokens,
 } from './parser';
 
 // ---- Public types (stable contract for consumers) ----
 
 export interface GraphMessage {
-  index: number;
-  content: string; // capped at 100 words
-  timestamp: number;
-  costAic: number;
-  inputTokens: number;
-  outputTokens: number;
-  cachedTokens: number;
-  totalTokens: number;
-  durationMs: number;
-  turnCount: number;
-  toolCallCount: number;
-  continuations: number;
-  turns: GraphTurn[];
+    index: number;
+    content: string; // capped at 100 words
+    timestamp: number;
+    costAic: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    totalTokens: number;
+    durationMs: number;
+    turnCount: number;
+    toolCallCount: number;
+    continuations: number;
+    turns: GraphTurn[];
 }
 
 export interface GraphTurn {
-  index: number;
-  model: string;
-  debugName: string;
-  costAic: number;
-  inputTokens: number;
-  outputTokens: number;
-  cachedTokens: number;
-  freshTokens: number;
-  cacheHitRatio: number;
-  durationMs: number;
-  ttftMs: number;
-  toolCalls: GraphToolCall[];
+    index: number;
+    model: string;
+    debugName: string;
+    costAic: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    freshTokens: number;
+    cacheHitRatio: number;
+    durationMs: number;
+    ttftMs: number;
+    toolCalls: GraphToolCall[];
 }
 
 export interface GraphToolCall {
-  name: string;
-  displayLabel: string;
-  durationMs: number;
-  isSubagent: boolean;
-  subagentCostAic?: number;
+    name: string;
+    displayLabel: string;
+    durationMs: number;
+    isSubagent: boolean;
+    source?: string;
+    toolKind?: string;
+    resultCount?: number;
+    subagentCostAic?: number;
 }
 
 export interface ToolUsageEntry {
-  name: string;
-  count: number;
-  totalDurationMs: number;
-  tier: 'heavy' | 'medium' | 'light' | 'never';
+    name: string;
+    count: number;
+    totalDurationMs: number;
+    tier: 'heavy' | 'medium' | 'light' | 'never';
 }
 
 export interface CommandEntry {
-  executable: string;
-  count: number;
+    executable: string;
+    count: number;
 }
 
 export interface SessionStats {
-  sessionId: string;
-  title?: string;
-  totalCostAic: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCachedTokens: number;
-  totalTokens: number;
-  totalDurationMs: number;
-  messageCount: number;
-  modelTurnCount: number;
-  toolCallCount: number;
-  avgCostPerMessage: number;
-  avgTurnsPerMessage: number;
-  cacheHitRatio: number;
+    sessionId: string;
+    title?: string;
+    totalCostAic: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalCachedTokens: number;
+    totalTokens: number;
+    totalDurationMs: number;
+    messageCount: number;
+    modelTurnCount: number;
+    toolCallCount: number;
+    avgCostPerMessage: number;
+    avgTurnsPerMessage: number;
+    cacheHitRatio: number;
 }
 
 export interface RiskFlag {
-  messageIndex: number;
-  turnIndex: number;
-  toolCall: string;
-  reason: string;
-  severity: 'low' | 'medium' | 'high';
+    messageIndex: number;
+    turnIndex: number;
+    toolCall: string;
+    reason: string;
+    severity: 'low' | 'medium' | 'high';
 }
 
 export interface GraphComparison {
-  sessionA: SessionStats;
-  sessionB: SessionStats;
-  costDelta: number;
-  tokenDelta: number;
-  turnDelta: number;
-  toolUsageDiff: { name: string; countA: number; countB: number }[];
-  commandDiff: { executable: string; countA: number; countB: number }[];
+    sessionA: SessionStats;
+    sessionB: SessionStats;
+    costDelta: number;
+    tokenDelta: number;
+    turnDelta: number;
+    toolUsageDiff: { name: string; countA: number; countB: number }[];
+    commandDiff: { executable: string; countA: number; countB: number }[];
 }
 
 // ---- SessionGraph class ----
 
 export class SessionGraph {
-  private readonly summary: SessionSummary;
+    private readonly summary: SessionSummary;
 
-  // Lazy caches
-  private _messages?: GraphMessage[];
-  private _toolUsage?: Map<string, ToolUsageEntry>;
-  private _commands?: CommandEntry[];
-  private _stats?: SessionStats;
-  private _risks?: RiskFlag[];
+    // Lazy caches
+    private _messages?: GraphMessage[];
+    private _toolUsage?: Map<string, ToolUsageEntry>;
+    private _commands?: CommandEntry[];
+    private _stats?: SessionStats;
+    private _risks?: RiskFlag[];
 
-  constructor(summary: SessionSummary) {
-    this.summary = summary;
-  }
-
-  /** Session-level aggregate statistics */
-  get stats(): SessionStats {
-    if (!this._stats) {
-      const s = this.summary;
-      const totalCost = s.totalNanoAiu / 1_000_000_000;
-      this._stats = {
-        sessionId: s.sessionId,
-        title: s.title,
-        totalCostAic: totalCost,
-        totalInputTokens: s.totalInputTokens,
-        totalOutputTokens: s.totalOutputTokens,
-        totalCachedTokens: s.totalCachedTokens,
-        totalTokens: s.totalTokens,
-        totalDurationMs: s.totalDurationMs,
-        messageCount: s.userMessages.length,
-        modelTurnCount: s.modelTurnCount,
-        toolCallCount: s.toolCallCount,
-        avgCostPerMessage: s.userMessages.length > 0 ? totalCost / s.userMessages.length : 0,
-        avgTurnsPerMessage: s.userMessages.length > 0 ? s.modelTurnCount / s.userMessages.length : 0,
-        cacheHitRatio: s.totalInputTokens > 0 ? s.totalCachedTokens / s.totalInputTokens : 0,
-      };
-    }
-    return this._stats;
-  }
-
-  /** All messages with turns and tool calls (text capped at 100 words) */
-  get messages(): GraphMessage[] {
-    if (!this._messages) {
-      this._messages = this.summary.userMessages.map((m, i) => this.buildGraphMessage(m, i));
-    }
-    return this._messages;
-  }
-
-  /** Get a specific message by index (0-based) */
-  getMessage(index: number): GraphMessage | undefined {
-    return this.messages[index];
-  }
-
-  /** Get messages in a range */
-  getMessages(from: number, to: number): GraphMessage[] {
-    return this.messages.slice(from, to);
-  }
-
-  /** Tool usage across the session, with tier classification */
-  get toolUsage(): Map<string, ToolUsageEntry> {
-    if (!this._toolUsage) {
-      this._toolUsage = this.computeToolUsage();
-    }
-    return this._toolUsage;
-  }
-
-  /** Tools sorted by usage count (descending) */
-  getToolsByUsage(): ToolUsageEntry[] {
-    return [...this.toolUsage.values()].sort((a, b) => b.count - a.count);
-  }
-
-  /** Tools that were never used (wasted context) */
-  getUnusedTools(): string[] {
-    return [...this.toolUsage.values()]
-      .filter((t) => t.tier === 'never')
-      .map((t) => t.name);
-  }
-
-  /** Terminal commands grouped by executable */
-  get commands(): CommandEntry[] {
-    if (!this._commands) {
-      this._commands = this.computeCommands();
-    }
-    return this._commands;
-  }
-
-  /** Identify risky operations */
-  get risks(): RiskFlag[] {
-    if (!this._risks) {
-      this._risks = this.computeRisks();
-    }
-    return this._risks;
-  }
-
-  /** Prompt composition info (tool sizes, system prompt sizes) */
-  get promptComposition(): PromptComposition | undefined {
-    return this.summary.promptComposition;
-  }
-
-  /**
-   * Serialize to a compact string for LLM context.
-   * Produces a structured text summary suitable for injection into a chat prompt.
-   */
-  serialize(options?: { includeMessages?: boolean; maxMessages?: number }): string {
-    const opts = { includeMessages: true, maxMessages: 30, ...options };
-    const lines: string[] = [];
-
-    const s = this.stats;
-    lines.push(`# Session: ${s.title || s.sessionId}`);
-    lines.push(`Cost: ${s.totalCostAic.toFixed(2)} AIC | Tokens: ${formatNumber(s.totalTokens)} (in: ${formatNumber(s.totalInputTokens)} out: ${formatNumber(s.totalOutputTokens)} cached: ${formatNumber(s.totalCachedTokens)})`);
-    lines.push(`Messages: ${s.messageCount} | Turns: ${s.modelTurnCount} | Tool Calls: ${s.toolCallCount} | LLM Time: ${formatDuration(s.totalDurationMs)}`);
-    lines.push(`Cache Hit: ${(s.cacheHitRatio * 100).toFixed(1)}% | Avg Cost/Message: ${s.avgCostPerMessage.toFixed(1)} AIC | Avg Turns/Message: ${s.avgTurnsPerMessage.toFixed(1)}`);
-    lines.push('');
-
-    // Tool usage
-    const tools = this.getToolsByUsage();
-    const used = tools.filter((t) => t.count > 0);
-    const unused = tools.filter((t) => t.count === 0);
-    if (used.length > 0) {
-      lines.push('## Tool Usage');
-      for (const t of used) {
-        lines.push(`- ${t.name}: ${t.count}× (${formatDuration(t.totalDurationMs)})`);
-      }
-      if (unused.length > 0) {
-        lines.push(`- [${unused.length} tools available but never used]`);
-      }
-      lines.push('');
+    constructor(summary: SessionSummary) {
+        this.summary = summary;
     }
 
-    // Commands
-    if (this.commands.length > 0) {
-      lines.push('## Commands');
-      for (const c of this.commands) {
-        lines.push(`- ${c.executable}: ${c.count}×`);
-      }
-      lines.push('');
-    }
-
-    // Risks
-    if (this.risks.length > 0) {
-      lines.push('## Risk Flags');
-      for (const r of this.risks) {
-        lines.push(`- [${r.severity}] Message ${r.messageIndex + 1}, Turn ${r.turnIndex + 1}: ${r.reason} (${r.toolCall})`);
-      }
-      lines.push('');
-    }
-
-    // Messages
-    if (opts.includeMessages) {
-      lines.push('## Messages');
-      const msgs = this.messages.slice(0, opts.maxMessages);
-      for (const msg of msgs) {
-        const cost = msg.costAic.toFixed(1);
-        lines.push(`### ${msg.index + 1}: "${msg.content}" [${cost} AIC | ${msg.turnCount}T ${msg.toolCallCount} tools]`);
-        for (const turn of msg.turns) {
-          const tools = turn.toolCalls.map((tc) => tc.displayLabel).join(', ');
-          lines.push(`  Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+    /** Session-level aggregate statistics */
+    get stats(): SessionStats {
+        if (!this._stats) {
+            const s = this.summary;
+            const totalCost = s.totalNanoAiu / 1_000_000_000;
+            this._stats = {
+                sessionId: s.sessionId,
+                title: s.title,
+                totalCostAic: totalCost,
+                totalInputTokens: s.totalInputTokens,
+                totalOutputTokens: s.totalOutputTokens,
+                totalCachedTokens: s.totalCachedTokens,
+                totalTokens: s.totalTokens,
+                totalDurationMs: s.totalDurationMs,
+                messageCount: s.userMessages.length,
+                modelTurnCount: s.modelTurnCount,
+                toolCallCount: s.toolCallCount,
+                avgCostPerMessage: s.userMessages.length > 0 ? totalCost / s.userMessages.length : 0,
+                avgTurnsPerMessage: s.userMessages.length > 0 ? s.modelTurnCount / s.userMessages.length : 0,
+                cacheHitRatio: s.totalInputTokens > 0 ? s.totalCachedTokens / s.totalInputTokens : 0,
+            };
         }
-      }
-      if (this.messages.length > opts.maxMessages) {
-        lines.push(`... ${this.messages.length - opts.maxMessages} more messages`);
-      }
+        return this._stats;
     }
 
-    return lines.join('\n');
-  }
-
-  // ---- Private computation methods ----
-
-  private buildGraphMessage(m: UserMessageSummary, index: number): GraphMessage {
-    return {
-      index,
-      content: capWords(m.content, 100),
-      timestamp: m.timestamp,
-      costAic: m.totalNanoAiu / 1_000_000_000,
-      inputTokens: m.totalInputTokens,
-      outputTokens: m.totalOutputTokens,
-      cachedTokens: m.totalCachedTokens,
-      totalTokens: m.totalTokens,
-      durationMs: m.totalDurationMs,
-      turnCount: m.modelTurns.length,
-      toolCallCount: m.toolCalls.length,
-      continuations: m.mergedMessages.length,
-      turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i)),
-    };
-  }
-
-  private buildGraphTurn(t: ModelTurnSummary, index: number): GraphTurn {
-    return {
-      index,
-      model: t.model,
-      debugName: t.debugName,
-      costAic: t.nanoAiu / 1_000_000_000,
-      inputTokens: t.inputTokens,
-      outputTokens: t.outputTokens,
-      cachedTokens: t.cachedTokens,
-      freshTokens: t.freshTokens,
-      cacheHitRatio: t.cacheHitRatio,
-      durationMs: t.durationMs,
-      ttftMs: t.ttftMs,
-      toolCalls: t.toolCalls.map((tc: ToolCallSummary) => ({
-        name: tc.name,
-        displayLabel: tc.displayLabel.slice(0, 80),
-        durationMs: tc.durationMs,
-        isSubagent: tc.isSubagent,
-        subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
-      })),
-    };
-  }
-
-  private computeToolUsage(): Map<string, ToolUsageEntry> {
-    const counts = new Map<string, { count: number; totalDurationMs: number }>();
-
-    for (const msg of this.summary.userMessages) {
-      for (const turn of msg.modelTurns) {
-        for (const tc of turn.toolCalls) {
-          const existing = counts.get(tc.name);
-          if (existing) {
-            existing.count++;
-            existing.totalDurationMs += tc.durationMs;
-          } else {
-            counts.set(tc.name, { count: 1, totalDurationMs: tc.durationMs });
-          }
+    /** All messages with turns and tool calls (text capped at 100 words) */
+    get messages(): GraphMessage[] {
+        if (!this._messages) {
+            this._messages = this.summary.userMessages.map((m, i) => this.buildGraphMessage(m, i));
         }
-      }
+        return this._messages;
     }
 
-    // Add tools from prompt composition that were never used
-    if (this.summary.promptComposition?.toolSets) {
-      for (const defs of Object.values(this.summary.promptComposition.toolSets)) {
-        for (const def of defs) {
-          if (!counts.has(def.name)) {
-            counts.set(def.name, { count: 0, totalDurationMs: 0 });
-          }
+    /** Get a specific message by index (0-based) */
+    getMessage(index: number): GraphMessage | undefined {
+        return this.messages[index];
+    }
+
+    /** Get messages in a range */
+    getMessages(from: number, to: number): GraphMessage[] {
+        return this.messages.slice(from, to);
+    }
+
+    /** Tool usage across the session, with tier classification */
+    get toolUsage(): Map<string, ToolUsageEntry> {
+        if (!this._toolUsage) {
+            this._toolUsage = this.computeToolUsage();
         }
-      }
+        return this._toolUsage;
     }
 
-    const result = new Map<string, ToolUsageEntry>();
-    for (const [name, data] of counts) {
-      const tier: ToolUsageEntry['tier'] =
-        data.count === 0 ? 'never' :
-        data.count <= 2 ? 'light' :
-        data.count < 5 ? 'medium' : 'heavy';
-
-      result.set(name, {
-        name,
-        count: data.count,
-        totalDurationMs: data.totalDurationMs,
-        tier,
-      });
+    /** Tools sorted by usage count (descending) */
+    getToolsByUsage(): ToolUsageEntry[] {
+        return [...this.toolUsage.values()].sort((a, b) => b.count - a.count);
     }
 
-    return result;
-  }
+    /** Tools that were never used (wasted context) */
+    getUnusedTools(): string[] {
+        return [...this.toolUsage.values()]
+            .filter(t => t.tier === 'never')
+            .map(t => t.name);
+    }
 
-  private computeCommands(): CommandEntry[] {
-    const counts = new Map<string, number>();
+    /** Terminal commands grouped by executable */
+    get commands(): CommandEntry[] {
+        if (!this._commands) {
+            this._commands = this.computeCommands();
+        }
+        return this._commands;
+    }
 
-    for (const msg of this.summary.userMessages) {
-      for (const turn of msg.modelTurns) {
-        for (const tc of turn.toolCalls) {
-          if (tc.name === 'run_in_terminal') {
-            const exe = extractExe(tc.displayLabel);
-            if (exe) {
-              counts.set(exe, (counts.get(exe) || 0) + 1);
+    /** Identify risky operations */
+    get risks(): RiskFlag[] {
+        if (!this._risks) {
+            this._risks = this.computeRisks();
+        }
+        return this._risks;
+    }
+
+    /** Prompt composition info (tool sizes, system prompt sizes) */
+    get promptComposition(): PromptComposition | undefined {
+        return this.summary.promptComposition;
+    }
+
+    /**
+     * Serialize to a compact string for LLM context.
+     * Produces a structured text summary suitable for injection into a chat prompt.
+     */
+    serialize(options?: { includeMessages?: boolean; maxMessages?: number }): string {
+        const opts = { includeMessages: true, maxMessages: 30, ...options };
+        const lines: string[] = [];
+
+        const s = this.stats;
+        lines.push(`# Session: ${s.title || s.sessionId}`);
+        lines.push(`Cost: ${s.totalCostAic.toFixed(2)} AIC | Tokens: ${formatNumber(s.totalTokens)} (in:${formatNumber(s.totalInputTokens)} out:${formatNumber(s.totalOutputTokens)} cache:${formatNumber(s.totalCachedTokens)})`);
+        lines.push(`Messages: ${s.messageCount} | Turns: ${s.modelTurnCount} | Tool Calls: ${s.toolCallCount} | LLM Time: ${formatDuration(s.totalDurationMs)}`);
+        lines.push(`Cache Hit: ${(s.cacheHitRatio * 100).toFixed(1)}% | Avg Cost/Message: ${s.avgCostPerMessage.toFixed(1)} AIC`);
+        lines.push('');
+
+        // Tool usage
+        const tools = this.getToolsByUsage();
+        const used = tools.filter(t => t.count > 0);
+        const unused = tools.filter(t => t.count === 0);
+        if (used.length > 0) {
+            lines.push('## Tool Usage');
+            for (const t of used) {
+                lines.push(`  ${t.name}: ${t.count}x (${formatDuration(t.totalDurationMs)})`);
             }
-          }
-        }
-      }
-    }
-
-    return [...counts.entries()]
-      .map(([executable, count]) => ({ executable, count }))
-      .sort((a, b) => b.count - a.count);
-  }
-
-  private computeRisks(): RiskFlag[] {
-    const risks: RiskFlag[] = [];
-    const riskyPatterns: { pattern: RegExp; reason: string; severity: RiskFlag['severity'] }[] = [
-      { pattern: /--force|-f|--hard|--no-verify/i, reason: 'Force/unsafe flag used', severity: 'high' },
-      { pattern: /rm\s+-rf|Remove-Item.*-Recurse/i, reason: 'Recursive delete', severity: 'high' },
-      { pattern: /drop\s+table|drop\s+database/i, reason: 'Database drop command', severity: 'high' },
-      { pattern: /git\s+push/i, reason: 'Git push (publishes code)', severity: 'medium' },
-      { pattern: /git\s+reset/i, reason: 'Git reset (may lose work)', severity: 'medium' },
-      { pattern: /npm\s+publish|npx\s+publish/i, reason: 'Package publish', severity: 'medium' },
-      { pattern: /curl|wget|Invoke-WebRequest/i, reason: 'Network request', severity: 'low' },
-    ];
-
-    for (const msg of this.messages) {
-      for (const turn of msg.turns) {
-        for (const tc of turn.toolCalls) {
-          if (tc.name === 'run_in_terminal') {
-            for (const { pattern, reason, severity } of riskyPatterns) {
-              if (pattern.test(tc.displayLabel)) {
-                risks.push({
-                  messageIndex: msg.index,
-                  turnIndex: turn.index,
-                  toolCall: tc.displayLabel,
-                  reason,
-                  severity,
-                });
-              }
+            if (unused.length > 0) {
+                lines.push(`  [${unused.length} tools available but never used]`);
             }
-          }
+            lines.push('');
         }
-      }
+
+        // Commands
+        if (this.commands.length > 0) {
+            lines.push('## Commands');
+            for (const c of this.commands) {
+                lines.push(`  ${c.executable}: ${c.count}x`);
+            }
+            lines.push('');
+        }
+
+        // Risks
+        if (this.risks.length > 0) {
+            lines.push('## Risk Flags');
+            for (const r of this.risks) {
+                lines.push(`  [${r.severity}] Message ${r.messageIndex + 1}, Turn ${r.turnIndex + 1}: ${r.reason} (${r.toolCall})`);
+            }
+            lines.push('');
+        }
+
+        // Messages
+        if (opts.includeMessages) {
+            lines.push('## Messages');
+            const msgs = this.messages.slice(0, opts.maxMessages);
+            for (const msg of msgs) {
+                const cost = msg.costAic.toFixed(1);
+                lines.push(`### ${msg.index + 1}: "${msg.content}" [${cost} AIC | ${msg.turnCount} turns | ${msg.toolCallCount} tool calls]`);
+                for (const turn of msg.turns) {
+                    const tools = turn.toolCalls
+                        .map(tc => tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel)
+                        .join(', ');
+                    lines.push(`  Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+                }
+            }
+            if (this.messages.length > opts.maxMessages) {
+                lines.push(`  ... ${this.messages.length - opts.maxMessages} more messages`);
+            }
+        }
+
+        return lines.join('\n');
     }
 
-    return risks;
-  }
+    // ---- Private computation methods ----
+
+    private buildGraphMessage(m: UserMessageSummary, index: number): GraphMessage {
+        return {
+            index,
+            content: capWords(m.content, 100),
+            timestamp: m.timestamp,
+            costAic: m.totalNanoAiu / 1_000_000_000,
+            inputTokens: m.totalInputTokens,
+            outputTokens: m.totalOutputTokens,
+            cachedTokens: m.totalCachedTokens,
+            totalTokens: m.totalTokens,
+            durationMs: m.totalDurationMs,
+            turnCount: m.modelTurns.length,
+            toolCallCount: m.toolCalls.length,
+            continuations: m.mergedMessages.length,
+            turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i)),
+        };
+    }
+
+    private buildGraphTurn(t: ModelTurnSummary, index: number): GraphTurn {
+        return {
+            index,
+            model: t.model,
+            debugName: t.debugName,
+            costAic: t.nanoAiu / 1_000_000_000,
+            inputTokens: t.inputTokens,
+            outputTokens: t.outputTokens,
+            cachedTokens: t.cachedTokens,
+            freshTokens: t.freshTokens,
+            cacheHitRatio: t.cacheHitRatio,
+            durationMs: t.durationMs,
+            ttftMs: t.ttftMs,
+            toolCalls: t.toolCalls.map(tc => ({
+                name: tc.name,
+                displayLabel: tc.displayLabel.slice(0, 80),
+                durationMs: tc.durationMs,
+                isSubagent: tc.isSubagent,
+                source: tc.source,
+                toolKind: tc.toolKind,
+                resultCount: tc.resultCount,
+                subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
+            })),
+        };
+    }
+
+    private computeToolUsage(): Map<string, ToolUsageEntry> {
+        const counts = new Map<string, { count: number; totalDurationMs: number }>();
+
+        for (const msg of this.summary.userMessages) {
+            for (const turn of msg.modelTurns) {
+                for (const tc of turn.toolCalls) {
+                    const existing = counts.get(tc.name);
+                    if (existing) {
+                        existing.count++;
+                        existing.totalDurationMs += tc.durationMs;
+                    } else {
+                        counts.set(tc.name, { count: 1, totalDurationMs: tc.durationMs });
+                    }
+                }
+            }
+        }
+
+        // Add tools from prompt composition that were never used
+        if (this.summary.promptComposition) {
+            for (const defs of Object.values(this.summary.promptComposition.toolSets)) {
+                for (const def of defs) {
+                    if (!counts.has(def.name)) {
+                        counts.set(def.name, { count: 0, totalDurationMs: 0 });
+                    }
+                }
+            }
+        }
+
+        const result = new Map<string, ToolUsageEntry>();
+        for (const [name, data] of counts) {
+            const tier: ToolUsageEntry['tier'] =
+                data.count === 0 ? 'never' :
+                data.count <= 2 ? 'light' :
+                data.count <= 5 ? 'medium' : 'heavy';
+            result.set(name, { name, count: data.count, totalDurationMs: data.totalDurationMs, tier });
+        }
+        return result;
+    }
+
+    private computeCommands(): CommandEntry[] {
+        const counts = new Map<string, number>();
+
+        for (const msg of this.summary.userMessages) {
+            for (const turn of msg.modelTurns) {
+                for (const tc of turn.toolCalls) {
+                    if (tc.name === 'run_in_terminal') {
+                        const exe = extractExe(tc.displayLabel);
+                        if (exe) {
+                            counts.set(exe, (counts.get(exe) || 0) + 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        return [...counts.entries()]
+            .map(([executable, count]) => ({ executable, count }))
+            .sort((a, b) => b.count - a.count);
+    }
+
+    private computeRisks(): RiskFlag[] {
+        const risks: RiskFlag[] = [];
+        const riskyPatterns: { pattern: RegExp; reason: string; severity: RiskFlag['severity'] }[] = [
+            { pattern: /--force|--hard|--no-verify/i, reason: 'Force/unsafe flag used', severity: 'high' },
+            { pattern: /rm\s+-rf|Remove-Item.*-Recurse/i, reason: 'Recursive delete', severity: 'high' },
+            { pattern: /drop\s+table|drop\s+database/i, reason: 'Database drop command', severity: 'high' },
+            { pattern: /git\s+push/i, reason: 'Git push (publishes code)', severity: 'medium' },
+            { pattern: /git\s+reset/i, reason: 'Git reset (may lose work)', severity: 'medium' },
+            { pattern: /npm\s+publish|npx\s+publish/i, reason: 'Package publish', severity: 'medium' },
+            { pattern: /curl|wget|Invoke-WebRequest/i, reason: 'Network request', severity: 'low' },
+        ];
+
+        for (const msg of this.messages) {
+            for (const turn of msg.turns) {
+                for (const tc of turn.toolCalls) {
+                    if (tc.name === 'run_in_terminal') {
+                        for (const { pattern, reason, severity } of riskyPatterns) {
+                            if (pattern.test(tc.displayLabel)) {
+                                risks.push({
+                                    messageIndex: msg.index,
+                                    turnIndex: turn.index,
+                                    toolCall: tc.displayLabel,
+                                    reason,
+                                    severity,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return risks;
+    }
 }
 
 // ---- Comparison ----
 
 export function compareGraphs(a: SessionGraph, b: SessionGraph): GraphComparison {
-  const sa = a.stats;
-  const sb = b.stats;
+    const sa = a.stats;
+    const sb = b.stats;
 
-  // Tool usage diff
-  const allTools = new Set([...a.toolUsage.keys(), ...b.toolUsage.keys()]);
-  const toolUsageDiff: GraphComparison['toolUsageDiff'] = [];
-
-  for (const name of allTools) {
-    const countA = a.toolUsage.get(name)?.count ?? 0;
-    const countB = b.toolUsage.get(name)?.count ?? 0;
-
-    if (countA !== countB) {
-      toolUsageDiff.push({ name, countA, countB });
+    // Tool usage diff
+    const allTools = new Set([...a.toolUsage.keys(), ...b.toolUsage.keys()]);
+    const toolUsageDiff: GraphComparison['toolUsageDiff'] = [];
+    for (const name of allTools) {
+        const countA = a.toolUsage.get(name)?.count ?? 0;
+        const countB = b.toolUsage.get(name)?.count ?? 0;
+        if (countA !== countB) {
+            toolUsageDiff.push({ name, countA, countB });
+        }
     }
-  }
+    toolUsageDiff.sort((a, b) => Math.abs(b.countB - b.countA) - Math.abs(a.countB - a.countA));
 
-  toolUsageDiff.sort((a, b) => Math.abs(b.countB - b.countA) - Math.abs(a.countB - a.countA));
-
-  // Command diff
-  const cmdMapA = new Map(a.commands.map(c => [c.executable, c.count]));
-  const cmdMapB = new Map(b.commands.map(c => [c.executable, c.count]));
-  const allCmds = new Set([...cmdMapA.keys(), ...cmdMapB.keys()]);
-  const commandDiff: GraphComparison['commandDiff'] = [];
-
-  for (const exe of allCmds) {
-    const cA = cmdMapA.get(exe) ?? 0;
-    const cB = cmdMapB.get(exe) ?? 0;
-
-    if (cA !== cB) {
-      commandDiff.push({ executable: exe, countA: cA, countB: cB });
+    // Command diff
+    const cmdMapA = new Map(a.commands.map(c => [c.executable, c.count]));
+    const cmdMapB = new Map(b.commands.map(c => [c.executable, c.count]));
+    const allCmds = new Set([...cmdMapA.keys(), ...cmdMapB.keys()]);
+    const commandDiff: GraphComparison['commandDiff'] = [];
+    for (const exe of allCmds) {
+        const cA = cmdMapA.get(exe) ?? 0;
+        const cB = cmdMapB.get(exe) ?? 0;
+        if (cA !== cB) {
+            commandDiff.push({ executable: exe, countA: cA, countB: cB });
+        }
     }
-  }
 
-  return {
-    sessionA: sa,
-    sessionB: sb,
-    costDelta: sb.totalCostAic - sa.totalCostAic,
-    tokenDelta: sb.totalTokens - sa.totalTokens,
-    turnDelta: sb.modelTurnCount - sa.modelTurnCount,
-    toolUsageDiff,
-    commandDiff,
-  };
+    return {
+        sessionA: sa,
+        sessionB: sb,
+        costDelta: sb.totalCostAic - sa.totalCostAic,
+        tokenDelta: sb.totalTokens - sa.totalTokens,
+        turnDelta: sb.modelTurnCount - sa.modelTurnCount,
+        toolUsageDiff,
+        commandDiff,
+    };
 }
 
 /** Serialize a comparison for LLM context */
 export function serializeComparison(cmp: GraphComparison): string {
-  const lines: string[] = [];
-
-  lines.push(`# Session Comparison`);
-  lines.push(`## Session A: ${cmp.sessionA.title || cmp.sessionA.sessionId}`);
-  lines.push(`  Cost: ${cmp.sessionA.totalCostAic.toFixed(2)} AIC | Messages: ${cmp.sessionA.messageCount} | Turns: ${cmp.sessionA.modelTurnCount}`);
-  lines.push(`## Session B: ${cmp.sessionB.title || cmp.sessionB.sessionId}`);
-  lines.push(`  Cost: ${cmp.sessionB.totalCostAic.toFixed(2)} AIC | Messages: ${cmp.sessionB.messageCount} | Turns: ${cmp.sessionB.modelTurnCount}`);
-  lines.push('');
-  lines.push(`## Deltas`);
-  lines.push(`  Cost: ${cmp.costDelta >= 0 ? '+' : ''}${cmp.costDelta.toFixed(2)} AIC`);
-  lines.push(`  Tokens: ${cmp.tokenDelta >= 0 ? '+' : ''}${formatNumber(cmp.tokenDelta)}`);
-  lines.push(`  Turns: ${cmp.turnDelta >= 0 ? '+' : ''}${cmp.turnDelta}`);
-
-  if (cmp.toolUsageDiff.length > 0) {
+    const lines: string[] = [];
+    lines.push(`# Session Comparison`);
+    lines.push(`## Session A: ${cmp.sessionA.title || cmp.sessionA.sessionId}`);
+    lines.push(`  Cost: ${cmp.sessionA.totalCostAic.toFixed(2)} AIC | Messages: ${cmp.sessionA.messageCount} | Turns: ${cmp.sessionA.modelTurnCount}`);
+    lines.push(`## Session B: ${cmp.sessionB.title || cmp.sessionB.sessionId}`);
+    lines.push(`  Cost: ${cmp.sessionB.totalCostAic.toFixed(2)} AIC | Messages: ${cmp.sessionB.messageCount} | Turns: ${cmp.sessionB.modelTurnCount}`);
     lines.push('');
-    lines.push('## Tool Usage Differences');
+    lines.push(`## Deltas`);
+    lines.push(`  Cost: ${cmp.costDelta >= 0 ? '+' : ''}${cmp.costDelta.toFixed(2)} AIC`);
+    lines.push(`  Tokens: ${cmp.tokenDelta >= 0 ? '+' : ''}${formatNumber(cmp.tokenDelta)}`);
+    lines.push(`  Turns: ${cmp.turnDelta >= 0 ? '+' : ''}${cmp.turnDelta}`);
 
-    for (const d of cmp.toolUsageDiff.slice(0, 15)) {
-      lines.push(`  ${d.name}: A=${d.countA} B=${d.countB} (${d.countB - d.countA >= 0 ? '+' : ''}${d.countB - d.countA})`);
+    if (cmp.toolUsageDiff.length > 0) {
+        lines.push('');
+        lines.push('## Tool Usage Differences');
+        for (const d of cmp.toolUsageDiff.slice(0, 15)) {
+            lines.push(`  ${d.name}: A=${d.countA} B=${d.countB} (${d.countB - d.countA >= 0 ? '+' : ''}${d.countB - d.countA})`);
+        }
     }
-  }
 
-  if (cmp.commandDiff.length > 0) {
-    lines.push('');
-    lines.push('## Command Differences');
-
-    for (const d of cmp.commandDiff) {
-      lines.push(`  ${d.executable}: A=${d.countA} B=${d.countB}`);
+    if (cmp.commandDiff.length > 0) {
+        lines.push('');
+        lines.push('## Command Differences');
+        for (const d of cmp.commandDiff) {
+            lines.push(`  ${d.executable}: A=${d.countA} B=${d.countB}`);
+        }
     }
-  }
 
-  return lines.join('\n');
+    return lines.join('\n');
 }
 
 // ---- Utilities ----
 
 /** Cap text at N words */
 function capWords(text: string, maxWords: number): string {
-  const words = text.split(/\s+/);
-  if (words.length <= maxWords) { return text; }
-  return words.slice(0, maxWords).join(' ') + '...';
+    const words = text.split(/\s+/);
+    if (words.length <= maxWords) { return text; }
+    return words.slice(0, maxWords).join(' ') + '…';
 }
 
 /** Extract executable from a "Ran: ..." display label */
 function extractExe(displayLabel: string): string | undefined {
-  const match = displayLabel.match(/^Ran:\s*(?:cd\s+[^;]+;\s*)?(.+)/);
-  if (!match) { return undefined; }
-
-  let cmd = match[1].trim();
-  const assignMatch = cmd.match(/^\S+\s*=\s*(.+)/);
-
-  if (assignMatch) { cmd = assignMatch[1].trim(); }
-
-  const exe = cmd.split(/\s+/)[0].replace(/['"]/g, '');
-  if (exe.startsWith('$') || exe.startsWith('(') || exe.startsWith('{') || exe === '') { return undefined; }
-
-  return exe;
+    const match = displayLabel.match(/^Ran:\s*(?:cd\s+[^;]+;\s*)?(.+)/);
+    if (!match) { return undefined; }
+    let cmd = match[1].trim();
+    const assignMatch = cmd.match(/^\$\w+\s*=\s*(.+)/);
+    if (assignMatch) { cmd = assignMatch[1].trim(); }
+    const exe = cmd.split(/\s+/)[0].replace(/['"]/g, '');
+    if (exe.startsWith('$') || exe.startsWith('(') || exe.startsWith('{') || exe === '') { return undefined; }
+    return exe;
 }

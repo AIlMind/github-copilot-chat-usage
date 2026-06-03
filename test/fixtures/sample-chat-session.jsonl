@@ -3,3 +3,4 @@
 {"kind":2,"k":["requests"],"v":[{"requestId":"request-1","timestamp":1710000000100,"agent":{"name":"chat"},"modelId":"gpt-4.1","responseId":"response-1","message":{"text":"Enable chat debug view steps","parts":[{"text":"Enable chat debug view steps"}]},"completionTokens":42,"response":[]}]}
 {"kind":1,"k":["requests",0,"elapsedMs"],"v":1234}
 {"kind":2,"k":["requests",0,"response"],"v":[{"kind":"toolInvocationSerialized","toolId":"copilot_findTextInFiles","toolCallId":"tool-1","isComplete":true,"invocationMessage":{"value":"Searching files"},"pastTenseMessage":{"value":"Searched files"}},{"value":"Done"}]}
+{"kind":2,"k":["requests"],"v":[{"requestId":"request-2","timestamp":1710000010100,"agent":{"name":"chat"},"modelId":"gpt-4.1","message":{"text":"Can you tell me how the code works?","parts":[{"text":"Can you tell me how the code works?"}]},"response":[]}]}

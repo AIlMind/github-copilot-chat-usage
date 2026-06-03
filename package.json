@@ -5,6 +5,10 @@
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
   "version": "0.1.0",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ailmind/github-copilot-chat-usage.git"
+  },
   "engines": {
     "vscode": "^1.101.0"
   },
@@ -69,7 +73,7 @@
     "viewsWelcome": [
       {
         "view": "copilotUsageTree",
-        "contents": "No Copilot Chat debug logs found.\n\nTo use this extension, enable debug log file logging:\n\n...",
+        "contents": "No Copilot Chat debug logs found.\n\nTo use this extension, enable debug log file logging:\n\n1. Open Settings (Ctrl+,)\n2. Search for `github.copilot.chat.agentDebugLog.fileLogging.enabled`\n3. Set it to **true**\n4. Start a new Copilot Chat session\n5. Click Refresh above\n\n[Open Settings](command:workbench.action.openSettings?%22github.copilot.chat.agentDebugLog.fileLogging.enabled%22)",
         "when": "!copilotUsageTracker.hasSession"
       }
     ],
@@ -78,7 +82,7 @@
         "id": "copilot-usage-tracker.usage",
         "fullName": "Usage Analyzer",
         "name": "usage",
-        "description": "Analyze Copilot chat session data - costs, tool calls, commands, patterns. Ask about any session.",
+        "description": "Analyze Copilot chat session data — costs, tool calls, commands, patterns. Ask about any session.",
         "isSticky": false
       }
     ],
@@ -88,7 +92,7 @@
         "tags": ["copilot", "usage", "sessions"],
         "toolReferenceName": "searchSessions",
         "displayName": "Search Chat Sessions",
-        "modelDescription": "Search recent Copilot Chat sessions by keyword (supports multiple words as OR match). Always returns the last 2 days of sessions ...",
+        "modelDescription": "Search recent Copilot Chat sessions by keyword (supports multiple words as OR match). Always returns the last 2 days of sessions as a safety net alongside search results. Use this FIRST before usage-get-graph unless the user explicitly says 'this session' or 'the current one'. Returns session IDs you can pass to usage-get-graph.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -112,7 +116,7 @@
         "tags": ["copilot", "usage", "analysis"],
         "toolReferenceName": "getGraph",
         "displayName": "Get Session Graph",
-        "modelDescription": "Get the full data graph for a Copilot Chat session. Returns stats, messages, tool calls, commands, and costs.",
+        "modelDescription": "Get the full data graph for a Copilot Chat session. Returns stats, messages, tool calls, commands, and costs. Omit sessionId only when the user says 'this session' or 'the loaded one'. Otherwise call usage-search-sessions first to get the correct session ID. Analyze the returned data for risks, patterns, waste, repeated terminal commands, and tool usage.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -149,22 +153,15 @@
           "minimum": 1,
           "maximum": 12,
           "description": "Maximum recursion depth when scanning configured and default log roots."
-        },
-        "copilotUsageTracker.maxIndexedFiles": {
-          "type": "number",
-          "default": 250,
-          "minimum": 20,
-          "maximum": 5000,
-          "description": "Maximum candidate log files to index before sorting by modification time."
         }
       }
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc --watch -p ./",
     "test": "npm run compile && node test/parser.test.js",
-    "vscode:prepublish": "npm run compile",
     "package": "vsce package"
   },
   "devDependencies": {

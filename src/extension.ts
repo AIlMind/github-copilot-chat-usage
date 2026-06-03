@@ -10,7 +10,6 @@ import {
     ToolDefinitionSize,
     findSiblingChatSessionLog,
     parseCopilotSessionFile,
-    readEntriesIncremental,
     quickPeekHasBillingData,
     formatNumber,
     formatAic,
@@ -18,9 +17,6 @@ import {
     estimateTokens,
 } from './parser';
 import { setCurrentGraph, registerChatParticipant } from './participant';
-
-// Keeps this helper referenced when parser.ts exports it but this file only needs it indirectly.
-void readEntriesIncremental;
 
 /**
  * Title priority levels (higher = better):
@@ -34,6 +30,8 @@ interface TitleEntry {
     title: string;
     priority: number;
 }
+
+const AI_CREDITS_DOCS_URI = vscode.Uri.parse('https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals');
 
 function pathExists(candidate: string | undefined): candidate is string {
     return !!candidate && fs.existsSync(candidate);
@@ -54,6 +52,7 @@ function getWorkspaceStorageRoots(): string[] {
         pushUnique(roots, path.join(appDataPath, 'Code', 'User', 'workspaceStorage'));
         pushUnique(roots, path.join(appDataPath, 'Code - Insiders', 'User', 'workspaceStorage'));
         pushUnique(roots, path.join(appDataPath, 'VSCodium', 'User', 'workspaceStorage'));
+        pushUnique(roots, path.join(appDataPath, 'Cursor', 'User', 'workspaceStorage'));
     }
 
     if (home) {
@@ -135,7 +134,8 @@ function buildTitleCache(): Map<string, TitleEntry> {
 
                         const filePath = path.join(chatSessionsDir, file);
                         try {
-                            // Read entire file and search for customTitle line.
+                            // Read entire file and search for customTitle line
+                            // (customTitle can be far into the file for long sessions)
                             const content = fs.readFileSync(filePath, 'utf-8');
                             const lastIdx = content.lastIndexOf('"customTitle"');
                             if (lastIdx >= 0) {
@@ -168,7 +168,7 @@ function buildTitleCache(): Map<string, TitleEntry> {
                         if (!fs.existsSync(mainJsonl)) { continue; }
 
                         try {
-                            // Read first 4KB to find first user_message or debugName.
+                            // Read first 4KB to find first user_message or debugName
                             const fd = fs.openSync(mainJsonl, 'r');
                             const buf = Buffer.alloc(4096);
                             const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
@@ -188,7 +188,6 @@ function buildTitleCache(): Map<string, TitleEntry> {
                                             cache.set(sessionId, { title: name, priority: 1 });
                                         }
                                     }
-
                                     // Priority 2: first user message
                                     if (obj.type === 'user_message' && obj.attrs?.content) {
                                         const content = obj.attrs.content.slice(0, 60).replace(/[\r\n]+/g, ' ').trim();
@@ -205,7 +204,6 @@ function buildTitleCache(): Map<string, TitleEntry> {
             }
         }
     }
-
     return cache;
 }
 
@@ -226,10 +224,6 @@ function invalidateTitleCache(): void {
 function resolveSessionTitle(sessionId: string): string | undefined {
     const entry = getTitleCache().get(sessionId);
     return entry?.title;
-}
-
-function findDebugLogDir(): string | undefined {
-    return findAllDebugLogDirs()[0];
 }
 
 function findAllDebugLogDirs(): string[] {
@@ -289,10 +283,25 @@ function findSessionsInDir(debugLogsDir: string): SessionCandidate[] {
             }
         }
     }
-
     // Sort by most recent first
     sessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
     return sessions;
+}
+
+function safeQuickPeekHasBillingData(file: string): boolean {
+    try {
+        return quickPeekHasBillingData(file);
+    } catch {
+        return false;
+    }
+}
+
+function applyResolvedTitle(summary: SessionSummary): void {
+    summary.title = resolveSessionTitle(summary.sessionId) || summary.title;
+}
+
+function parseSessionCandidate(candidate: SessionCandidate) {
+    return parseCopilotSessionFile(candidate.mainJsonl);
 }
 
 // ---- Tree View ----
@@ -352,7 +361,6 @@ function getCommandGroups(message: UserMessageSummary): { name: string; count: n
             }
         }
     }
-
     return [...counts.entries()]
         .map(([name, count]) => ({ name, count }))
         .sort((a, b) => b.count - a.count);
@@ -373,7 +381,6 @@ function getSessionCommandGroups(summary: SessionSummary): { name: string; count
             }
         }
     }
-
     return [...counts.entries()]
         .map(([name, count]) => ({ name, count }))
         .sort((a, b) => b.count - a.count);
@@ -383,50 +390,15 @@ function extractCommandName(displayLabel: string): string | undefined {
     const match = displayLabel.match(/^Ran:\s*(?:cd\s+[^;]+;\s*)?(.+)/);
     if (!match) { return undefined; }
     let cmd = match[1].trim();
-
     // Handle PowerShell variable assignments: $var = Command ...
     const assignMatch = cmd.match(/^\$\w+\s*=\s*(.+)/);
     if (assignMatch) {
         cmd = assignMatch[1].trim();
     }
-
-    const exe = cmd.split(/\s+/)[0].replace(/["']/g, '');
+    const exe = cmd.split(/\s+/)[0].replace(/['"]/g, '');
     // Skip remaining inline expressions that aren't real commands
     if (exe.startsWith('$') || exe.startsWith('(') || exe.startsWith('{') || exe === '') { return undefined; }
     return exe;
-}
-
-function asAny<T = any>(value: unknown): T {
-    return value as T;
-}
-
-function getToolDefinitions(source: unknown): ToolDefinitionSize[] {
-    const raw = asAny(source).toolDefinitions ?? asAny(source).toolDefinitionSizes ?? [];
-    return Array.isArray(raw) ? raw as ToolDefinitionSize[] : [];
-}
-
-function getToolDefinitionName(def: ToolDefinitionSize): string {
-    const d = asAny(def);
-    return String(d.name ?? d.toolName ?? d.label ?? d.id ?? '(tool)');
-}
-
-function getToolDefinitionTokenCount(def: ToolDefinitionSize): number {
-    const d = asAny(def);
-    const direct = d.tokens ?? d.tokenCount ?? d.estimatedTokens ?? d.estimateTokens ?? d.inputTokens ?? d.sizeTokens;
-    if (typeof direct === 'number') { return direct; }
-
-    const text = d.schema ?? d.definition ?? d.description ?? d.raw ?? JSON.stringify(d);
-    return estimateTokens(String(text ?? ''));
-}
-
-function getMergedMessageText(info: MergedMessageInfo): string {
-    const i = asAny(info);
-    return String(i.content ?? i.message ?? i.text ?? i.prompt ?? '(merged message)');
-}
-
-function compactLabel(text: string, maxLength: number): string {
-    const normalized = text.replace(/[\r\n]+/g, ' ').trim();
-    return normalized.length > maxLength ? normalized.slice(0, maxLength - 1) + '…' : normalized;
 }
 
 class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
@@ -449,7 +421,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     titleDisplay,
                     vscode.TreeItemCollapsibleState.Expanded
                 );
-                item.description = `${formatAic(s.totalNanoAiu)} AIC | ${formatNumber(s.totalTokens)} tokens | ${s.modelTurnCount} turns`;
+                item.description = `${formatAic(s.totalNanoAiu)} AIC | ${formatNumber(s.totalTokens)} tokens | ${s.userMessages.length} messages`;
                 item.iconPath = new vscode.ThemeIcon('graph');
                 item.tooltip = [
                     `Session: ${s.sessionId}`,
@@ -464,7 +436,6 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 ].join('\n');
                 return item;
             }
-
             case 'userMessage': {
                 const m = element.message;
                 const mergedNote = m.mergedMessages.length > 0
@@ -474,8 +445,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const filled = aic >= 2000 ? 5 : aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
                 const meter = aic >= 2000
                     ? '✦✦✦✦✦'
-                    : '■'.repeat(filled) + '▫'.repeat(5 - filled);
-
+                    : '■'.repeat(filled) + '□'.repeat(5 - filled);
                 // Fixed-width label: pad/truncate to 28 chars so descriptions align
                 const rawPreview = (m.content || '(empty)') + mergedNote;
                 const label = rawPreview.length > 28 ? rawPreview.slice(0, 27) + '…' : rawPreview.padEnd(28);
@@ -487,8 +457,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 item.iconPath = new vscode.ThemeIcon('comment');
                 item.tooltip = [
                     `User Message ${element.index + 1}`,
-                    `${m.content}`,
-                    m.mergedMessages.length > 0 ? `(includes ${m.mergedMessages.length} merged continuation messages${m.mergedMessages.length > 1 ? 's' : ''})` : '',
+                    `"${m.content}"`,
+                    m.mergedMessages.length > 0 ? `(includes ${m.mergedMessages.length} merged continuation message${m.mergedMessages.length > 1 ? 's' : ''})` : '',
                     `---`,
                     `Input Tokens: ${formatNumber(m.totalInputTokens)}`,
                     `Output Tokens: ${formatNumber(m.totalOutputTokens)}`,
@@ -501,7 +471,6 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 ].filter(Boolean).join('\n');
                 return item;
             }
-
             case 'turnsGroup': {
                 const m = element.message;
                 const totalTools = m.modelTurns.reduce((s, t) => s + t.toolCalls.length, 0);
@@ -509,11 +478,10 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `${m.modelTurns.length} turns`,
                     vscode.TreeItemCollapsibleState.Collapsed
                 );
-                item.description = `${totalTools} tc | ${formatDuration(m.totalDurationMs)}`;
+                item.description = `${totalTools} tool calls | ${formatDuration(m.totalDurationMs)}`;
                 item.iconPath = new vscode.ThemeIcon('layers');
                 return item;
             }
-
             case 'modelTurn': {
                 const t = element.turn;
                 const cacheNote = t.inputTokens > 0 ? ` | ${(t.cacheHitRatio * 100).toFixed(0)}%` : '';
@@ -551,411 +519,424 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `Duration: ${formatDuration(t.durationMs)}`,
                     `TTFT: ${formatDuration(t.ttftMs)}`,
                     `Tool Calls: ${t.toolCalls.length}`,
-                    t.toolCalls.length > 0 ? ` ${t.toolCalls.map(tc => tc.name).join(', ')}` : '',
+                    t.toolCalls.length > 0 ? `  ${t.toolCalls.map(tc => tc.name).join(', ')}` : '',
                 ].filter(Boolean).join('\n');
                 return item;
             }
-
             case 'turnToolCall': {
                 const c = element.call;
-                const hasChildren = Boolean(c.isSubagent && c.subagentSummary);
+                const hasChildren = c.isSubagent && c.subagentSummary;
                 const item = new vscode.TreeItem(
                     c.displayLabel,
                     hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
                 );
-                item.description = formatDuration(c.durationMs);
+                const descriptionParts: string[] = [];
+                if (c.durationMs > 0) {
+                    descriptionParts.push(formatDuration(c.durationMs));
+                }
+                if (c.toolKind) {
+                    descriptionParts.push(c.toolKind);
+                }
+                if (c.source) {
+                    descriptionParts.push(c.source);
+                }
+                if (c.resultCount !== undefined) {
+                    descriptionParts.push(`${formatNumber(c.resultCount)} result${c.resultCount === 1 ? '' : 's'}`);
+                }
+                item.description = descriptionParts.join(' | ');
+                item.tooltip = [
+                    `Tool: ${c.name}`,
+                    c.toolKind ? `Kind: ${c.toolKind}` : undefined,
+                    c.source ? `Source: ${c.source}` : undefined,
+                    c.resultCount !== undefined ? `Results: ${formatNumber(c.resultCount)}` : undefined,
+                    c.toolCallId ? `Call ID: ${c.toolCallId}` : undefined,
+                    `Label: ${c.displayLabel}`,
+                ].filter(Boolean).join('\n');
                 if (c.isSubagent) {
                     item.iconPath = new vscode.ThemeIcon('rocket');
                     if (c.subagentSummary) {
-                        item.description += ` | ${formatAic(c.subagentSummary.totalNanoAiu)} AIC | ${c.subagentSummary.modelTurnCount} turns`;
+                        const subagentDescription = `${formatAic(c.subagentSummary.totalNanoAiu)} AIC | ${c.subagentSummary.modelTurnCount} turns`;
+                        item.description = item.description ? `${item.description} | ${subagentDescription}` : subagentDescription;
                     }
                 } else {
                     item.iconPath = new vscode.ThemeIcon('wrench');
                 }
-                item.tooltip = [
-                    `Tool: ${c.name}`,
-                    `Label: ${c.displayLabel}`,
-                    `Duration: ${formatDuration(c.durationMs)}`,
-                    c.isSubagent ? 'Subagent: yes' : '',
-                    c.subagentSummary ? `Subagent Cost: ${formatAic(c.subagentSummary.totalNanoAiu)} AIC` : '',
-                    c.subagentSummary ? `Subagent Turns: ${c.subagentSummary.modelTurnCount}` : '',
-                ].filter(Boolean).join('\n');
                 return item;
             }
-
             case 'subagentTurn': {
                 const t = element.turn;
-                const firstTool = t.toolCalls[0]?.displayLabel;
+                const toolNames = t.toolCalls.map(tc => tc.displayLabel || tc.name).slice(0, 3);
+                const toolPreview = toolNames.length > 0 ? toolNames.join(', ') : 'no tools';
                 const item = new vscode.TreeItem(
-                    `${element.turnIndex + 1}: ${firstTool ? compactLabel(firstTool, 35) : 'Subagent response'}`,
+                    `Turn ${element.turnIndex + 1}: ${t.model}`,
                     t.toolCalls.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
                 );
-                item.description = `${formatAic(t.nanoAiu)} AIC | ${t.toolCalls.length} tc | ${formatDuration(t.durationMs)}`;
-                item.iconPath = new vscode.ThemeIcon('rocket');
-                item.tooltip = [
-                    `Model: ${t.model}`,
-                    `Request: ${t.debugName}`,
-                    `Input: ${formatNumber(t.inputTokens)}`,
-                    `Output: ${formatNumber(t.outputTokens)}`,
-                    `Cached: ${formatNumber(t.cachedTokens)}`,
-                    `Total: ${formatNumber(t.totalTokens)}`,
-                    `Cost: ${formatAic(t.nanoAiu)} AIC`,
-                    `Duration: ${formatDuration(t.durationMs)}`,
-                    `TTFT: ${formatDuration(t.ttftMs)}`,
-                    `Tool Calls: ${t.toolCalls.length}`,
-                ].join('\n');
-                return item;
-            }
-
-            case 'mergedInfo': {
-                const count = element.message.mergedMessages.length;
-                const item = new vscode.TreeItem(
-                    `Merged continuation messages (${count})`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
-                item.description = 'included in this request';
-                item.iconPath = new vscode.ThemeIcon('git-merge');
-                return item;
-            }
-
-            case 'mergedItem': {
-                const text = getMergedMessageText(element.info);
-                const item = new vscode.TreeItem(
-                    compactLabel(text || '(empty)', 60),
-                    vscode.TreeItemCollapsibleState.None
-                );
-                item.description = `${formatNumber(estimateTokens(text))} est. tokens`;
-                item.iconPath = new vscode.ThemeIcon('comment');
-                item.tooltip = text;
-                return item;
-            }
-
-            case 'toolDefinitions': {
-                const totalTokens = element.definitions.reduce((sum, def) => sum + getToolDefinitionTokenCount(def), 0);
-                const item = new vscode.TreeItem(
-                    element.label,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
-                item.description = `${element.definitions.length} tools | ~${formatNumber(totalTokens)} tokens`;
+                item.description = `${formatAic(t.nanoAiu)} AIC | ${toolPreview}`;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
                 return item;
             }
-
-            case 'toolDef': {
-                const name = getToolDefinitionName(element.def);
-                const tokens = getToolDefinitionTokenCount(element.def);
+            case 'mergedInfo': {
+                const m = element.message;
                 const item = new vscode.TreeItem(
-                    name,
-                    vscode.TreeItemCollapsibleState.None
-                );
-                item.description = `~${formatNumber(tokens)} tokens | used ${element.usageCount}`;
-                item.iconPath = new vscode.ThemeIcon(element.usageCount > 0 ? 'tools' : 'circle-outline');
-                item.tooltip = JSON.stringify(element.def, undefined, 2);
-                return item;
-            }
-
-            case 'commandsGroup': {
-                const total = element.commands.reduce((sum, cmd) => sum + cmd.count, 0);
-                const item = new vscode.TreeItem(
-                    'Terminal commands',
+                    `Merged Continuations (${m.mergedMessages.length})`,
                     vscode.TreeItemCollapsibleState.Collapsed
                 );
-                item.description = `${total} runs | ${element.commands.length} commands`;
-                item.iconPath = new vscode.ThemeIcon('terminal');
+                item.description = 'system-triggered follow-ups';
+                item.iconPath = new vscode.ThemeIcon('git-merge');
                 return item;
             }
-
-            case 'commandItem': {
+            case 'mergedItem': {
+                const info = element.info;
+                const item = new vscode.TreeItem(info.content, vscode.TreeItemCollapsibleState.None);
+                item.iconPath = new vscode.ThemeIcon('arrow-right');
+                item.tooltip = `SpanId: ${info.spanId}\nTimestamp: ${new Date(info.timestamp).toLocaleTimeString()}`;
+                return item;
+            }
+            case 'toolDefinitions': {
+                const defs = element.definitions;
+                const totalUsed = [...element.usageCounts.values()].reduce((s, c) => s + c, 0);
+                const uniqueUsed = element.usageCounts.size;
                 const item = new vscode.TreeItem(
-                    element.name,
-                    vscode.TreeItemCollapsibleState.None
+                    `Tools (${defs.length} available, ${uniqueUsed} used, ${totalUsed} calls)`,
+                    vscode.TreeItemCollapsibleState.Collapsed
                 );
-                item.description = `${element.count} run${element.count === 1 ? '' : 's'}`;
+                item.description = element.label;
+                item.iconPath = new vscode.ThemeIcon('symbol-method');
+                return item;
+            }
+            case 'toolDef': {
+                const d = element.def;
+                const count = element.usageCount;
+                const item = new vscode.TreeItem(d.name, vscode.TreeItemCollapsibleState.None);
+                if (count > 0) {
+                    item.description = `×${count} | ~${formatNumber(d.estimatedTokens)} tokens`;
+                    item.iconPath = new vscode.ThemeIcon('check');
+                } else {
+                    item.description = `unused | ~${formatNumber(d.estimatedTokens)} tokens`;
+                    item.iconPath = new vscode.ThemeIcon('circle-slash');
+                }
+                return item;
+            }
+            case 'commandsGroup': {
+                const total = element.commands.reduce((s, c) => s + c.count, 0);
+                const item = new vscode.TreeItem(
+                    `Commands (${element.commands.length} executables, ${total} runs)`,
+                    vscode.TreeItemCollapsibleState.Collapsed
+                );
                 item.iconPath = new vscode.ThemeIcon('terminal');
                 return item;
             }
-
+            case 'commandItem': {
+                const item = new vscode.TreeItem(element.name, vscode.TreeItemCollapsibleState.None);
+                item.description = `×${element.count}`;
+                item.iconPath = new vscode.ThemeIcon('terminal-bash');
+                return item;
+            }
             case 'insights': {
                 const item = new vscode.TreeItem(
                     'Insights',
                     vscode.TreeItemCollapsibleState.Collapsed
                 );
-                item.description = `${formatAic(element.summary.totalNanoAiu)} AIC | ${formatNumber(element.summary.totalTokens)} tokens`;
                 item.iconPath = new vscode.ThemeIcon('lightbulb');
+                item.description = 'tool usage analysis & command summary';
                 return item;
             }
-
             case 'insightGroup': {
-                const total = element.tools.reduce((sum, t) => sum + t.count, 0);
                 const item = new vscode.TreeItem(
                     element.label,
-                    vscode.TreeItemCollapsibleState.Collapsed
+                    element.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
                 );
-                item.description = `${total} calls`;
-                item.iconPath = new vscode.ThemeIcon('list-tree');
+                item.description = `${element.tools.length} tools`;
+                item.iconPath = new vscode.ThemeIcon('tag');
                 return item;
             }
-
             case 'insightTool': {
-                const item = new vscode.TreeItem(
-                    element.name,
-                    vscode.TreeItemCollapsibleState.None
-                );
-                item.description = `${element.count}`;
-                item.iconPath = new vscode.ThemeIcon('symbol-method');
+                const item = new vscode.TreeItem(element.name, vscode.TreeItemCollapsibleState.None);
+                item.description = element.count > 0 ? `×${element.count}` : 'never used';
+                item.iconPath = element.count === 0
+                    ? new vscode.ThemeIcon('circle-slash')
+                    : new vscode.ThemeIcon('wrench');
                 return item;
             }
-
             case 'stat': {
-                const item = new vscode.TreeItem(
-                    element.label,
-                    vscode.TreeItemCollapsibleState.None
-                );
+                const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
                 item.description = element.value;
-                item.iconPath = new vscode.ThemeIcon('pulse');
+                item.iconPath = new vscode.ThemeIcon('info');
+                if (element.label === 'Total Cost') {
+                    item.description = `${element.value} [Learn more]`;
+                    item.command = {
+                        command: 'vscode.open',
+                        title: 'Learn more',
+                        arguments: [AI_CREDITS_DOCS_URI],
+                    };
+                    item.tooltip = `${element.value}\nOpen GitHub docs for AI Credits.`;
+                }
                 return item;
             }
         }
     }
 
-    getChildren(element?: TreeItemData): vscode.ProviderResult<TreeItemData[]> {
+    getChildren(element?: TreeItemData): TreeItemData[] {
+        if (!this.summary) {
+            return [];
+        }
+
         if (!element) {
-            return this.summary ? [{ kind: 'session', summary: this.summary }] : [];
+            return [{ kind: 'session', summary: this.summary }];
         }
 
         switch (element.kind) {
             case 'session': {
                 const s = element.summary;
-                const children: TreeItemData[] = [
-                    { kind: 'insights', summary: s },
-                    ...s.userMessages.map((message, index) => ({ kind: 'userMessage' as const, message, index })),
+                const stats: TreeItemData[] = [
+                    { kind: 'stat', label: 'Total Cost', value: `${formatAic(s.totalNanoAiu)} AIC` },
+                    { kind: 'stat', label: 'Total Tokens', value: `${formatNumber(s.totalTokens)} (in:${formatNumber(s.totalInputTokens)} out:${formatNumber(s.totalOutputTokens)} cache:${formatNumber(s.totalCachedTokens)})` },
+                    { kind: 'stat', label: 'Total LLM Time', value: formatDuration(s.totalDurationMs) },
+                    { kind: 'stat', label: 'Model Turns / Tool Calls', value: `${s.modelTurnCount} / ${s.toolCallCount}` },
                 ];
-
-                const definitions = getToolDefinitions(s);
-                if (definitions.length > 0) {
-                    children.push({
-                        kind: 'toolDefinitions',
-                        definitions,
-                        label: 'Tool definitions',
-                        usageCounts: getSessionToolUsageCounts(s),
-                    });
-                }
-
-                const commands = getSessionCommandGroups(s);
-                if (commands.length > 0) {
-                    children.push({ kind: 'commandsGroup', commands });
-                }
-
-                return children;
+                stats.push({ kind: 'stat', label: '💡 Tip', value: 'Type @usage in Copilot Chat to ask AI about this session' });
+                // Insights node (lazy-computed on expand)
+                stats.push({ kind: 'insights', summary: s });
+                const messages: TreeItemData[] = s.userMessages.map((m, i) => ({
+                    kind: 'userMessage' as const,
+                    message: m,
+                    index: i,
+                }));
+                return [...stats, ...messages];
             }
-
             case 'userMessage': {
                 const m = element.message;
                 const children: TreeItemData[] = [];
-
-                if (m.mergedMessages.length > 0) {
-                    children.push({ kind: 'mergedInfo', message: m, msgIndex: element.index });
+                // Summary stats
+                children.push({ kind: 'stat', label: 'Cost', value: `${formatAic(m.totalNanoAiu)} AIC` });
+                children.push({ kind: 'stat', label: 'Tokens', value: `in:${formatNumber(m.totalInputTokens)} out:${formatNumber(m.totalOutputTokens)} cache:${formatNumber(m.totalCachedTokens)}` });
+                children.push({ kind: 'stat', label: 'Context at Start', value: `~${formatNumber(estimateTokens(m.contextCharsAtStart))} tokens (${formatNumber(m.contextCharsAtStart)} chars)` });
+                if (m.systemPromptFile) {
+                    const sp = this.summary?.promptComposition?.systemPrompts[m.systemPromptFile];
+                    const spInfo = sp ? ` (~${formatNumber(sp.estimatedTokens)} tokens)` : '';
+                    children.push({ kind: 'stat', label: 'System Prompt', value: `${m.systemPromptFile}${spInfo}` });
                 }
-
-                if (m.modelTurns.length > 0) {
-                    children.push({ kind: 'turnsGroup', message: m, msgIndex: element.index });
+                // Tool definitions with usage counts for this message
+                if (m.toolsFile && this.summary?.promptComposition?.toolSets[m.toolsFile]) {
+                    const defs = this.summary.promptComposition.toolSets[m.toolsFile];
+                    const usageCounts = getToolUsageCounts(m);
+                    children.push({ kind: 'toolDefinitions', definitions: defs, label: m.toolsFile, usageCounts });
                 }
-
-                const definitions = getToolDefinitions(m);
-                if (definitions.length > 0) {
-                    children.push({
-                        kind: 'toolDefinitions',
-                        definitions,
-                        label: 'Tool definitions in prompt',
-                        usageCounts: getToolUsageCounts(m),
-                    });
-                }
-
+                // Commands group
                 const commands = getCommandGroups(m);
                 if (commands.length > 0) {
                     children.push({ kind: 'commandsGroup', commands });
                 }
-
+                // Turns group
+                children.push({ kind: 'turnsGroup', message: m, msgIndex: element.index });
+                // Merged continuations info
+                if (m.mergedMessages.length > 0) {
+                    children.push({ kind: 'mergedInfo', message: m, msgIndex: element.index });
+                }
                 return children;
             }
-
             case 'turnsGroup': {
-                return element.message.modelTurns.map((turn, turnIndex) => ({
+                const m = element.message;
+                return m.modelTurns.map((turn, i) => ({
                     kind: 'modelTurn' as const,
                     turn,
                     msgIndex: element.msgIndex,
-                    turnIndex,
+                    turnIndex: i,
                 }));
             }
-
             case 'modelTurn': {
-                return element.turn.toolCalls.map(call => ({ kind: 'turnToolCall' as const, call }));
-            }
-
-            case 'turnToolCall': {
-                const summary = element.call.subagentSummary;
-                if (!summary) { return []; }
-
-                const turns: ModelTurnSummary[] = [];
-                for (const msg of summary.userMessages) {
-                    turns.push(...msg.modelTurns);
+                const t = element.turn;
+                const cachePercent = (t.cacheHitRatio * 100).toFixed(0);
+                const children: TreeItemData[] = [
+                    { kind: 'stat', label: 'Cost', value: `${formatAic(t.nanoAiu)} AIC` },
+                    { kind: 'stat', label: 'Tokens', value: `in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)} cache:${formatNumber(t.cachedTokens)}` },
+                    { kind: 'stat', label: 'Cache', value: `${cachePercent}% hit (${formatNumber(t.freshTokens)} fresh tokens)` },
+                    { kind: 'stat', label: 'Duration / TTFT', value: `${formatDuration(t.durationMs)} / ${formatDuration(t.ttftMs)}` },
+                ];
+                // Tool calls for this turn
+                for (const tc of t.toolCalls) {
+                    children.push({ kind: 'turnToolCall', call: tc });
                 }
-
-                return turns.map((turn, turnIndex) => ({ kind: 'subagentTurn' as const, turn, turnIndex }));
+                return children;
             }
-
+            case 'turnToolCall': {
+                // Expand subagent summary if available
+                const c = element.call;
+                if (c.subagentSummary) {
+                    const s = c.subagentSummary;
+                    const children: TreeItemData[] = [
+                        { kind: 'stat', label: 'Subagent Cost', value: `${formatAic(s.totalNanoAiu)} AIC` },
+                        { kind: 'stat', label: 'Subagent Tokens', value: `in:${formatNumber(s.totalInputTokens)} out:${formatNumber(s.totalOutputTokens)}` },
+                    ];
+                    // Show subagent turns
+                    for (const msg of s.userMessages) {
+                        for (let i = 0; i < msg.modelTurns.length; i++) {
+                            children.push({ kind: 'subagentTurn', turn: msg.modelTurns[i], turnIndex: i });
+                        }
+                    }
+                    return children;
+                }
+                return [];
+            }
             case 'subagentTurn': {
-                return element.turn.toolCalls.map(call => ({ kind: 'turnToolCall' as const, call }));
+                const t = element.turn;
+                const children: TreeItemData[] = [
+                    { kind: 'stat', label: 'Tokens', value: `in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)} cache:${formatNumber(t.cachedTokens)}` },
+                ];
+                for (const tc of t.toolCalls) {
+                    children.push({ kind: 'turnToolCall', call: tc });
+                }
+                return children;
             }
-
             case 'mergedInfo': {
-                return element.message.mergedMessages.map(info => ({ kind: 'mergedItem' as const, info }));
-            }
-
-            case 'toolDefinitions': {
-                return [...element.definitions]
-                    .sort((a, b) => getToolDefinitionTokenCount(b) - getToolDefinitionTokenCount(a))
-                    .map(def => ({
-                        kind: 'toolDef' as const,
-                        def,
-                        usageCount: element.usageCounts.get(getToolDefinitionName(def)) || 0,
-                    }));
-            }
-
-            case 'commandsGroup': {
-                return element.commands.map(command => ({
-                    kind: 'commandItem' as const,
-                    name: command.name,
-                    count: command.count,
+                return element.message.mergedMessages.map(info => ({
+                    kind: 'mergedItem' as const,
+                    info,
                 }));
             }
-
+            case 'toolDefinitions': {
+                // Sort: used tools first (by count desc), then unused
+                const sorted = [...element.definitions].sort((a, b) => {
+                    const ca = element.usageCounts.get(a.name) || 0;
+                    const cb = element.usageCounts.get(b.name) || 0;
+                    return cb - ca;
+                });
+                return sorted.map(def => ({
+                    kind: 'toolDef' as const,
+                    def,
+                    usageCount: element.usageCounts.get(def.name) || 0,
+                }));
+            }
+            case 'commandsGroup': {
+                return element.commands.map(cmd => ({
+                    kind: 'commandItem' as const,
+                    name: cmd.name,
+                    count: cmd.count,
+                }));
+            }
             case 'insights': {
                 const s = element.summary;
-                const toolCounts = [...getSessionToolUsageCounts(s).entries()]
-                    .map(([name, count]) => ({ name, count }))
-                    .sort((a, b) => b.count - a.count);
-                const commandCounts = getSessionCommandGroups(s);
+                const sessionUsage = getSessionToolUsageCounts(s);
 
-                const children: TreeItemData[] = [
-                    { kind: 'stat', label: 'Total cost', value: `${formatAic(s.totalNanoAiu)} AIC` },
-                    { kind: 'stat', label: 'Total tokens', value: formatNumber(s.totalTokens) },
-                    { kind: 'stat', label: 'Input tokens', value: formatNumber(s.totalInputTokens) },
-                    { kind: 'stat', label: 'Output tokens', value: formatNumber(s.totalOutputTokens) },
-                    { kind: 'stat', label: 'Cached tokens', value: formatNumber(s.totalCachedTokens) },
-                    { kind: 'stat', label: 'User messages', value: formatNumber(s.userMessages.length) },
-                    { kind: 'stat', label: 'Model turns', value: formatNumber(s.modelTurnCount) },
-                    { kind: 'stat', label: 'Tool calls', value: formatNumber(s.toolCallCount) },
-                    { kind: 'stat', label: 'Total LLM time', value: formatDuration(s.totalDurationMs) },
-                ];
-
-                if (toolCounts.length > 0) {
-                    children.push({ kind: 'insightGroup', label: 'Top tools', tools: toolCounts.slice(0, 20) });
+                // Get all observed tool names, plus available debug-log tool definitions when present.
+                const allToolNames = new Set<string>();
+                if (s.promptComposition) {
+                    for (const defs of Object.values(s.promptComposition.toolSets)) {
+                        for (const d of defs) { allToolNames.add(d.name); }
+                    }
+                }
+                for (const name of sessionUsage.keys()) {
+                    allToolNames.add(name);
                 }
 
-                if (commandCounts.length > 0) {
-                    children.push({ kind: 'insightGroup', label: 'Terminal commands', tools: commandCounts.slice(0, 20) });
+                // Categorize tools by usage
+                const unused: { name: string; count: number }[] = [];
+                const low: { name: string; count: number }[] = [];     // 1-2
+                const medium: { name: string; count: number }[] = [];  // 3-5
+                const high: { name: string; count: number }[] = [];    // 5+
+
+                for (const name of allToolNames) {
+                    const count = sessionUsage.get(name) || 0;
+                    if (count === 0) { unused.push({ name, count }); }
+                    else if (count <= 2) { low.push({ name, count }); }
+                    else if (count <= 5) { medium.push({ name, count }); }
+                    else { high.push({ name, count }); }
+                }
+
+                // Sort each group
+                low.sort((a, b) => b.count - a.count);
+                medium.sort((a, b) => b.count - a.count);
+                high.sort((a, b) => b.count - a.count);
+                unused.sort((a, b) => a.name.localeCompare(b.name));
+
+                const children: TreeItemData[] = [
+                    { kind: 'insightGroup', label: `Heavy (5+ calls)`, tools: high },
+                    { kind: 'insightGroup', label: `Medium (3-5 calls)`, tools: medium },
+                    { kind: 'insightGroup', label: `Light (1-2 calls)`, tools: low },
+                    { kind: 'insightGroup', label: `Never Used (wasted tokens)`, tools: unused },
+                ];
+
+                // Session-wide command groups
+                const sessionCommands = getSessionCommandGroups(s);
+                if (sessionCommands.length > 0) {
+                    children.push({ kind: 'commandsGroup', commands: sessionCommands });
                 }
 
                 return children;
             }
-
             case 'insightGroup': {
-                return element.tools.map(tool => ({ kind: 'insightTool' as const, name: tool.name, count: tool.count }));
+                return element.tools.map(t => ({
+                    kind: 'insightTool' as const,
+                    name: t.name,
+                    count: t.count,
+                }));
             }
-
-            case 'mergedItem':
-            case 'toolDef':
-            case 'commandItem':
-            case 'insightTool':
-            case 'stat':
+            default:
                 return [];
         }
     }
 }
 
-const treeProvider = new UsageTreeProvider();
-const TREE_VIEW_ID = 'copilotUsageTracker';
+export function activate(context: vscode.ExtensionContext) {
+    const treeProvider = new UsageTreeProvider();
 
-function registerUsageTreeProvider(context: vscode.ExtensionContext) {
-    const packageJson = asAny(context).extension?.packageJSON;
-    const ids = new Set<string>();
-    const contributedViews = packageJson?.contributes?.views;
+    vscode.window.createTreeView('copilotUsageTree', {
+        treeDataProvider: treeProvider,
+        showCollapseAll: true,
+    });
 
-    if (contributedViews && typeof contributedViews === 'object') {
-        for (const views of Object.values(contributedViews)) {
-            if (!Array.isArray(views)) { continue; }
-            for (const view of views) {
-                const id = asAny(view).id;
-                if (typeof id === 'string' && /copilot|usage/i.test(id)) {
-                    ids.add(id);
-                }
+    // Auto-load the most recent session, prioritizing the current workspace
+    const autoLoad = () => {
+        const debugLogDirs = findAllDebugLogDirs();
+
+        // Determine current workspace's debug-log dir from storageUri
+        let currentWsDebugDir: string | undefined;
+        if (context.storageUri) {
+            // storageUri is like: .../workspaceStorage/<ws-id>/copilot-usage-tracker
+            // We need: .../workspaceStorage/<ws-id>/GitHub.copilot-chat/debug-logs
+            const wsDir = path.dirname(context.storageUri.fsPath);
+            const candidate = path.join(wsDir, 'GitHub.copilot-chat', 'debug-logs');
+            if (fs.existsSync(candidate)) {
+                currentWsDebugDir = candidate;
             }
         }
-    }
 
-    if (ids.size === 0) {
-        ids.add(TREE_VIEW_ID);
-    }
+        // Collect all sessions, prioritizing current workspace
+        let allSessions: SessionCandidate[] = [];
 
-    for (const id of ids) {
-        context.subscriptions.push(vscode.window.registerTreeDataProvider(id, treeProvider));
-    }
-}
+        if (currentWsDebugDir) {
+            // Try current workspace first
+            allSessions = findSessionsInDir(currentWsDebugDir);
+        }
 
-function safeQuickPeekHasBillingData(file: string): boolean {
-    try {
-        return quickPeekHasBillingData(file);
-    } catch {
-        return false;
-    }
-}
+        if (allSessions.length === 0) {
+            // Fall back to all workspaces, sorted by most recent globally
+            for (const dir of debugLogDirs) {
+                allSessions.push(...findSessionsInDir(dir));
+            }
+            allSessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
+        }
 
-function applyResolvedTitle(summary: SessionSummary): void {
-    summary.title = resolveSessionTitle(summary.sessionId) || summary.title;
-}
-
-function parseSessionCandidate(candidate: SessionCandidate) {
-    return parseCopilotSessionFile(candidate.mainJsonl);
-}
-
-export function activate(context: vscode.ExtensionContext) {
-    registerUsageTreeProvider(context);
+        const picked = allSessions.find(s => safeQuickPeekHasBillingData(s.mainJsonl)) ?? allSessions[0];
+        if (picked) {
+            const parsed = parseSessionCandidate(picked);
+            if (parsed) {
+                applyResolvedTitle(parsed.summary);
+                treeProvider.setSummary(parsed.summary);
+                setCurrentGraph(parsed.summary);
+                vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', true);
+                currentSessionFile = parsed.sourceFile;
+                return;
+            }
+        }
+        // Only show "no logs" welcome after confirmed search found nothing
+        vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', false);
+    };
 
     // File watcher state
     let currentSessionFile: string | undefined;
     let fileWatcher: vscode.FileSystemWatcher | undefined;
     let debounceTimer: NodeJS.Timeout | undefined;
-
-    function autoLoad() {
-        const firstDebugLogDir = findDebugLogDir();
-        const debugLogDirs = findAllDebugLogDirs();
-        if (firstDebugLogDir && !debugLogDirs.includes(firstDebugLogDir)) {
-            debugLogDirs.unshift(firstDebugLogDir);
-        }
-
-        const allSessions: SessionCandidate[] = [];
-        for (const dir of debugLogDirs) {
-            allSessions.push(...findSessionsInDir(dir));
-        }
-        allSessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
-
-        const picked = allSessions.find(s => safeQuickPeekHasBillingData(s.mainJsonl)) ?? allSessions[0];
-        if (!picked) {
-            treeProvider.setSummary(undefined);
-            vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', false);
-            return;
-        }
-
-        const parsed = parseSessionCandidate(picked);
-        if (parsed) {
-            applyResolvedTitle(parsed.summary);
-            treeProvider.setSummary(parsed.summary);
-            setCurrentGraph(parsed.summary);
-            vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', true);
-            currentSessionFile = parsed.sourceFile;
-        }
-    }
 
     function watchCurrentSession() {
         // Dispose previous watcher
@@ -1015,15 +996,6 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    async function notifyNoDebugLogsFound() {
-        const action = 'Open Settings';
-        const message = 'No Copilot debug log sessions found. To enable logging, open settings and enable "github.copilot.chat.agentDebugLog.fileLogging.enabled", then open the Copilot Chat debug view and run a chat.';
-        const selection = await vscode.window.showWarningMessage(message, action);
-        if (selection === action) {
-            vscode.commands.executeCommand('workbench.action.openSettings', 'github.copilot.chat.agentDebugLog.fileLogging.enabled');
-        }
-    }
-
     context.subscriptions.push(
         vscode.commands.registerCommand('copilotUsageTracker.pickSession', async () => {
             // Invalidate cache so we get fresh titles
@@ -1044,7 +1016,7 @@ export function activate(context: vscode.ExtensionContext) {
             allSessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
 
             if (allSessions.length === 0) {
-                await notifyNoDebugLogsFound();
+                vscode.window.showWarningMessage('No Copilot debug log sessions found. Enable "github.copilot.chat.agentDebugLog.fileLogging.enabled".');
                 return;
             }
 
@@ -1068,7 +1040,6 @@ export function activate(context: vscode.ExtensionContext) {
             const sessionsToShow = allSessions.filter(s =>
                 titles.has(s.id) || s.modifiedTime > recentCutoff
             );
-
             // Fallback: if nothing matches, show all
             const finalList = sessionsToShow.length > 0 ? sessionsToShow : allSessions;
 
@@ -1110,7 +1081,6 @@ export function activate(context: vscode.ExtensionContext) {
             }
         })
     );
-
 }
 
 export function deactivate() {}

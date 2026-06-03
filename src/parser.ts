@@ -1,5 +1,5 @@
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from 'fs';
+import * as path from 'path';
 
 export const NANO_AIU_PER_AIC = 1_000_000_000;
 
@@ -21,6 +21,10 @@ export interface ToolCallAttrs {
     args?: string;
     result?: string;
     displayLabel?: string;
+    source?: string;
+    toolKind?: string;
+    resultCount?: number;
+    toolCallId?: string;
 }
 
 export interface UserMessageAttrs {
@@ -37,26 +41,28 @@ export interface LogEntry {
     spanId: string;
     parentSpanId?: string;
     status: string;
-    attrs: LlmRequestAttrs &
-        ToolCallAttrs &
-        UserMessageAttrs & {
-            turnId?: string;
-            childLogFile?: string;
-            childSessionId?: string;
-            label?: string;
-            systemPromptFile?: string;
-            toolsFile?: string;
-            inputMessages?: string;
-        };
+    attrs: LlmRequestAttrs & ToolCallAttrs & UserMessageAttrs & {
+        turnId?: string;
+        childLogFile?: string;
+        childSessionId?: string;
+        label?: string;
+        systemPromptFile?: string;
+        toolsFile?: string;
+        inputMessages?: string;
+    };
 }
 
 export interface ToolCallSummary {
     name: string;
-    displayLabel: string;
+    displayLabel: string; // e.g. "Ran: git clone...", "Search: chat debug"
     durationMs: number;
     timestamp: number;
     isSubagent: boolean;
-    subagentSummary?: SessionSummary;
+    source?: string;
+    toolKind?: string;
+    resultCount?: number;
+    toolCallId?: string;
+    subagentSummary?: SessionSummary; // populated if subagent log is parsed
 }
 
 export interface ModelTurnSummary {
@@ -71,8 +77,8 @@ export interface ModelTurnSummary {
     timestamp: number;
     debugName: string;
     toolCalls: ToolCallSummary[];
-    cacheHitRatio: number;
-    freshTokens: number;
+    cacheHitRatio: number; // cachedTokens / inputTokens (0-1)
+    freshTokens: number;   // inputTokens - cachedTokens
     systemPromptFile?: string;
     toolsFile?: string;
     inputMessagesChars: number;
@@ -97,6 +103,7 @@ export interface UserMessageSummary {
     totalTokens: number;
     totalNanoAiu: number;
     totalDurationMs: number;
+    /** Context size at start of this message (first turn's inputMessages chars) */
     contextCharsAtStart: number;
     systemPromptFile?: string;
     toolsFile?: string;
@@ -120,7 +127,7 @@ export interface SessionSummary {
 export interface ParsedSessionFile {
     summary: SessionSummary;
     sourceFile: string;
-    sourceType: "debugLog" | "chatSession";
+    sourceType: 'debugLog' | 'chatSession';
 }
 
 export interface ToolDefinitionSize {
@@ -138,78 +145,63 @@ export interface PromptComposition {
 
 /** Generate a human-friendly display label for a tool call based on its args */
 function getToolDisplayLabel(name: string, argsStr: string | undefined, fallbackLabel?: string): string {
-    if (!argsStr) {
-        return fallbackLabel || name;
-    }
+    if (!argsStr) { return fallbackLabel || name; }
 
     try {
         const args = JSON.parse(argsStr);
-
         switch (name) {
-            case "run_in_terminal": {
-                const cmd = args.command || "";
-                const short = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
+            case 'run_in_terminal': {
+                const cmd = args.command || '';
+                const short = cmd.length > 60 ? cmd.slice(0, 57) + '...' : cmd;
                 return `Ran: ${short}`;
             }
-
-            case "grep_search": {
-                const q = args.query || "";
-                const pat = args.includePattern ? ` in ${path.basename(args.includePattern)}` : "";
+            case 'grep_search': {
+                const q = args.query || '';
+                const pat = args.includePattern ? ` in ${path.basename(args.includePattern)}` : '';
                 return `Search: "${q}"${pat}`;
             }
-
-            case "read_file": {
-                const fp = args.filePath || "";
+            case 'read_file': {
+                const fp = args.filePath || '';
                 const fname = path.basename(fp);
-                const lines = args.startLine && args.endLine ? ` L${args.startLine}-L${args.endLine}` : "";
+                const lines = args.startLine && args.endLine ? ` L${args.startLine}-${args.endLine}` : '';
                 return `Read: ${fname}${lines}`;
             }
-
-            case "file_search": {
-                return `Find files: ${args.query || ""}`;
+            case 'file_search': {
+                return `Find files: ${args.query || ''}`;
             }
-
-            case "replace_string_in_file":
-            case "multi_replace_string_in_file": {
-                const fp = args.filePath || (args.replacements?.[0]?.filePath) || "";
+            case 'replace_string_in_file':
+            case 'multi_replace_string_in_file': {
+                const fp = args.filePath || (args.replacements?.[0]?.filePath) || '';
                 return `Edit: ${path.basename(fp)}`;
             }
-
-            case "create_file": {
-                const fp = args.filePath || "";
+            case 'create_file': {
+                const fp = args.filePath || '';
                 return `Create: ${path.basename(fp)}`;
             }
-
-            case "list_dir": {
-                const p = args.path || "";
+            case 'list_dir': {
+                const p = args.path || '';
                 return `List: ${path.basename(p) || p}`;
             }
-
-            case "runSubagent": {
-                const desc = args.description || args.agentName || "subagent";
+            case 'runSubagent': {
+                const desc = args.description || args.agentName || 'subagent';
                 return `Subagent: ${desc}`;
             }
-
-            case "manage_todo_list":
-                return "Update todo list";
-
-            case "semantic_search":
-                return `Semantic search: "${(args.query || "").slice(0, 40)}"`;
-
-            case "tool_search":
-                return `Tool search: "${(args.query || "").slice(0, 40)}"`;
-
-            case "get_terminal_output":
-                return "Get terminal output";
-
-            case "kill_terminal":
-                return "Kill terminal";
-
-            case "send_to_terminal":
-                return `Send to terminal: "${(args.command || "").slice(0, 40)}"`;
-
+            case 'manage_todo_list':
+                return 'Update todo list';
+            case 'semantic_search':
+                return `Semantic search: "${(args.query || '').slice(0, 40)}"`;
+            case 'tool_search':
+                return `Tool search: "${(args.query || '').slice(0, 40)}"`;
+            case 'get_terminal_output':
+                return 'Get terminal output';
+            case 'kill_terminal':
+                return 'Kill terminal';
+            case 'send_to_terminal':
+                return `Send to terminal: "${(args.command || '').slice(0, 40)}"`;
+            case 'vscode_askQuestions':
+                return 'Ask user questions';
             default:
-                return name;
+                return fallbackLabel || name;
         }
     } catch {
         return fallbackLabel || name;
@@ -218,11 +210,9 @@ function getToolDisplayLabel(name: string, argsStr: string | undefined, fallback
 
 /** Patterns that indicate a system-generated continuation, not a real user message */
 export function isSystemContinuation(content: string): boolean {
-    return (
-        content.startsWith("[Terminal") ||
-        content.startsWith("[Notification") ||
-        content.startsWith("[Background terminal")
-    );
+    return content.startsWith('[Terminal') ||
+           content.startsWith('[Notification') ||
+           content.startsWith('[Background terminal');
 }
 
 function firstDefined<T>(...values: T[]): T | undefined {
@@ -230,11 +220,11 @@ function firstDefined<T>(...values: T[]): T | undefined {
 }
 
 function toNumber(value: unknown): number | undefined {
-    if (typeof value === "number" && Number.isFinite(value)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
         return value;
     }
 
-    if (typeof value === "string" && value.trim() !== "") {
+    if (typeof value === 'string' && value.trim() !== '') {
         const parsed = Number(value);
         return Number.isFinite(parsed) ? parsed : undefined;
     }
@@ -248,7 +238,7 @@ function toTimestamp(value: unknown, fallback: number): number {
         return numeric;
     }
 
-    if (typeof value === "string") {
+    if (typeof value === 'string') {
         const parsed = Date.parse(value);
         if (Number.isFinite(parsed)) {
             return parsed;
@@ -258,7 +248,7 @@ function toTimestamp(value: unknown, fallback: number): number {
     return fallback;
 }
 
-function asString(value: unknown, fallback = ""): string {
+function asString(value: unknown, fallback = ''): string {
     if (value === undefined || value === null) {
         return fallback;
     }
@@ -271,35 +261,35 @@ function stringifyValue(value: unknown): string | undefined {
         return undefined;
     }
 
-    return typeof value === "string" ? value : JSON.stringify(value);
+    return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
 function normalizeEntryType(type: unknown): string {
     switch (asString(type).toLowerCase()) {
-        case "model_response":
-        case "model_turn":
-        case "assistant_message":
-            return "llm_request";
-        case "toolcall":
-            return "tool_call";
+        case 'model_response':
+        case 'model_turn':
+        case 'assistant_message':
+            return 'llm_request';
+        case 'toolcall':
+            return 'tool_call';
         default:
             return asString(type);
     }
 }
 
 function normalizeEntry(raw: any, index: number): LogEntry | undefined {
-    if (!raw || typeof raw !== "object") {
+    if (!raw || typeof raw !== 'object') {
         return undefined;
     }
 
-    const rawAttrs = raw.attrs && typeof raw.attrs === "object" ? raw.attrs : {};
+    const rawAttrs = raw.attrs && typeof raw.attrs === 'object' ? raw.attrs : {};
     const type = normalizeEntryType(firstDefined(raw.type, rawAttrs.type));
     if (!type) {
         return undefined;
     }
 
     const ts = toTimestamp(firstDefined(raw.ts, raw.timestamp, raw.time, rawAttrs.ts, rawAttrs.timestamp), index);
-    const sessionId = asString(firstDefined(raw.sid, raw.sessionId, raw.session_id, rawAttrs.sid, rawAttrs.sessionId), "unknown");
+    const sessionId = asString(firstDefined(raw.sid, raw.sessionId, raw.session_id, rawAttrs.sid, rawAttrs.sessionId), 'unknown');
     const name = asString(firstDefined(raw.name, raw.toolName, raw.tool_name, raw.debugName, rawAttrs.name, rawAttrs.toolName, rawAttrs.debugName), type);
     const spanId = asString(firstDefined(raw.spanId, raw.spanID, raw.id, rawAttrs.spanId), `${type}-${index}`);
 
@@ -312,7 +302,7 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
         name,
         spanId,
         parentSpanId: asString(firstDefined(raw.parentSpanId, raw.parentSpanID, rawAttrs.parentSpanId), undefined as any),
-        status: asString(firstDefined(raw.status, rawAttrs.status), "ok"),
+        status: asString(firstDefined(raw.status, rawAttrs.status), 'ok'),
         attrs: {
             ...rawAttrs,
             turnId: firstDefined(rawAttrs.turnId, raw.turnId),
@@ -334,6 +324,10 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
             args: stringifyValue(firstDefined(rawAttrs.args, raw.args)),
             result: stringifyValue(firstDefined(rawAttrs.result, raw.result)),
             displayLabel: firstDefined(rawAttrs.displayLabel, raw.displayLabel),
+            source: firstDefined(rawAttrs.source, raw.source),
+            toolKind: firstDefined(rawAttrs.toolKind, raw.toolKind),
+            resultCount: toNumber(firstDefined(rawAttrs.resultCount, raw.resultCount)),
+            toolCallId: firstDefined(rawAttrs.toolCallId, raw.toolCallId),
         },
     };
 }
@@ -346,32 +340,36 @@ function normalizeParsedEntries(raw: any, index: number): LogEntry[] {
 
     const entries = [entry];
     const inlineTools = firstDefined(raw.toolCalls, raw.tools, raw.attrs?.toolCalls);
-    if (entry.type !== "llm_request" || !Array.isArray(inlineTools)) {
+    if (entry.type !== 'llm_request' || !Array.isArray(inlineTools)) {
         return entries;
     }
 
     inlineTools.forEach((tool: any, toolIndex: number) => {
-        const toolName = asString(firstDefined(tool.name, tool.toolName, tool.tool_name), "tool_call");
+        const toolName = asString(firstDefined(tool.name, tool.toolName, tool.tool_name), 'tool_call');
         const displayLabel = asString(firstDefined(tool.displayLabel, tool.label, tool.command, toolName), toolName);
         const args = firstDefined(
             tool.args,
             tool.arguments,
-            toolName === "run_in_terminal" ? { command: displayLabel } : undefined
+            toolName === 'run_in_terminal' ? { command: displayLabel } : undefined
         );
 
         entries.push({
             ts: entry.ts + toolIndex + 1,
             dur: toNumber(firstDefined(tool.durationMs, tool.duration, tool.dur)) || 0,
             sid: entry.sid,
-            type: "tool_call",
+            type: 'tool_call',
             name: toolName,
             spanId: asString(firstDefined(tool.spanId, tool.id), `${entry.spanId}-tool-${toolIndex}`),
             parentSpanId: entry.spanId,
-            status: asString(firstDefined(tool.status), "ok"),
+            status: asString(firstDefined(tool.status), 'ok'),
             attrs: {
                 args: stringifyValue(args),
                 result: stringifyValue(firstDefined(tool.result, tool.output)),
                 displayLabel,
+                source: firstDefined(tool.source?.label, tool.source),
+                toolKind: firstDefined(tool.toolKind, tool.kind),
+                resultCount: toNumber(firstDefined(tool.resultCount, tool.resultDetails?.length)),
+                toolCallId: firstDefined(tool.toolCallId, tool.id),
             },
         });
     });
@@ -387,11 +385,11 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
 
     const sessionId = entries[0].sid;
 
-    const userMessages = entries.filter(e => e.type === "user_message");
-    const llmRequests = entries.filter(e => e.type === "llm_request");
-    const toolCalls = entries.filter(e => e.type === "tool_call");
+    const userMessages = entries.filter(e => e.type === 'user_message');
+    const llmRequests = entries.filter(e => e.type === 'llm_request');
+    const toolCalls = entries.filter(e => e.type === 'tool_call');
 
-    // Build raw message groups before merging.
+    // Build raw message groups (before merging)
     interface RawGroup {
         msg: LogEntry;
         llmRequests: LogEntry[];
@@ -399,12 +397,11 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
     }
 
     const rawGroups: RawGroup[] = [];
-
     for (let i = 0; i < userMessages.length; i++) {
         const msg = userMessages[i];
         const nextMsg = userMessages[i + 1];
 
-        // Group by timestamp boundaries only. SpanIds get recycled across messages,
+        // Group by timestamp boundaries only. SpanIds get recycled across messages
         // so parentSpanId matching is unreliable.
         const msgLlmRequests = llmRequests.filter(r =>
             r.ts >= msg.ts && (nextMsg ? r.ts < nextMsg.ts : true)
@@ -417,7 +414,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         rawGroups.push({ msg, llmRequests: msgLlmRequests, toolCalls: msgToolCalls });
     }
 
-    // Merge system continuations such as "[Terminal ...]" into the previous real user message.
+    // Merge system continuations (e.g. "[Terminal ...") into the previous real user message
     interface MergedGroup {
         primaryMsg: LogEntry;
         allLlmRequests: LogEntry[];
@@ -426,17 +423,16 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
     }
 
     const mergedGroups: MergedGroup[] = [];
-
     for (let i = 0; i < rawGroups.length; i++) {
         const group = rawGroups[i];
-        const msgContent = group.msg.attrs.content || "";
+        const msgContent = group.msg.attrs.content || '';
 
         if (i > 0 && isSystemContinuation(msgContent) && mergedGroups.length > 0) {
             const prev = mergedGroups[mergedGroups.length - 1];
             prev.allLlmRequests.push(...group.llmRequests);
             prev.allToolCalls.push(...group.toolCalls);
             prev.mergedMessages.push({
-                content: msgContent.slice(0, 80).replace(/[\r\n]+/g, " "),
+                content: msgContent.slice(0, 80).replace(/[\r\n]+/g, ' '),
                 timestamp: group.msg.ts,
                 spanId: group.msg.spanId,
             });
@@ -450,7 +446,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         }
     }
 
-    // Build summaries with tool calls assigned to specific turns.
+    // Build summaries with tool calls assigned to specific turns
     const messageSummaries: UserMessageSummary[] = [];
 
     for (const group of mergedGroups) {
@@ -458,7 +454,6 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         group.allToolCalls.sort((a, b) => a.ts - b.ts);
 
         const modelTurns: ModelTurnSummary[] = [];
-
         for (let j = 0; j < group.allLlmRequests.length; j++) {
             const r = group.allLlmRequests[j];
             const nextR = group.allLlmRequests[j + 1];
@@ -466,7 +461,6 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             const turnToolCalls = group.allToolCalls.filter(t =>
                 t.ts >= r.ts && (nextR ? t.ts < nextR.ts : true)
             );
-
             const preTools = j === 0
                 ? group.allToolCalls.filter(t => t.ts < r.ts)
                 : [];
@@ -477,7 +471,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             const cachedTk = r.attrs.cachedTokens || 0;
 
             modelTurns.push({
-                model: r.attrs.model || "unknown",
+                model: r.attrs.model || 'unknown',
                 inputTokens: inputTk,
                 outputTokens: r.attrs.outputTokens || 0,
                 cachedTokens: cachedTk,
@@ -486,18 +480,22 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
                 durationMs: r.dur,
                 ttftMs: r.attrs.ttft || 0,
                 timestamp: r.ts,
-                debugName: r.attrs.debugName || r.name || "",
+                debugName: r.attrs.debugName || r.name || '',
                 cacheHitRatio: inputTk > 0 ? cachedTk / inputTk : 0,
                 freshTokens: inputTk - cachedTk,
                 systemPromptFile: r.attrs.systemPromptFile,
                 toolsFile: r.attrs.toolsFile,
-                inputMessagesChars: (r.attrs.inputMessages || "").length,
+                inputMessagesChars: (r.attrs.inputMessages || '').length,
                 toolCalls: allTurnTools.map(t => ({
                     name: t.name,
                     displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
                     durationMs: t.dur,
                     timestamp: t.ts,
-                    isSubagent: t.name === "runSubagent",
+                    isSubagent: t.name === 'runSubagent',
+                    source: t.attrs.source,
+                    toolKind: t.attrs.toolKind,
+                    resultCount: t.attrs.resultCount,
+                    toolCallId: t.attrs.toolCallId,
                 })),
             });
         }
@@ -507,7 +505,11 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
             durationMs: t.dur,
             timestamp: t.ts,
-            isSubagent: t.name === "runSubagent",
+            isSubagent: t.name === 'runSubagent',
+            source: t.attrs.source,
+            toolKind: t.attrs.toolKind,
+            resultCount: t.attrs.resultCount,
+            toolCallId: t.attrs.toolCallId,
         }));
 
         const totalInput = modelTurns.reduce((s, t) => s + t.inputTokens, 0);
@@ -517,12 +519,9 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         const totalNano = modelTurns.reduce((s, t) => s + t.nanoAiu, 0);
         const totalDur = modelTurns.reduce((s, t) => s + t.durationMs, 0);
 
-        const contentPreview = (group.primaryMsg.attrs.content || "")
-            .slice(0, 80)
-            .replace(/[\r\n]+/g, " ");
+        const contentPreview = (group.primaryMsg.attrs.content || '').slice(0, 80).replace(/[\r\n]+/g, ' ');
 
         const firstTurn = modelTurns[0];
-
         messageSummaries.push({
             spanId: group.primaryMsg.spanId,
             content: contentPreview,
@@ -568,14 +567,14 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
 /** Quick-peek: check if a JSONL file contains billing data in first 4KB */
 export function quickPeekHasBillingData(filePath: string): boolean {
     try {
-        const fd = fs.openSync(filePath, "r");
+        const fd = fs.openSync(filePath, 'r');
         const buf = Buffer.alloc(4096);
         const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
         fs.closeSync(fd);
-        const sample = buf.toString("utf-8", 0, bytesRead);
-        return sample.includes("copilotUsageNanoAiu") ||
-            sample.includes("nanoAiu") ||
-            sample.includes("nanoAiU");
+        const sample = buf.toString('utf-8', 0, bytesRead);
+        return sample.includes('copilotUsageNanoAiu') ||
+            sample.includes('nanoAiu') ||
+            sample.includes('nanoAiU');
     } catch {
         return false;
     }
@@ -592,7 +591,7 @@ function setNestedValue(target: any, pathParts: unknown[], value: unknown): void
         const nextKey = pathParts[i + 1];
 
         if (cursor[key] === undefined || cursor[key] === null) {
-            cursor[key] = typeof nextKey === "number" ? [] : {};
+            cursor[key] = typeof nextKey === 'number' ? [] : {};
         }
 
         cursor = cursor[key];
@@ -601,32 +600,77 @@ function setNestedValue(target: any, pathParts: unknown[], value: unknown): void
     cursor[pathParts[pathParts.length - 1] as string | number] = value;
 }
 
-function extractChatText(value: any): string {
-    if (value === undefined || value === null) {
-        return "";
+function deleteNestedValue(target: any, pathParts: unknown[]): void {
+    if (!target || !Array.isArray(pathParts) || pathParts.length === 0) {
+        return;
     }
 
-    if (typeof value === "string") {
+    let cursor = target;
+    for (let i = 0; i < pathParts.length - 1; i++) {
+        cursor = cursor?.[pathParts[i] as string | number];
+        if (cursor === undefined || cursor === null) {
+            return;
+        }
+    }
+
+    delete cursor[pathParts[pathParts.length - 1] as string | number];
+}
+
+function pushNestedArray(target: any, pathParts: unknown[], values: unknown, startIndex: unknown): void {
+    if (!target || !Array.isArray(pathParts) || pathParts.length === 0) {
+        return;
+    }
+
+    let cursor = target;
+    for (let i = 0; i < pathParts.length - 1; i++) {
+        const key = pathParts[i] as string | number;
+        if (cursor[key] === undefined || cursor[key] === null) {
+            cursor[key] = typeof pathParts[i + 1] === 'number' ? [] : {};
+        }
+        cursor = cursor[key];
+    }
+
+    const arrayKey = pathParts[pathParts.length - 1] as string | number;
+    const arr = Array.isArray(cursor[arrayKey]) ? cursor[arrayKey] : [];
+    const numericStart = toNumber(startIndex);
+
+    if (numericStart !== undefined) {
+        arr.length = numericStart;
+    }
+
+    if (Array.isArray(values) && values.length > 0) {
+        arr.push(...values);
+    }
+
+    cursor[arrayKey] = arr;
+}
+
+function extractChatText(value: any): string {
+    if (value === undefined || value === null) {
+        return '';
+    }
+
+    if (typeof value === 'string') {
         return value;
     }
 
     if (Array.isArray(value)) {
-        return value.map(part => extractChatText(part)).filter(Boolean).join("");
+        return value.map(part => extractChatText(part)).filter(Boolean).join('');
     }
 
-    if (typeof value !== "object") {
-        return "";
+    if (typeof value !== 'object') {
+        return '';
     }
 
-    if (typeof value.text === "string") {
+    if (typeof value.text === 'string') {
         return value.text;
     }
 
-    if (typeof value.value === "string") {
+    if (typeof value.value === 'string') {
         return value.value;
     }
 
-    if (typeof value.content === "string") {
+    if (typeof value.content === 'string') {
         return value.content;
     }
 
@@ -634,7 +678,7 @@ function extractChatText(value: any): string {
         return extractChatText(value.parts);
     }
 
-    return "";
+    return '';
 }
 
 function extractMarkdownValue(value: any): string | undefined {
@@ -642,15 +686,15 @@ function extractMarkdownValue(value: any): string | undefined {
         return undefined;
     }
 
-    if (typeof value === "string") {
+    if (typeof value === 'string') {
         return value;
     }
 
-    if (typeof value.value === "string") {
+    if (typeof value.value === 'string') {
         return value.value;
     }
 
-    if (typeof value.markdown === "string") {
+    if (typeof value.markdown === 'string') {
         return value.markdown;
     }
 
@@ -658,8 +702,8 @@ function extractMarkdownValue(value: any): string | undefined {
 }
 
 function normalizeChatToolName(part: any): string {
-    const raw = asString(firstDefined(part.toolId, part.source?.label, part.kind), "tool_call");
-    return raw.replace(/^copilot[_-]/i, "") || "tool_call";
+    const raw = asString(firstDefined(part.toolId, part.source?.label, part.kind), 'tool_call');
+    return raw.replace(/^copilot[_-]/i, '') || 'tool_call';
 }
 
 function getChatToolDisplayLabel(part: any): string {
@@ -672,7 +716,50 @@ function getChatToolDisplayLabel(part: any): string {
             part.source?.label
         ),
         normalizeChatToolName(part)
-    ).replace(/[\r\n]+/g, " ").trim();
+    ).replace(/[\r\n]+/g, ' ').trim();
+}
+
+function getChatToolSource(part: any): string | undefined {
+    return asString(firstDefined(part.source?.label, part.source?.type), undefined as any);
+}
+
+function getChatToolKind(part: any): string | undefined {
+    const explicitKind = asString(part.toolSpecificData?.kind, '');
+    if (explicitKind) {
+        return explicitKind;
+    }
+
+    const normalizedName = normalizeChatToolName(part).toLowerCase();
+    if (normalizedName.includes('terminal')) {
+        return 'terminal';
+    }
+    if (normalizedName.includes('find') || normalizedName.includes('search')) {
+        return 'search';
+    }
+    if (normalizedName.includes('replace') || normalizedName.includes('edit')) {
+        return 'edit';
+    }
+    if (normalizedName.includes('error') || normalizedName.includes('diagnostic')) {
+        return 'diagnostics';
+    }
+    if (normalizedName.includes('todo')) {
+        return 'todo';
+    }
+
+    return undefined;
+}
+
+function getChatToolResultCount(part: any): number | undefined {
+    if (Array.isArray(part.resultDetails)) {
+        return part.resultDetails.length;
+    }
+    if (Array.isArray(part.resultDetails?.output)) {
+        return part.resultDetails.output.length;
+    }
+    if (Array.isArray(part.toolSpecificData?.todoList)) {
+        return part.toolSpecificData.todoList.length;
+    }
+    return undefined;
 }
 
 function getChatRequestDurationMs(request: any, timestamp: number): number {
@@ -719,8 +806,8 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
         return undefined;
     }
 
-    const content = fs.readFileSync(filePath, "utf-8");
-    const lines = content.split("\n").filter(l => l.trim());
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
     let state: any = {};
     let title: string | undefined;
 
@@ -728,14 +815,20 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
         try {
             const raw = JSON.parse(line);
 
-            if (raw.kind === 0 && raw.v && typeof raw.v === "object") {
+            if (raw.kind === 0 && raw.v && typeof raw.v === 'object') {
                 state = raw.v;
                 continue;
             }
 
             if (Array.isArray(raw.k)) {
-                setNestedValue(state, raw.k, raw.v);
-                if (raw.k.length === 1 && raw.k[0] === "customTitle" && typeof raw.v === "string") {
+                if (raw.kind === 2) {
+                    pushNestedArray(state, raw.k, raw.v, raw.i);
+                } else if (raw.kind === 3) {
+                    deleteNestedValue(state, raw.k);
+                } else {
+                    setNestedValue(state, raw.k, raw.v);
+                }
+                if (raw.k.length === 1 && raw.k[0] === 'customTitle' && typeof raw.v === 'string') {
                     title = raw.v;
                 }
             }
@@ -744,21 +837,21 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
         }
     }
 
-    const sessionId = asString(state.sessionId, path.basename(filePath, ".jsonl"));
+    const sessionId = asString(state.sessionId, path.basename(filePath, '.jsonl'));
     const baseTimestamp = toTimestamp(state.creationDate, 0);
     const selectedModel = state.inputState?.selectedModel;
     const fallbackModel = asString(firstDefined(
         selectedModel?.identifier,
         selectedModel?.metadata?.id,
         selectedModel?.metadata?.name
-    ), "unknown");
+    ), 'unknown');
 
     const requests = Array.isArray(state.requests) ? state.requests : [];
     const entries: LogEntry[] = [];
 
     for (let i = 0; i < requests.length; i++) {
         const request = requests[i];
-        if (!request || typeof request !== "object") {
+        if (!request || typeof request !== 'object') {
             continue;
         }
 
@@ -774,10 +867,10 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
             ts: timestamp,
             dur: 0,
             sid: sessionId,
-            type: "user_message",
-            name: "user_message",
+            type: 'user_message',
+            name: 'user_message',
             spanId: requestId,
-            status: "ok",
+            status: 'ok',
             attrs: {
                 content: contentPreview,
             },
@@ -801,14 +894,14 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
             ts: turnTimestamp,
             dur: getChatRequestDurationMs(request, timestamp),
             sid: sessionId,
-            type: "llm_request",
-            name: asString(request.agent?.name, "chat"),
+            type: 'llm_request',
+            name: asString(request.agent?.name, 'chat'),
             spanId: `${requestId}-response`,
             parentSpanId: requestId,
-            status: "ok",
+            status: 'ok',
             attrs: {
                 model: asString(request.modelId, fallbackModel),
-                debugName: asString(request.agent?.name, "chat"),
+                debugName: asString(request.agent?.name, 'chat'),
                 inputTokens,
                 outputTokens,
                 cachedTokens: 0,
@@ -819,7 +912,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
 
         let toolIndex = 0;
         for (const part of responseParts) {
-            if (!part || typeof part !== "object" || part.kind !== "toolInvocationSerialized") {
+            if (!part || typeof part !== 'object' || part.kind !== 'toolInvocationSerialized') {
                 continue;
             }
 
@@ -828,13 +921,17 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
                 ts: turnTimestamp + toolIndex + 1,
                 dur: 0,
                 sid: sessionId,
-                type: "tool_call",
+                type: 'tool_call',
                 name: toolName,
                 spanId: asString(part.toolCallId, `${requestId}-tool-${toolIndex}`),
                 parentSpanId: `${requestId}-response`,
-                status: part.isComplete === false ? "pending" : "ok",
+                status: part.isComplete === false ? 'pending' : 'ok',
                 attrs: {
                     displayLabel: getChatToolDisplayLabel(part),
+                    source: getChatToolSource(part),
+                    toolKind: getChatToolKind(part),
+                    resultCount: getChatToolResultCount(part),
+                    toolCallId: part.toolCallId,
                 },
             });
             toolIndex++;
@@ -846,16 +943,16 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
         return undefined;
     }
 
-    summary.title = title || (typeof state.customTitle === "string" ? state.customTitle : undefined);
+    summary.title = title || (typeof state.customTitle === 'string' ? state.customTitle : undefined);
     return summary;
 }
 
 export function findSiblingChatSessionLog(debugLogFilePath: string): string | undefined {
-    if (path.basename(path.dirname(debugLogFilePath)) === "chatSessions") {
+    if (path.basename(path.dirname(debugLogFilePath)) === 'chatSessions') {
         return fs.existsSync(debugLogFilePath) ? debugLogFilePath : undefined;
     }
 
-    if (path.basename(debugLogFilePath) !== "main.jsonl") {
+    if (path.basename(debugLogFilePath) !== 'main.jsonl') {
         return undefined;
     }
 
@@ -863,34 +960,34 @@ export function findSiblingChatSessionLog(debugLogFilePath: string): string | un
     const debugLogsDir = path.dirname(path.dirname(debugLogFilePath));
     const copilotChatDir = path.dirname(debugLogsDir);
     const workspaceStorageDir = path.dirname(copilotChatDir);
-    const candidate = path.join(workspaceStorageDir, "chatSessions", `${sessionId}.jsonl`);
+    const candidate = path.join(workspaceStorageDir, 'chatSessions', `${sessionId}.jsonl`);
 
     return fs.existsSync(candidate) ? candidate : undefined;
 }
 
 export function parseCopilotSessionFile(filePath: string): ParsedSessionFile | undefined {
-    if (path.basename(path.dirname(filePath)) === "chatSessions") {
+    if (path.basename(path.dirname(filePath)) === 'chatSessions') {
         const summary = parseChatSessionLog(filePath);
-        return summary ? { summary, sourceFile: filePath, sourceType: "chatSession" } : undefined;
+        return summary ? { summary, sourceFile: filePath, sourceType: 'chatSession' } : undefined;
     }
 
     const debugSummary = parseDebugLog(filePath);
     if (debugSummary && debugSummary.userMessages.length > 0) {
-        return { summary: debugSummary, sourceFile: filePath, sourceType: "debugLog" };
+        return { summary: debugSummary, sourceFile: filePath, sourceType: 'debugLog' };
     }
 
     const chatSessionLog = findSiblingChatSessionLog(filePath);
     const chatSummary = chatSessionLog ? parseChatSessionLog(chatSessionLog) : undefined;
     if (chatSummary && chatSummary.userMessages.length > 0) {
-        return { summary: chatSummary, sourceFile: chatSessionLog, sourceType: "chatSession" };
+        return { summary: chatSummary, sourceFile: chatSessionLog, sourceType: 'chatSession' };
     }
 
     if (debugSummary) {
-        return { summary: debugSummary, sourceFile: filePath, sourceType: "debugLog" };
+        return { summary: debugSummary, sourceFile: filePath, sourceType: 'debugLog' };
     }
 
     return chatSummary && chatSessionLog
-        ? { summary: chatSummary, sourceFile: chatSessionLog, sourceType: "chatSession" }
+        ? { summary: chatSummary, sourceFile: chatSessionLog, sourceType: 'chatSession' }
         : undefined;
 }
 
@@ -899,10 +996,10 @@ export function parseCopilotSessionLog(filePath: string): SessionSummary | undef
 }
 
 /** Title-generation debugNames that should be filtered from user-visible turns */
-const TITLE_GENERATION_NAMES = new Set(["title", "generate_title", "generateTitle", "title-generation"]);
+const TITLE_GENERATION_NAMES = new Set(['title', 'generate_title', 'generate title', 'generateTitle', 'title-generation']);
 
 function isTitleGenerationRequest(entry: LogEntry): boolean {
-    const name = (entry.attrs.debugName || "").toLowerCase();
+    const name = (entry.attrs.debugName || '').toLowerCase();
     return TITLE_GENERATION_NAMES.has(name);
 }
 
@@ -912,8 +1009,8 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
         return undefined;
     }
 
-    const content = fs.readFileSync(filePath, "utf-8");
-    const lines = content.split("\n").filter(l => l.trim());
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
     const entries: LogEntry[] = [];
 
     for (const line of lines) {
@@ -922,11 +1019,10 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
             const normalizedEntries = normalizeParsedEntries(raw, entries.length);
 
             for (const entry of normalizedEntries) {
-                // Filter out title-generation LLM requests.
-                if (entry.type === "llm_request" && isTitleGenerationRequest(entry)) {
+                // Filter out title-generation LLM requests (internal Copilot calls)
+                if (entry.type === 'llm_request' && isTitleGenerationRequest(entry)) {
                     continue;
                 }
-
                 entries.push(entry);
             }
         } catch {
@@ -935,36 +1031,24 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     }
 
     const summary = parseEntries(entries);
-    if (!summary) {
-        return undefined;
-    }
+    if (!summary) { return undefined; }
 
-    // Parse subagent child log files and attach summaries.
+    // Parse subagent child log files and attach summaries
     const sessionDir = path.dirname(filePath);
-    const childRefs = entries.filter(e => e.type === "child_session_ref" && e.attrs.childLogFile);
+    const childRefs = entries.filter(e => e.type === 'child_session_ref' && e.attrs.childLogFile);
 
     for (const ref of childRefs) {
         const childFile = path.join(sessionDir, ref.attrs.childLogFile as string);
-
-        if (!fs.existsSync(childFile)) {
-            continue;
-        }
-
+        if (!fs.existsSync(childFile)) { continue; }
         const childSummary = parseDebugLog(childFile);
+        if (!childSummary) { continue; }
 
-        if (!childSummary) {
-            continue;
-        }
-
-        // Find the matching runSubagent tool call by timestamp proximity.
+        // Find the matching runSubagent tool call by timestamp proximity
         for (const msg of summary.userMessages) {
             for (const turn of msg.modelTurns) {
                 for (const tc of turn.toolCalls) {
-                    if (
-                        tc.isSubagent &&
-                        !tc.subagentSummary &&
-                        Math.abs(tc.timestamp - ref.ts) < 5000
-                    ) {
+                    if (tc.isSubagent && !tc.subagentSummary &&
+                        Math.abs(tc.timestamp - ref.ts) < 5000) {
                         tc.subagentSummary = childSummary;
                     }
                 }
@@ -972,13 +1056,12 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
         }
     }
 
-    // Roll up subagent costs into parent message and session totals.
+    // Roll up subagent costs into parent message and session totals
     for (const msg of summary.userMessages) {
         for (const turn of msg.modelTurns) {
             for (const tc of turn.toolCalls) {
                 if (tc.subagentSummary) {
                     const sub = tc.subagentSummary;
-
                     msg.totalInputTokens += sub.totalInputTokens;
                     msg.totalOutputTokens += sub.totalOutputTokens;
                     msg.totalCachedTokens += sub.totalCachedTokens;
@@ -989,8 +1072,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
             }
         }
     }
-
-    // Recompute session totals from updated message totals.
+    // Recompute session totals from updated message totals
     summary.totalInputTokens = summary.userMessages.reduce((s, m) => s + m.totalInputTokens, 0);
     summary.totalOutputTokens = summary.userMessages.reduce((s, m) => s + m.totalOutputTokens, 0);
     summary.totalCachedTokens = summary.userMessages.reduce((s, m) => s + m.totalCachedTokens, 0);
@@ -998,7 +1080,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     summary.totalNanoAiu = summary.userMessages.reduce((s, m) => s + m.totalNanoAiu, 0);
     summary.totalDurationMs = summary.userMessages.reduce((s, m) => s + m.totalDurationMs, 0);
 
-    // Parse prompt composition from system prompt and tools files.
+    // Parse prompt composition from system_prompt and tools files
     summary.promptComposition = parsePromptComposition(sessionDir, entries);
 
     return summary;
@@ -1006,87 +1088,48 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
 
 /** Rough token estimate: ~4 chars per token for o200k_base */
 export function estimateTokens(value: number | string): number {
-    const chars = typeof value === "string" ? value.length : value;
+    const chars = typeof value === 'string' ? value.length : value;
     return Math.round(chars / 4);
 }
 
-function parsePromptComposition(
-    sessionDir: string,
-    entries: LogEntry[]
-): PromptComposition | undefined {
-    const llmRequests = entries.filter(e => e.type === "llm_request");
+function parsePromptComposition(sessionDir: string, entries: LogEntry[]): PromptComposition | undefined {
+    const llmRequests = entries.filter(e => e.type === 'llm_request');
+    if (llmRequests.length === 0) { return undefined; }
 
-    if (llmRequests.length === 0) {
-        return undefined;
-    }
+    // Collect all distinct system prompt and tools files
+    const spFiles = new Set(llmRequests.map(e => e.attrs.systemPromptFile).filter(Boolean) as string[]);
+    const tFiles = new Set(llmRequests.map(e => e.attrs.toolsFile).filter(Boolean) as string[]);
 
-    // Collect all distinct system prompt and tools files.
-    const spFiles = new Set(
-        llmRequests.map(e => e.attrs.systemPromptFile).filter(Boolean) as string[]
-    );
-
-    const tFiles = new Set(
-        llmRequests.map(e => e.attrs.toolsFile).filter(Boolean) as string[]
-    );
-
-    const systemPrompts: {
-        [filename: string]: { chars: number; estimatedTokens: number };
-    } = {};
-
+    const systemPrompts: { [filename: string]: { chars: number; estimatedTokens: number } } = {};
     for (const spFile of spFiles) {
         const spPath = path.join(sessionDir, spFile);
-
-        if (!fs.existsSync(spPath)) {
-            continue;
-        }
-
+        if (!fs.existsSync(spPath)) { continue; }
         try {
-            const raw = JSON.parse(fs.readFileSync(spPath, "utf-8"));
-            const content = typeof raw === "string" ? raw : (raw.content || JSON.stringify(raw));
-
-            systemPrompts[spFile] = {
-                chars: content.length,
-                estimatedTokens: estimateTokens(content.length),
-            };
-        } catch {
-            // skip
-        }
+            const raw = JSON.parse(fs.readFileSync(spPath, 'utf-8'));
+            const content = typeof raw === 'string' ? raw : (raw.content || JSON.stringify(raw));
+            systemPrompts[spFile] = { chars: content.length, estimatedTokens: estimateTokens(content.length) };
+        } catch { /* skip */ }
     }
 
     const toolSets: { [filename: string]: ToolDefinitionSize[] } = {};
-
     for (const toolsFile of tFiles) {
         const toolsPath = path.join(sessionDir, toolsFile);
-
-        if (!fs.existsSync(toolsPath)) {
-            continue;
-        }
-
+        if (!fs.existsSync(toolsPath)) { continue; }
         try {
-            const raw = JSON.parse(fs.readFileSync(toolsPath, "utf-8"));
-            const toolsContent = typeof raw.content === "string" ? raw.content : JSON.stringify(raw);
-            const tools = JSON.parse(toolsContent);
+            const raw = JSON.parse(fs.readFileSync(toolsPath, 'utf-8'));
+            const toolsContent = typeof raw.content === 'string' ? raw.content : JSON.stringify(raw);
+            const toolsArray = JSON.parse(toolsContent);
             const defs: ToolDefinitionSize[] = [];
-
-            if (Array.isArray(tools)) {
-                for (const tool of tools) {
-                    const name = tool.name || tool.function?.name || "unknown";
+            if (Array.isArray(toolsArray)) {
+                for (const tool of toolsArray) {
+                    const name = tool.name || tool.function?.name || 'unknown';
                     const chars = JSON.stringify(tool).length;
-
-                    defs.push({
-                        name,
-                        chars,
-                        estimatedTokens: estimateTokens(chars),
-                    });
+                    defs.push({ name, chars, estimatedTokens: estimateTokens(chars) });
                 }
-
                 defs.sort((a, b) => b.chars - a.chars);
             }
-
             toolSets[toolsFile] = defs;
-        } catch {
-            // skip
-        }
+        } catch { /* skip */ }
     }
 
     return { toolSets, systemPrompts };
@@ -1096,25 +1139,20 @@ function parsePromptComposition(
  * Incremental JSONL reader: reads only bytes from `fromOffset` to end of file.
  * Returns parsed entries and the new byte offset for next read.
  */
-export function readEntriesIncremental(
-    filePath: string,
-    fromOffset: number
-): { entries: LogEntry[]; newOffset: number } {
+export function readEntriesIncremental(filePath: string, fromOffset: number): { entries: LogEntry[]; newOffset: number } {
     const stat = fs.statSync(filePath);
-
     if (stat.size <= fromOffset) {
         return { entries: [], newOffset: fromOffset };
     }
 
-    const fd = fs.openSync(filePath, "r");
+    const fd = fs.openSync(filePath, 'r');
     const bufSize = stat.size - fromOffset;
     const buf = Buffer.alloc(bufSize);
-
     fs.readSync(fd, buf, 0, bufSize, fromOffset);
     fs.closeSync(fd);
 
-    const chunk = buf.toString("utf-8");
-    const lines = chunk.split("\n").filter(l => l.trim());
+    const chunk = buf.toString('utf-8');
+    const lines = chunk.split('\n').filter(l => l.trim());
     const entries: LogEntry[] = [];
 
     for (const line of lines) {
@@ -1123,10 +1161,9 @@ export function readEntriesIncremental(
             const normalizedEntries = normalizeParsedEntries(raw, entries.length);
 
             for (const entry of normalizedEntries) {
-                if (entry.type === "llm_request" && isTitleGenerationRequest(entry)) {
+                if (entry.type === 'llm_request' && isTitleGenerationRequest(entry)) {
                     continue;
                 }
-
                 entries.push(entry);
             }
         } catch {
@@ -1146,9 +1183,6 @@ export function formatAic(nanoAiu: number): string {
 }
 
 export function formatDuration(ms: number): string {
-    if (ms < 1000) {
-        return `${ms}ms`;
-    }
-
+    if (ms < 1000) { return `${ms}ms`; }
     return `${(ms / 1000).toFixed(1)}s`;
 }

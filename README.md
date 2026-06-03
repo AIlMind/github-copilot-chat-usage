@@ -1,33 +1,55 @@
-# Copilot Usage Tracker
+# GitHub Copilot Chat Usage
 
-A local VS Code extension that indexes Copilot/VS Code chat debug logs and turns them into a compact usage graph: cost, token totals, cache hit ratio, tool calls, terminal commands, and risky command flags.
+A local VS Code extension for inspecting GitHub Copilot Chat usage from VS Code's persisted chat/debug logs.
 
-## What this zip contains
+It builds a session view with message counts, token totals, AIC totals, tool calls, terminal command summaries, cache ratios, and an `@usage` chat participant for asking questions about the loaded session.
 
-This is a best-effort recreated extension project. The recovered `src/graph.ts` file is included as source. The surrounding files (`parser.ts`, `extension.ts`, `participant.ts`, manifest, and tests) are compatible replacements written to make the project recreatable.
+This project is not affiliated with GitHub, Microsoft, or the GitHub Copilot team.
+
+## Features
+
+- Auto-load the most recent Copilot Chat session.
+- Pick a previous session from local VS Code workspace storage.
+- Show message, model-turn, token, cache, duration, and AIC totals.
+- Show tool calls from debug logs and VS Code `chatSessions` history.
+- Summarize terminal command usage and potentially risky shell commands.
+- Ask `@usage` questions about the currently loaded session or recent sessions.
+
+## Requirements
+
+To get cost/token data, enable Copilot Chat debug log file logging in VS Code:
+
+1. Open Settings.
+2. Search for `github.copilot.chat.agentDebugLog.fileLogging.enabled`.
+3. Set it to `true`.
+4. Start a new Copilot Chat session.
+5. Run `Copilot Usage: Analyze Current Session` or use the Copilot Usage activity bar view.
+
+The extension can also read VS Code `chatSessions` files for transcript/tool-call information when debug logs are missing or incomplete. Those files do not always contain billing totals.
 
 ## Commands
 
-- `Copilot Usage: Load Most Recent Session`
-- `Copilot Usage: Load Session From File`
-- `Copilot Usage: Search Sessions`
-- `Copilot Usage: Show Current Summary`
+- `Copilot Usage: Analyze Current Session`
+- `Copilot Usage: Pick Session to Analyze`
+- `Refresh`
 
-The extension also contributes a chat participant:
+## Chat Participant
+
+Use the chat participant in Copilot Chat:
 
 ```text
-@usage summarize the current session
-@usage show risks
-@usage show tools
-@usage show commands
+@usage summarize this session
+@usage show tool usage
+@usage find risky commands
+@usage compare recent sessions about parser changes
 ```
 
-And two language model tools:
+The extension contributes two language model tools for the participant:
 
-- `copilot_usage_searchSessions`
-- `copilot_usage_getGraph`
+- `usage-search-sessions`
+- `usage-get-graph`
 
-## Build and run
+## Build
 
 ```bash
 npm install
@@ -35,28 +57,18 @@ npm run compile
 npm test
 ```
 
-Then open the folder in VS Code and press `F5` to launch an Extension Development Host.
-
-To package a `.vsix`:
+## Package
 
 ```bash
 npm run package
 ```
 
-## Log discovery
+This creates a `.vsix` file that can be installed locally:
 
-The extension searches common VS Code folders on macOS, Windows, and Linux, including Code / Code Insiders log and workspace storage directories. You can add extra roots in settings:
-
-```json
-{
-  "copilotUsageTracker.searchRoots": [
-    "/absolute/path/to/logs"
-  ]
-}
+```bash
+code --install-extension github-copilot-chat-usage-0.1.0.vsix
 ```
 
-The parser is deliberately tolerant: it handles JSONL-style logs with many possible field names (`sessionId`, `sid`, `inputTokens`, `prompt_tokens`, `toolCalls`, `toolName`, `durationMs`, and so on). If your local Copilot debug log schema differs, adjust `src/parser.ts` in one place.
+## Notes
 
-## Completeness verdict
-
-This zip should be enough to recreate and iterate on the plugin as a VS Code extension project, but it is not guaranteed to be a byte-for-byte copy of the original screenshot source. See `RECOVERY_NOTES.md` for exact confidence notes.
+VS Code and Copilot Chat log formats are not public stable APIs. The parser is intentionally tolerant, but some values are best-effort and may need updates if VS Code changes its persisted chat or debug-log schema.

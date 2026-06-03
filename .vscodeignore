@@ -2,5 +2,7 @@ src/**
 test/**
 .gitignore
 tsconfig.json
+RECOVERY_NOTES.md
 *.zip
+*.tgz
 node_modules/**/.cache/**

@@ -1,5 +1,9 @@
 node_modules/
 out/
 *.vsix
+*.tgz
 .DS_Store
 .vscode-test/
+.env
+.env.*
+*.log

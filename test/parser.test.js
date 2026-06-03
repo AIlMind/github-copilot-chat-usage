@@ -453,14 +453,16 @@ test('parseChatSessionLog - reconstructs VS Code chatSessions patches', () => {
   assert(result !== undefined, 'result should not be undefined');
   assertEqual(result.sessionId, 'sample-chat-session', 'session ID');
   assertEqual(result.title, 'Enable chat debug view steps', 'custom title');
-  assertEqual(result.userMessages.length, 1, 'one user message');
+  assertEqual(result.userMessages.length, 2, 'two user messages from appended request patches');
   assertEqual(result.userMessages[0].content, 'Enable chat debug view steps', 'message content');
+  assertEqual(result.userMessages[1].content, 'Can you tell me how the code works?', 'follow-up message content');
   assertEqual(result.modelTurnCount, 1, 'one model turn');
   assertEqual(result.totalOutputTokens, 42, 'completion tokens');
   assertEqual(result.totalDurationMs, 1234, 'elapsed time');
   assertEqual(result.toolCallCount, 1, 'one tool call');
   assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].name, 'findTextInFiles', 'normalized tool name');
   assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].displayLabel, 'Searched files', 'tool label');
+  assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].toolKind, 'search', 'tool kind');
 });
 
 console.log(`\n${'='.repeat(50)}`);
