@@ -1,0 +1,6 @@
+src/**
+test/**
+.gitignore
+tsconfig.json
+*.zip
+node_modules/**/.cache/**

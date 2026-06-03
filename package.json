@@ -1,0 +1,176 @@
+{
+  "name": "github-copilot-chat-usage",
+  "publisher": "ailmind",
+  "displayName": "GitHub Copilot Chat Usage",
+  "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:copilotUsageTracker.analyzeSession",
+    "onCommand:copilotUsageTracker.pickSession",
+    "onCommand:copilotUsageTracker.refresh",
+    "onView:copilotUsageTree",
+    "onChatParticipant:copilot-usage-tracker.usage",
+    "onLanguageModelTool:usage-search-sessions",
+    "onLanguageModelTool:usage-get-graph"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotUsageTracker.analyzeSession",
+        "title": "Copilot Usage: Analyze Current Session"
+      },
+      {
+        "command": "copilotUsageTracker.pickSession",
+        "title": "Copilot Usage: Pick Session to Analyze"
+      },
+      {
+        "command": "copilotUsageTracker.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "copilot-usage",
+          "title": "Copilot Usage",
+          "icon": "$(dashboard)"
+        }
+      ]
+    },
+    "views": {
+      "copilot-usage": [
+        {
+          "id": "copilotUsageTree",
+          "name": "Token Usage"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "copilotUsageTracker.pickSession",
+          "when": "view == copilotUsageTree",
+          "group": "navigation"
+        },
+        {
+          "command": "copilotUsageTracker.refresh",
+          "when": "view == copilotUsageTree",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "copilotUsageTree",
+        "contents": "No Copilot Chat debug logs found.\n\nTo use this extension, enable debug log file logging:\n\n...",
+        "when": "!copilotUsageTracker.hasSession"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "copilot-usage-tracker.usage",
+        "fullName": "Usage Analyzer",
+        "name": "usage",
+        "description": "Analyze Copilot chat session data - costs, tool calls, commands, patterns. Ask about any session.",
+        "isSticky": false
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "usage-search-sessions",
+        "tags": ["copilot", "usage", "sessions"],
+        "toolReferenceName": "searchSessions",
+        "displayName": "Search Chat Sessions",
+        "modelDescription": "Search recent Copilot Chat sessions by keyword (supports multiple words as OR match). Always returns the last 2 days of sessions ...",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Keywords to match against session titles (space-separated, OR match — any word matching counts). Like a wildcard search."
+            },
+            "daysBack": {
+              "type": "number",
+              "description": "How many days back to search (default: 3)"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum sessions to return."
+            }
+          }
+        }
+      },
+      {
+        "name": "usage-get-graph",
+        "tags": ["copilot", "usage", "analysis"],
+        "toolReferenceName": "getGraph",
+        "displayName": "Get Session Graph",
+        "modelDescription": "Get the full data graph for a Copilot Chat session. Returns stats, messages, tool calls, commands, and costs.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "type": "string",
+              "description": "Session ID (or prefix) to load. Omit for the current session."
+            },
+            "includeMessages": {
+              "type": "boolean",
+              "description": "Whether to include per-message summaries."
+            },
+            "maxMessages": {
+              "type": "number",
+              "description": "Maximum messages to include."
+            }
+          }
+        }
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Usage Tracker",
+      "properties": {
+        "copilotUsageTracker.searchRoots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional directories to scan for Copilot/VS Code chat debug logs. Use absolute paths."
+        },
+        "copilotUsageTracker.maxSearchDepth": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 12,
+          "description": "Maximum recursion depth when scanning configured and default log roots."
+        },
+        "copilotUsageTracker.maxIndexedFiles": {
+          "type": "number",
+          "default": 250,
+          "minimum": 20,
+          "maximum": 5000,
+          "description": "Maximum candidate log files to index before sorting by modification time."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc --watch -p ./",
+    "test": "npm run compile && node test/parser.test.js",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.101.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.5.4"
+  }
+}
