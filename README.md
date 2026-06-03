@@ -6,7 +6,7 @@ This extension is not affiliated with GitHub or Microsoft.
 
 GitHub documents Copilot usage in AI credits, where "1 AI credit = $0.01 USD" in the official [GitHub Copilot billing docs](https://docs.github.com/en/billing/concepts/product-billing/github-copilot-billing).
 
-![GitHub Copilot Chat Usage showing token, cost, and tool-call insights](images/usage-screenshot.png)
+![GitHub Copilot Chat Usage showing token, cost, and tool-call insights](https://ailmind.com/images/copilot-usage-screenshot.png)
 
 ## Features
 
