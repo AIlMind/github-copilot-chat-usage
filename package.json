@@ -60,7 +60,7 @@
         {
           "id": "copilot-usage",
           "title": "Copilot Usage",
-          "icon": "images/ailmind-icon.svg"
+          "icon": "$(dashboard)"
         }
       ]
     },
