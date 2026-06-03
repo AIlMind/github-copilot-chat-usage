@@ -1,31 +1,28 @@
 # GitHub Copilot Chat Usage
 
-A local VS Code extension for inspecting GitHub Copilot Chat usage from VS Code's persisted chat/debug logs.
+GitHub Copilot Chat Usage is a lightweight VS Code extension by [Ailmind](https://ailmind.com) for understanding where your Copilot Chat spend goes. It reads local VS Code Copilot Chat logs and shows cost, token, and tool-call breakdowns by conversation message.
 
-It builds a session view with message counts, token totals, AIC totals, tool calls, terminal command summaries, cache ratios, and an `@usage` chat participant for asking questions about the loaded session.
-
-This project is not affiliated with GitHub, Microsoft, or the GitHub Copilot team.
+GitHub documents Copilot usage in AI credits, where "1 AI credit = $0.01 USD" in the official [GitHub Copilot billing docs](https://docs.github.com/en/billing/concepts/product-billing/github-copilot-billing).
 
 ## Features
 
-- Auto-load the most recent Copilot Chat session.
-- Pick a previous session from local VS Code workspace storage.
-- Show message, model-turn, token, cache, duration, and AIC totals.
-- Show tool calls from debug logs and VS Code `chatSessions` history.
-- Summarize terminal command usage and potentially risky shell commands.
-- Ask `@usage` questions about the currently loaded session or recent sessions.
+- See AIC, token, cache, model-turn, and duration totals for each message.
+- Compare input, output, cached, and fresh-token usage across a session.
+- Inspect built-in tool calls such as searches, file reads, edits, diagnostics, todos, and terminal commands.
+- Use `@usage` in Copilot Chat to ask AI questions about the currently loaded session or recent sessions.
+- Open the GitHub AI credits documentation directly from the AIC row.
 
-## Requirements
+## Setup
 
-To get cost/token data, enable Copilot Chat debug log file logging in VS Code:
+To get cost/token data, set this VS Code setting to `true`:
 
-1. Open Settings.
-2. Search for `github.copilot.chat.agentDebugLog.fileLogging.enabled`.
-3. Set it to `true`.
-4. Start a new Copilot Chat session.
-5. Run `Copilot Usage: Analyze Current Session` or use the Copilot Usage activity bar view.
+```text
+github.copilot.chat.agentDebugLog.fileLogging.enabled
+```
 
-The extension can also read VS Code `chatSessions` files for transcript/tool-call information when debug logs are missing or incomplete. Those files do not always contain billing totals.
+Then start a new Copilot Chat session and open the Copilot Usage activity bar view.
+
+The extension can also read VS Code `chatSessions` files for transcript and tool-call information when debug logs are missing or incomplete. Those files do not always contain billing totals.
 
 ## Privacy
 
@@ -39,40 +36,12 @@ When you use the `@usage` chat participant, the extension sends the selected ses
 - `Copilot Usage: Pick Session to Analyze`
 - `Refresh`
 
-## Chat Participant
-
-Use the chat participant in Copilot Chat:
-
-```text
-@usage summarize this session
-@usage show tool usage
-@usage find risky commands
-@usage compare recent sessions about parser changes
-```
-
-The extension contributes two language model tools for the participant:
-
-- `usage-search-sessions`
-- `usage-get-graph`
-
 ## Build
 
 ```bash
 npm install
 npm run compile
 npm test
-```
-
-## Package
-
-```bash
-npm run package
-```
-
-This creates a `.vsix` file that can be installed locally:
-
-```bash
-code --install-extension github-copilot-chat-usage-0.1.0.vsix
 ```
 
 ## Notes

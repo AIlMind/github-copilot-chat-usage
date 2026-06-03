@@ -5,9 +5,14 @@
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
   "version": "0.1.0",
   "license": "MIT",
+  "homepage": "https://ailmind.com",
   "repository": {
     "type": "git",
     "url": "https://github.com/ailmind/github-copilot-chat-usage.git"
+  },
+  "galleryBanner": {
+    "color": "#1F2937",
+    "theme": "dark"
   },
   "engines": {
     "vscode": "^1.101.0"
@@ -73,7 +78,7 @@
     "viewsWelcome": [
       {
         "view": "copilotUsageTree",
-        "contents": "No Copilot Chat debug logs found.\n\nTo use this extension, enable debug log file logging:\n\n1. Open Settings (Ctrl+,)\n2. Search for `github.copilot.chat.agentDebugLog.fileLogging.enabled`\n3. Set it to **true**\n4. Start a new Copilot Chat session\n5. Click Refresh above\n\n[Open Settings](command:workbench.action.openSettings?%22github.copilot.chat.agentDebugLog.fileLogging.enabled%22)",
+        "contents": "Set `github.copilot.chat.agentDebugLog.fileLogging.enabled` to **true**, then start a new Copilot Chat session.\n\n[Open Setting](command:workbench.action.openSettings?%22github.copilot.chat.agentDebugLog.fileLogging.enabled%22)",
         "when": "!copilotUsageTracker.hasSession"
       }
     ],
