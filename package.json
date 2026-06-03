@@ -5,6 +5,7 @@
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
   "version": "0.1.0",
   "license": "MIT",
+  "icon": "images/ailmind-icon-128.png",
   "homepage": "https://ailmind.com",
   "repository": {
     "type": "git",
@@ -17,7 +18,17 @@
   "engines": {
     "vscode": "^1.101.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "usage",
+    "ai credits",
+    "tokens",
+    "costs"
+  ],
   "activationEvents": [
     "onCommand:copilotUsageTracker.analyzeSession",
     "onCommand:copilotUsageTracker.pickSession",

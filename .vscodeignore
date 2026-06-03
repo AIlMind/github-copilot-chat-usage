@@ -5,4 +5,7 @@ test/**
 tsconfig.json
 *.zip
 *.tgz
+*.vsix
+.DS_Store
+**/.DS_Store
 node_modules/**/.cache/**

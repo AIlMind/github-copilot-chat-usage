@@ -2,6 +2,8 @@
 
 GitHub Copilot Chat Usage is a lightweight VS Code extension by [Ailmind](https://ailmind.com) for understanding where your Copilot Chat spend goes. It reads local VS Code Copilot Chat logs and shows cost, token, and tool-call breakdowns by conversation message.
 
+This extension is not affiliated with GitHub or Microsoft.
+
 GitHub documents Copilot usage in AI credits, where "1 AI credit = $0.01 USD" in the official [GitHub Copilot billing docs](https://docs.github.com/en/billing/concepts/product-billing/github-copilot-billing).
 
 ## Features
