@@ -27,6 +27,12 @@ To get cost/token data, enable Copilot Chat debug log file logging in VS Code:
 
 The extension can also read VS Code `chatSessions` files for transcript/tool-call information when debug logs are missing or incomplete. Those files do not always contain billing totals.
 
+## Privacy
+
+This extension reads local VS Code/Copilot Chat storage files from your machine. It does not upload data by itself.
+
+When you use the `@usage` chat participant, the extension sends the selected session summary to the VS Code language model you are using so it can answer your question. Session summaries may include message previews, tool names, terminal command summaries, token counts, and cost totals.
+
 ## Commands
 
 - `Copilot Usage: Analyze Current Session`
