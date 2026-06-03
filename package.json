@@ -50,6 +50,11 @@
         "title": "Copilot Usage: Pick Session to Analyze"
       },
       {
+        "command": "copilotUsageTracker.pickSession.loading",
+        "title": "Loading Sessions...",
+        "icon": "$(sync~spin)"
+      },
+      {
         "command": "copilotUsageTracker.refresh",
         "title": "Refresh",
         "icon": "$(refresh)"
@@ -76,7 +81,12 @@
       "view/title": [
         {
           "command": "copilotUsageTracker.pickSession",
-          "when": "view == copilotUsageTree",
+          "when": "view == copilotUsageTree && !copilotUsageTracker.isPickingSession",
+          "group": "navigation"
+        },
+        {
+          "command": "copilotUsageTracker.pickSession.loading",
+          "when": "view == copilotUsageTree && copilotUsageTracker.isPickingSession",
           "group": "navigation"
         },
         {

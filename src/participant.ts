@@ -15,7 +15,7 @@ import { SessionGraph } from './graph';
 let currentGraph: SessionGraph | undefined;
 const loadedGraphs = new Map<string, SessionGraph>();
 
-type SessionFinder = () => { id: string; mainJsonl: string; modifiedTime: number }[];
+type SessionFinder = (daysBack?: number) => { id: string; mainJsonl: string; modifiedTime: number }[];
 type TitleResolver = (id: string) => string | undefined;
 
 let sessionFinder: SessionFinder = () => [];
@@ -43,7 +43,7 @@ class SearchSessionsTool implements vscode.LanguageModelTool<SearchInput> {
     invoke(options: vscode.LanguageModelToolInvocationOptions<SearchInput>): vscode.ProviderResult<vscode.LanguageModelToolResult> {
         const { query, daysBack = 3, limit = 25 } = options.input;
 
-        const sessions = sessionFinder();
+        const sessions = sessionFinder(Math.max(daysBack, 2));
         const cutoff = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
         const twoDayCutoff = Date.now() - (2 * 24 * 60 * 60 * 1000);
 

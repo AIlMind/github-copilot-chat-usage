@@ -32,6 +32,23 @@ interface TitleEntry {
 }
 
 const AI_CREDITS_DOCS_URI = vscode.Uri.parse('https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals');
+const INITIAL_PICK_DAYS = 3;
+const PICK_LOAD_MORE_DAYS = 10;
+const DEBUG_DIR_CACHE_MS = 30_000;
+const TITLE_CHAT_TAIL_BYTES = 256 * 1024;
+const TITLE_DEBUG_HEAD_BYTES = 16 * 1024;
+
+interface SessionCandidate {
+    id: string;
+    mainJsonl: string;
+    chatSessionJsonl?: string;
+    modifiedTime: number;
+}
+
+interface SessionScanResult<T extends SessionCandidate = SessionCandidate> {
+    sessions: T[];
+    hasOlder: boolean;
+}
 
 function pathExists(candidate: string | undefined): candidate is string {
     return !!candidate && fs.existsSync(candidate);
@@ -111,122 +128,124 @@ function collectDebugLogDirs(root: string, maxDepth: number, results: Set<string
     }
 }
 
-function buildTitleCache(): Map<string, TitleEntry> {
-    const cache = new Map<string, TitleEntry>();
-    for (const wsStorageRoot of getWorkspaceStorageRoots()) {
-        let workspaceDirs: string[];
-        try {
-            workspaceDirs = fs.readdirSync(wsStorageRoot);
-        } catch {
-            continue;
-        }
+const titleCache = new Map<string, TitleEntry>();
+const sessionCandidateById = new Map<string, SessionCandidate>();
+let debugLogDirsCache: { expiresAt: number; dirs: string[] } | undefined;
 
-        for (const dir of workspaceDirs) {
-            // Priority 5: customTitle from chatSessions JSONL
-            const chatSessionsDir = path.join(wsStorageRoot, dir, 'chatSessions');
-            if (fs.existsSync(chatSessionsDir)) {
-                try {
-                    const files = fs.readdirSync(chatSessionsDir);
-                    for (const file of files) {
-                        if (!file.endsWith('.jsonl')) { continue; }
-                        const sessionId = file.replace('.jsonl', '');
-                        if (cache.has(sessionId) && cache.get(sessionId)!.priority >= 5) { continue; }
-
-                        const filePath = path.join(chatSessionsDir, file);
-                        try {
-                            // Read entire file and search for customTitle line
-                            // (customTitle can be far into the file for long sessions)
-                            const content = fs.readFileSync(filePath, 'utf-8');
-                            const lastIdx = content.lastIndexOf('"customTitle"');
-                            if (lastIdx >= 0) {
-                                const lineStart = content.lastIndexOf('\n', lastIdx) + 1;
-                                const lineEnd = content.indexOf('\n', lastIdx);
-                                const line = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd);
-                                try {
-                                    const obj = JSON.parse(line);
-                                    if (obj.kind === 1 && obj.v) {
-                                        cache.set(sessionId, { title: obj.v, priority: 5 });
-                                    }
-                                } catch { /* partial line */ }
-                            }
-                        } catch { /* skip */ }
-                    }
-                } catch { /* skip */ }
-            }
-
-            // Priority 2: First user message content from debug logs
-            const debugLogsDir = path.join(wsStorageRoot, dir, 'GitHub.copilot-chat', 'debug-logs');
-            if (fs.existsSync(debugLogsDir)) {
-                try {
-                    const sessions = fs.readdirSync(debugLogsDir, { withFileTypes: true });
-                    for (const entry of sessions) {
-                        if (!entry.isDirectory()) { continue; }
-                        const sessionId = entry.name;
-                        if (cache.has(sessionId) && cache.get(sessionId)!.priority >= 2) { continue; }
-
-                        const mainJsonl = path.join(debugLogsDir, sessionId, 'main.jsonl');
-                        if (!fs.existsSync(mainJsonl)) { continue; }
-
-                        try {
-                            // Read first 4KB to find first user_message or debugName
-                            const fd = fs.openSync(mainJsonl, 'r');
-                            const buf = Buffer.alloc(4096);
-                            const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
-                            fs.closeSync(fd);
-
-                            const chunk = buf.toString('utf-8', 0, bytesRead);
-                            const lines = chunk.split('\n');
-                            for (const line of lines) {
-                                if (!line.trim()) { continue; }
-                                try {
-                                    const obj = JSON.parse(line);
-                                    // Priority 1: debugName
-                                    if (obj.type === 'llm_request' && obj.attrs?.debugName &&
-                                        !cache.has(sessionId)) {
-                                        const name = obj.attrs.debugName;
-                                        if (name !== 'title' && name !== 'generate title') {
-                                            cache.set(sessionId, { title: name, priority: 1 });
-                                        }
-                                    }
-                                    // Priority 2: first user message
-                                    if (obj.type === 'user_message' && obj.attrs?.content) {
-                                        const content = obj.attrs.content.slice(0, 60).replace(/[\r\n]+/g, ' ').trim();
-                                        if (content && (!cache.has(sessionId) || cache.get(sessionId)!.priority < 2)) {
-                                            cache.set(sessionId, { title: content, priority: 2 });
-                                            break; // first user message found
-                                        }
-                                    }
-                                } catch { /* partial line */ }
-                            }
-                        } catch { /* skip */ }
-                    }
-                } catch { /* skip */ }
-            }
-        }
+function rememberSessionCandidate(candidate: SessionCandidate): void {
+    const existing = sessionCandidateById.get(candidate.id);
+    if (!existing || candidate.modifiedTime > existing.modifiedTime) {
+        sessionCandidateById.set(candidate.id, candidate);
     }
-    return cache;
-}
-
-/** Lazily-built title cache, rebuilt when pickSession is called */
-let titleCache: Map<string, TitleEntry> | undefined;
-
-function getTitleCache(): Map<string, TitleEntry> {
-    if (!titleCache) {
-        titleCache = buildTitleCache();
-    }
-    return titleCache;
 }
 
 function invalidateTitleCache(): void {
-    titleCache = undefined;
+    titleCache.clear();
 }
 
-function resolveSessionTitle(sessionId: string): string | undefined {
-    const entry = getTitleCache().get(sessionId);
-    return entry?.title;
+function readFileWindow(filePath: string, maxBytes: number, fromEnd = false): string | undefined {
+    try {
+        const stat = fs.statSync(filePath);
+        const bytesToRead = Math.min(stat.size, maxBytes);
+        const offset = fromEnd ? Math.max(0, stat.size - bytesToRead) : 0;
+        const fd = fs.openSync(filePath, 'r');
+        const buffer = Buffer.alloc(bytesToRead);
+        const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, offset);
+        fs.closeSync(fd);
+        return buffer.toString('utf-8', 0, bytesRead);
+    } catch {
+        return undefined;
+    }
 }
 
-function findAllDebugLogDirs(): string[] {
+function extractCustomTitle(content: string): string | undefined {
+    let searchFrom = content.length;
+    while (searchFrom > 0) {
+        const idx = content.lastIndexOf('"customTitle"', searchFrom);
+        if (idx < 0) { return undefined; }
+
+        const lineStart = content.lastIndexOf('\n', idx) + 1;
+        const lineEnd = content.indexOf('\n', idx);
+        const line = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd);
+        try {
+            const obj = JSON.parse(line);
+            if (obj.kind === 1 && typeof obj.v === 'string' && obj.v.trim()) {
+                return obj.v.trim();
+            }
+        } catch {
+            // The line may be partial if it started before the window we read.
+        }
+        searchFrom = idx - 1;
+    }
+    return undefined;
+}
+
+function readChatSessionTitle(filePath: string): string | undefined {
+    const tail = readFileWindow(filePath, TITLE_CHAT_TAIL_BYTES, true);
+    const fromTail = tail ? extractCustomTitle(tail) : undefined;
+    if (fromTail) { return fromTail; }
+
+    const head = readFileWindow(filePath, TITLE_DEBUG_HEAD_BYTES);
+    return head ? extractCustomTitle(head) : undefined;
+}
+
+function readDebugLogTitle(filePath: string): TitleEntry | undefined {
+    const chunk = readFileWindow(filePath, TITLE_DEBUG_HEAD_BYTES);
+    if (!chunk) { return undefined; }
+
+    const lines = chunk.split('\n');
+    let fallback: TitleEntry | undefined;
+    for (const line of lines) {
+        if (!line.trim()) { continue; }
+        try {
+            const obj = JSON.parse(line);
+            if (obj.type === 'llm_request' && obj.attrs?.debugName && !fallback) {
+                const name = String(obj.attrs.debugName).trim();
+                if (name && name !== 'title' && name !== 'generate title') {
+                    fallback = { title: name, priority: 1 };
+                }
+            }
+            if (obj.type === 'user_message' && obj.attrs?.content) {
+                const content = String(obj.attrs.content).slice(0, 60).replace(/[\r\n]+/g, ' ').trim();
+                if (content) {
+                    return { title: content, priority: 2 };
+                }
+            }
+        } catch {
+            // skip partial lines
+        }
+    }
+    return fallback;
+}
+
+function resolveSessionTitle(sessionId: string, candidate = sessionCandidateById.get(sessionId)): string | undefined {
+    const cached = titleCache.get(sessionId);
+    if (cached) { return cached.title; }
+
+    let resolved: TitleEntry | undefined;
+    if (candidate?.chatSessionJsonl) {
+        const title = readChatSessionTitle(candidate.chatSessionJsonl);
+        if (title) {
+            resolved = { title, priority: 5 };
+        }
+    }
+
+    if (!resolved && candidate?.mainJsonl) {
+        resolved = readDebugLogTitle(candidate.mainJsonl);
+    }
+
+    if (resolved) {
+        titleCache.set(sessionId, resolved);
+    }
+
+    return resolved?.title;
+}
+
+function findAllDebugLogDirs(refresh = false): string[] {
+    if (!refresh && debugLogDirsCache && debugLogDirsCache.expiresAt > Date.now()) {
+        return debugLogDirsCache.dirs;
+    }
+
     const results = new Set<string>();
 
     for (const wsStorageRoot of getWorkspaceStorageRoots()) {
@@ -252,40 +271,97 @@ function findAllDebugLogDirs(): string[] {
         collectDebugLogDirs(root, maxDepth, results);
     }
 
-    return [...results];
+    const dirs = [...results];
+    debugLogDirsCache = { dirs, expiresAt: Date.now() + DEBUG_DIR_CACHE_MS };
+    return dirs;
 }
 
-interface SessionCandidate {
-    id: string;
-    mainJsonl: string;
-    chatSessionJsonl?: string;
-    modifiedTime: number;
-}
-
-function findSessionsInDir(debugLogsDir: string): SessionCandidate[] {
+function scanSessionsInDir(debugLogsDir: string, options: { modifiedSince?: number } = {}): SessionScanResult {
     const sessions: SessionCandidate[] = [];
-    if (!fs.existsSync(debugLogsDir)) { return sessions; }
+    let hasOlder = false;
+    if (!fs.existsSync(debugLogsDir)) { return { sessions, hasOlder }; }
 
-    const entries = fs.readdirSync(debugLogsDir, { withFileTypes: true });
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(debugLogsDir, { withFileTypes: true });
+    } catch {
+        return { sessions, hasOlder };
+    }
+
     for (const entry of entries) {
         if (entry.isDirectory()) {
             const mainJsonl = path.join(debugLogsDir, entry.name, 'main.jsonl');
             if (fs.existsSync(mainJsonl)) {
-                const debugStat = fs.statSync(mainJsonl);
-                const chatSessionJsonl = findSiblingChatSessionLog(mainJsonl);
-                const chatStat = chatSessionJsonl ? fs.statSync(chatSessionJsonl) : undefined;
-                sessions.push({
-                    id: entry.name,
-                    mainJsonl,
-                    chatSessionJsonl,
-                    modifiedTime: Math.max(debugStat.mtimeMs, chatStat?.mtimeMs || 0),
-                });
+                let debugStat: fs.Stats;
+                let chatStat: fs.Stats | undefined;
+                try {
+                    debugStat = fs.statSync(mainJsonl);
+                    const chatSessionJsonl = findSiblingChatSessionLog(mainJsonl);
+                    chatStat = chatSessionJsonl ? fs.statSync(chatSessionJsonl) : undefined;
+                    const modifiedTime = Math.max(debugStat.mtimeMs, chatStat?.mtimeMs || 0);
+                    if (options.modifiedSince !== undefined && modifiedTime < options.modifiedSince) {
+                        hasOlder = true;
+                        continue;
+                    }
+
+                    const candidate: SessionCandidate = {
+                        id: entry.name,
+                        mainJsonl,
+                        chatSessionJsonl,
+                        modifiedTime,
+                    };
+                    rememberSessionCandidate(candidate);
+                    sessions.push(candidate);
+                } catch {
+                    continue;
+                }
             }
         }
     }
     // Sort by most recent first
     sessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
-    return sessions;
+    return { sessions, hasOlder };
+}
+
+function findSessionsInDir(debugLogsDir: string): SessionCandidate[] {
+    return scanSessionsInDir(debugLogsDir).sessions;
+}
+
+function getWorkspaceLabelForDebugDir(debugLogsDir: string): string {
+    return path.basename(path.dirname(path.dirname(debugLogsDir)));
+}
+
+function getCurrentWorkspaceDebugDir(context: vscode.ExtensionContext): string | undefined {
+    if (!context.storageUri) { return undefined; }
+
+    // storageUri is like: .../workspaceStorage/<ws-id>/copilot-usage-tracker
+    // We need: .../workspaceStorage/<ws-id>/GitHub.copilot-chat/debug-logs
+    const wsDir = path.dirname(context.storageUri.fsPath);
+    const candidate = path.join(wsDir, 'GitHub.copilot-chat', 'debug-logs');
+    return fs.existsSync(candidate) ? candidate : undefined;
+}
+
+function findSessionsForDays(daysBack?: number): SessionScanResult<SessionCandidate & { wsDir: string }> {
+    const modifiedSince = daysBack === undefined
+        ? undefined
+        : Date.now() - (daysBack * 24 * 60 * 60 * 1000);
+    const byFile = new Map<string, SessionCandidate & { wsDir: string }>();
+    let hasOlder = false;
+
+    for (const dir of findAllDebugLogDirs()) {
+        const scan = scanSessionsInDir(dir, { modifiedSince });
+        hasOlder = hasOlder || scan.hasOlder;
+        const wsDir = getWorkspaceLabelForDebugDir(dir);
+        for (const session of scan.sessions) {
+            const existing = byFile.get(session.mainJsonl);
+            if (!existing || session.modifiedTime > existing.modifiedTime) {
+                byFile.set(session.mainJsonl, { ...session, wsDir });
+            }
+        }
+    }
+
+    const sessions = [...byFile.values()].sort((a, b) => b.modifiedTime - a.modifiedTime);
+    return { sessions, hasOlder };
 }
 
 function safeQuickPeekHasBillingData(file: string): boolean {
@@ -296,12 +372,16 @@ function safeQuickPeekHasBillingData(file: string): boolean {
     }
 }
 
-function applyResolvedTitle(summary: SessionSummary): void {
-    summary.title = resolveSessionTitle(summary.sessionId) || summary.title;
+function applyResolvedTitle(summary: SessionSummary, candidate?: SessionCandidate): void {
+    summary.title = resolveSessionTitle(summary.sessionId, candidate) || summary.title;
 }
 
 function parseSessionCandidate(candidate: SessionCandidate) {
-    return parseCopilotSessionFile(candidate.mainJsonl);
+    const parsed = parseCopilotSessionFile(candidate.mainJsonl);
+    if (parsed) {
+        applyResolvedTitle(parsed.summary, candidate);
+    }
+    return parsed;
 }
 
 // ---- Tree View ----
@@ -877,6 +957,52 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     }
 }
 
+type SessionPickItem =
+    | (vscode.QuickPickItem & { itemType: 'session'; session: SessionCandidate & { wsDir: string } })
+    | (vscode.QuickPickItem & { itemType: 'loadMore' });
+
+function getCurrentWorkspaceLatestSessionId(context: vscode.ExtensionContext): string | undefined {
+    const currentWsDebugDir = getCurrentWorkspaceDebugDir(context);
+    if (!currentWsDebugDir) { return undefined; }
+
+    const sessions = scanSessionsInDir(currentWsDebugDir).sessions;
+    return sessions[0]?.id;
+}
+
+function createSessionPickItems(
+    sessions: (SessionCandidate & { wsDir: string })[],
+    currentWsSessionId: string | undefined,
+    hasOlder: boolean,
+    loadedDays: number
+): SessionPickItem[] {
+    const items: SessionPickItem[] = sessions.map(session => {
+        const title = resolveSessionTitle(session.id, session);
+        const date = new Date(session.modifiedTime);
+        const timeStr = date.toLocaleString();
+        const isCurrent = session.id === currentWsSessionId;
+        const currentTag = isCurrent ? ' (current session)' : '';
+        return {
+            itemType: 'session',
+            label: `${title || session.id.slice(0, 8) + '...'}${currentTag}`,
+            description: `${timeStr}${title ? ' (' + session.id.slice(0, 8) + ')' : ''}`,
+            detail: session.mainJsonl,
+            session,
+        };
+    });
+
+    if (hasOlder) {
+        items.push({
+            itemType: 'loadMore',
+            label: '$(history) Load older sessions',
+            description: `Currently showing last ${loadedDays} days`,
+            detail: `Adds ${PICK_LOAD_MORE_DAYS} more days to this list.`,
+            alwaysShow: true,
+        });
+    }
+
+    return items;
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const treeProvider = new UsageTreeProvider();
 
@@ -885,21 +1011,15 @@ export function activate(context: vscode.ExtensionContext) {
         showCollapseAll: true,
     });
 
+    // File watcher state
+    let currentSessionFile: string | undefined;
+    let currentSessionCandidate: SessionCandidate | undefined;
+    let fileWatcher: vscode.FileSystemWatcher | undefined;
+    let debounceTimer: NodeJS.Timeout | undefined;
+
     // Auto-load the most recent session, prioritizing the current workspace
     const autoLoad = () => {
-        const debugLogDirs = findAllDebugLogDirs();
-
-        // Determine current workspace's debug-log dir from storageUri
-        let currentWsDebugDir: string | undefined;
-        if (context.storageUri) {
-            // storageUri is like: .../workspaceStorage/<ws-id>/copilot-usage-tracker
-            // We need: .../workspaceStorage/<ws-id>/GitHub.copilot-chat/debug-logs
-            const wsDir = path.dirname(context.storageUri.fsPath);
-            const candidate = path.join(wsDir, 'GitHub.copilot-chat', 'debug-logs');
-            if (fs.existsSync(candidate)) {
-                currentWsDebugDir = candidate;
-            }
-        }
+        const currentWsDebugDir = getCurrentWorkspaceDebugDir(context);
 
         // Collect all sessions, prioritizing current workspace
         let allSessions: SessionCandidate[] = [];
@@ -911,20 +1031,21 @@ export function activate(context: vscode.ExtensionContext) {
 
         if (allSessions.length === 0) {
             // Fall back to all workspaces, sorted by most recent globally
-            for (const dir of debugLogDirs) {
-                allSessions.push(...findSessionsInDir(dir));
+            allSessions = findSessionsForDays(INITIAL_PICK_DAYS).sessions;
+            if (allSessions.length === 0) {
+                allSessions = findSessionsForDays().sessions;
             }
-            allSessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
         }
 
-        const picked = allSessions.find(s => safeQuickPeekHasBillingData(s.mainJsonl)) ?? allSessions[0];
+        const billingCandidates = allSessions.slice(0, 10);
+        const picked = billingCandidates.find(s => safeQuickPeekHasBillingData(s.mainJsonl)) ?? allSessions[0];
         if (picked) {
             const parsed = parseSessionCandidate(picked);
             if (parsed) {
-                applyResolvedTitle(parsed.summary);
                 treeProvider.setSummary(parsed.summary);
                 setCurrentGraph(parsed.summary);
                 vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', true);
+                currentSessionCandidate = picked;
                 currentSessionFile = parsed.sourceFile;
                 return;
             }
@@ -932,11 +1053,6 @@ export function activate(context: vscode.ExtensionContext) {
         // Only show "no logs" welcome after confirmed search found nothing
         vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', false);
     };
-
-    // File watcher state
-    let currentSessionFile: string | undefined;
-    let fileWatcher: vscode.FileSystemWatcher | undefined;
-    let debounceTimer: NodeJS.Timeout | undefined;
 
     function watchCurrentSession() {
         // Dispose previous watcher
@@ -958,7 +1074,7 @@ export function activate(context: vscode.ExtensionContext) {
                 if (currentSessionFile) {
                     const parsed = parseCopilotSessionFile(currentSessionFile);
                     if (parsed) {
-                        applyResolvedTitle(parsed.summary);
+                        applyResolvedTitle(parsed.summary, currentSessionCandidate);
                         treeProvider.setSummary(parsed.summary);
                         setCurrentGraph(parsed.summary);
                     }
@@ -973,12 +1089,8 @@ export function activate(context: vscode.ExtensionContext) {
     watchCurrentSession();
 
     // Register chat participant (@usage)
-    registerChatParticipant(context, () => {
-        const dirs = findAllDebugLogDirs();
-        const all: SessionCandidate[] = [];
-        for (const dir of dirs) { all.push(...findSessionsInDir(dir)); }
-        all.sort((a, b) => b.modifiedTime - a.modifiedTime);
-        return all;
+    registerChatParticipant(context, (daysBack?: number) => {
+        return findSessionsForDays(daysBack).sessions;
     }, resolveSessionTitle);
 
     context.subscriptions.push(
@@ -996,89 +1108,107 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    let isPickingSession = false;
+    const setPickingSession = async (value: boolean) => {
+        isPickingSession = value;
+        await vscode.commands.executeCommand('setContext', 'copilotUsageTracker.isPickingSession', value);
+    };
+    void setPickingSession(false);
+
     context.subscriptions.push(
+        vscode.commands.registerCommand('copilotUsageTracker.pickSession.loading', () => undefined),
         vscode.commands.registerCommand('copilotUsageTracker.pickSession', async () => {
-            // Invalidate cache so we get fresh titles
-            invalidateTitleCache();
-            const titles = getTitleCache();
-
-            const debugLogDirs = findAllDebugLogDirs();
-            const allSessions: (SessionCandidate & { wsDir: string })[] = [];
-
-            for (const dir of debugLogDirs) {
-                const sessions = findSessionsInDir(dir);
-                for (const s of sessions) {
-                    allSessions.push({ ...s, wsDir: path.basename(path.dirname(path.dirname(dir))) });
-                }
-            }
-
-            // Sort all sessions by most recent
-            allSessions.sort((a, b) => b.modifiedTime - a.modifiedTime);
-
-            if (allSessions.length === 0) {
-                vscode.window.showWarningMessage('No Copilot debug log sessions found. Enable "github.copilot.chat.agentDebugLog.fileLogging.enabled".');
+            if (isPickingSession) {
+                vscode.window.showInformationMessage('Copilot Usage: already loading sessions.');
                 return;
             }
 
-            // Determine current workspace's most recent session
-            let currentWsSessionId: string | undefined;
-            if (context.storageUri) {
-                const wsDir = path.dirname(context.storageUri.fsPath);
-                const candidate = path.join(wsDir, 'GitHub.copilot-chat', 'debug-logs');
-                if (fs.existsSync(candidate)) {
-                    const wsSessions = findSessionsInDir(candidate);
-                    if (wsSessions.length > 0) {
-                        currentWsSessionId = wsSessions[0].id;
+            await setPickingSession(true);
+            invalidateTitleCache();
+
+            const quickPick = vscode.window.createQuickPick<SessionPickItem>();
+            const disposables: vscode.Disposable[] = [];
+            let loadedDays = INITIAL_PICK_DAYS;
+            let disposed = false;
+
+            quickPick.matchOnDescription = true;
+            quickPick.matchOnDetail = true;
+            quickPick.ignoreFocusOut = true;
+            quickPick.title = 'Pick Copilot Chat Session';
+            quickPick.placeholder = `Loading sessions from the last ${loadedDays} days...`;
+            quickPick.busy = true;
+            quickPick.enabled = false;
+
+            const refreshItems = async () => {
+                quickPick.busy = true;
+                quickPick.enabled = false;
+                quickPick.placeholder = `Loading sessions from the last ${loadedDays} days...`;
+
+                // Let VS Code paint the busy state before synchronous filesystem work starts.
+                await new Promise(resolve => setTimeout(resolve, 0));
+
+                const { sessions, hasOlder } = findSessionsForDays(loadedDays);
+                const currentWsSessionId = getCurrentWorkspaceLatestSessionId(context);
+                quickPick.items = createSessionPickItems(sessions, currentWsSessionId, hasOlder, loadedDays);
+                quickPick.placeholder = sessions.length > 0
+                    ? `Select a chat session from the last ${loadedDays} days`
+                    : `No sessions found in the last ${loadedDays} days`;
+                quickPick.enabled = true;
+                quickPick.busy = false;
+            };
+
+            const finish = async () => {
+                if (disposed) { return; }
+                disposed = true;
+                for (const disposable of disposables) {
+                    disposable.dispose();
+                }
+                quickPick.dispose();
+                await setPickingSession(false);
+            };
+
+            disposables.push(
+                quickPick.onDidHide(() => {
+                    void finish();
+                }),
+                quickPick.onDidAccept(async () => {
+                    const picked = quickPick.selectedItems[0];
+                    if (!picked) { return; }
+
+                    if (picked.itemType === 'loadMore') {
+                        loadedDays += PICK_LOAD_MORE_DAYS;
+                        await refreshItems();
+                        return;
                     }
-                }
-            }
 
-            // Filter: show sessions that have a title (real chat sessions)
-            // PLUS any recent untitled sessions (likely active/current sessions that haven't been titled yet)
-            const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-            const recentCutoff = Date.now() - ONE_DAY_MS;
-            const sessionsToShow = allSessions.filter(s =>
-                titles.has(s.id) || s.modifiedTime > recentCutoff
+                    quickPick.busy = true;
+                    quickPick.enabled = false;
+                    quickPick.placeholder = 'Loading selected session...';
+
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    const parsed = parseSessionCandidate(picked.session);
+                    if (parsed) {
+                        treeProvider.setSummary(parsed.summary);
+                        setCurrentGraph(parsed.summary);
+                        vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', true);
+                        currentSessionCandidate = picked.session;
+                        currentSessionFile = parsed.sourceFile;
+                        watchCurrentSession();
+                        const titleDisplay = parsed.summary.title || parsed.summary.sessionId.slice(0, 8) + '...';
+                        vscode.window.showInformationMessage(
+                            `Loaded "${titleDisplay}" | ${formatAic(parsed.summary.totalNanoAiu)} AIC | ${formatNumber(parsed.summary.totalTokens)} tokens`
+                        );
+                        quickPick.hide();
+                    } else {
+                        quickPick.enabled = true;
+                        quickPick.busy = false;
+                        vscode.window.showErrorMessage('Failed to parse the debug log file.');
+                    }
+                })
             );
-            // Fallback: if nothing matches, show all
-            const finalList = sessionsToShow.length > 0 ? sessionsToShow : allSessions;
 
-            const items = finalList.slice(0, 30).map(s => {
-                const date = new Date(s.modifiedTime);
-                const timeStr = date.toLocaleString();
-                const titleEntry = titles.get(s.id);
-                const title = titleEntry?.title;
-                const isCurrent = s.id === currentWsSessionId;
-                const currentTag = isCurrent ? ' (current session)' : '';
-                return {
-                    label: `${title || s.id.slice(0, 8) + '...'}${currentTag}`,
-                    description: `${timeStr}${title ? ' (' + s.id.slice(0, 8) + ')' : ''}`,
-                    detail: s.mainJsonl,
-                    session: s,
-                };
-            });
-
-            const picked = await vscode.window.showQuickPick(items, {
-                placeHolder: 'Select a chat session to analyze',
-            });
-
-            if (picked) {
-                const parsed = parseSessionCandidate(picked.session);
-                if (parsed) {
-                    applyResolvedTitle(parsed.summary);
-                    treeProvider.setSummary(parsed.summary);
-                    setCurrentGraph(parsed.summary);
-                    vscode.commands.executeCommand('setContext', 'copilotUsageTracker.hasSession', true);
-                    currentSessionFile = parsed.sourceFile;
-                    watchCurrentSession();
-                    const titleDisplay = parsed.summary.title || parsed.summary.sessionId.slice(0, 8) + '...';
-                    vscode.window.showInformationMessage(
-                        `Loaded "${titleDisplay}" | ${formatAic(parsed.summary.totalNanoAiu)} AIC | ${formatNumber(parsed.summary.totalTokens)} tokens`
-                    );
-                } else {
-                    vscode.window.showErrorMessage('Failed to parse the debug log file.');
-                }
-            }
+            quickPick.show();
+            await refreshItems();
         })
     );
 }
