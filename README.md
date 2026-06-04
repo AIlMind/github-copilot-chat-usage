@@ -1,6 +1,6 @@
 # GitHub Copilot Chat Usage
 
-GitHub Copilot Chat Usage is a lightweight VS Code extension by [Ailmind](https://ailmind.com) for understanding where your Copilot Chat spend goes. It reads local VS Code Copilot Chat logs and shows cost, token, and tool-call breakdowns by conversation message.
+GitHub Copilot Chat Usage is a lightweight VS Code extension for understanding where your Copilot Chat spend goes. It reads local VS Code Copilot Chat logs and shows cost, token, and tool-call breakdowns by conversation message.
 
 This extension is not affiliated with GitHub or Microsoft.
 
