@@ -1,4 +1,6 @@
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const {
   parseEntries,
@@ -463,6 +465,59 @@ test('parseChatSessionLog - reconstructs VS Code chatSessions patches', () => {
   assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].name, 'findTextInFiles', 'normalized tool name');
   assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].displayLabel, 'Searched files', 'tool label');
   assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].toolKind, 'search', 'tool kind');
+});
+
+test('parseChatSessionLog - parses credit details but ignores multiplier details', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const fixture = path.join(tmpDir, 'chat-credit-details.jsonl');
+  const state = {
+    version: 3,
+    creationDate: 1000,
+    sessionId: 'chat-credit-details',
+    requests: [
+      {
+        requestId: 'request-1',
+        timestamp: 1000,
+        message: 'Use credits',
+        agent: { name: 'agent' },
+        modelId: 'copilot/auto',
+        response: [],
+        completionTokens: 10,
+        elapsedMs: 100,
+        result: {
+          details: 'Claude Haiku 4.5 • 2.3 credits',
+          metadata: { promptTokens: 100 },
+        },
+      },
+      {
+        requestId: 'request-2',
+        timestamp: 2000,
+        message: 'Use multiplier',
+        agent: { name: 'agent' },
+        modelId: 'copilot/auto',
+        response: [],
+        completionTokens: 5,
+        elapsedMs: 50,
+        result: {
+          details: 'Claude Opus 4.7 • 7.5x',
+          metadata: { promptTokens: 50 },
+        },
+      },
+    ],
+  };
+
+  try {
+    fs.writeFileSync(fixture, JSON.stringify({ kind: 0, v: state }) + '\n');
+    const result = parseChatSessionLog(fixture);
+
+    assert(result !== undefined, 'result should not be undefined');
+    assertEqual(result.sourceType, 'chatSession', 'source type');
+    assertEqual(result.modelTurnCount, 2, 'two model turns');
+    assertEqual(result.totalNanoAiu, 2300000000, 'only credit details become AIC');
+    assertEqual(result.totalTokens, 165, 'token totals still parse');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 console.log(`\n${'='.repeat(50)}`);

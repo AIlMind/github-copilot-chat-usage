@@ -112,6 +112,7 @@ export interface UserMessageSummary {
 export interface SessionSummary {
     sessionId: string;
     title?: string;
+    sourceType?: 'debugLog' | 'chatSession';
     userMessages: UserMessageSummary[];
     totalInputTokens: number;
     totalOutputTokens: number;
@@ -785,6 +786,7 @@ function getChatRequestOutputTokens(request: any): number {
         request.completionTokens,
         request.outputTokens,
         request.result?.metadata?.completionTokens,
+        request.result?.metadata?.outputTokens,
         request.result?.metadata?.usage?.completionTokens,
         request.result?.metadata?.usage?.outputTokens
     )) || 0;
@@ -798,6 +800,33 @@ function getChatRequestInputTokens(request: any): number {
         request.result?.metadata?.usage?.promptTokens,
         request.result?.metadata?.usage?.inputTokens
     )) || 0;
+}
+
+export function parseCreditDetailsNanoAiu(detailsValue: unknown): number {
+    const details = asString(detailsValue, '');
+    const match = details.match(/(?:^|[^\d.])(\d+(?:\.\d+)?)\s+(?:ai\s+)?credits?\b/i);
+    if (!match) {
+        return 0;
+    }
+
+    const credits = Number(match[1]);
+    return Number.isFinite(credits) ? Math.round(credits * NANO_AIU_PER_AIC) : 0;
+}
+
+function getChatRequestNanoAiu(request: any): number {
+    const direct = toNumber(firstDefined(
+        request.copilotUsageNanoAiu,
+        request.nanoAiu,
+        request.result?.metadata?.copilotUsageNanoAiu,
+        request.result?.metadata?.nanoAiu,
+        request.result?.metadata?.usage?.copilotUsageNanoAiu,
+        request.result?.metadata?.usage?.nanoAiu
+    ));
+    if (direct !== undefined) {
+        return direct;
+    }
+
+    return parseCreditDetailsNanoAiu(request.result?.details);
 }
 
 /** Parse VS Code chatSessions JSONL files, which store user-facing transcript state. */
@@ -889,6 +918,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
         const turnTimestamp = timestamp + 1;
         const inputTokens = getChatRequestInputTokens(request);
         const outputTokens = getChatRequestOutputTokens(request);
+        const nanoAiu = getChatRequestNanoAiu(request);
 
         entries.push({
             ts: turnTimestamp,
@@ -905,7 +935,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
                 inputTokens,
                 outputTokens,
                 cachedTokens: 0,
-                copilotUsageNanoAiu: 0,
+                copilotUsageNanoAiu: nanoAiu,
                 responseId: request.responseId,
             },
         });
@@ -944,6 +974,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
     }
 
     summary.title = title || (typeof state.customTitle === 'string' ? state.customTitle : undefined);
+    summary.sourceType = 'chatSession';
     return summary;
 }
 
@@ -1082,6 +1113,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
 
     // Parse prompt composition from system_prompt and tools files
     summary.promptComposition = parsePromptComposition(sessionDir, entries);
+    summary.sourceType = 'debugLog';
 
     return summary;
 }

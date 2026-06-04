@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0
+
+- Adds a Spend Summary section.
+
 ## 0.2.0
 
 - Improves startup time by loading the current workspace session before scanning older workspace history.
