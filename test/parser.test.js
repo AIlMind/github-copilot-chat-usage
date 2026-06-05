@@ -4,6 +4,7 @@ const os = require('os');
 const path = require('path');
 const {
   parseEntries,
+  parseDebugLog,
   parseChatSessionLog,
   formatAic,
   formatDuration,
@@ -467,6 +468,45 @@ test('parseChatSessionLog - reconstructs VS Code chatSessions patches', () => {
   assertEqual(result.userMessages[0].modelTurns[0].toolCalls[0].toolKind, 'search', 'tool kind');
 });
 
+test('parseChatSessionLog - appends request patches without explicit index', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const fixture = path.join(tmpDir, 'chat-append-no-index.jsonl');
+  const firstRequest = {
+    requestId: 'request-1',
+    timestamp: 1000,
+    message: 'First message',
+    response: [],
+    completionTokens: 1,
+    result: { details: 'GPT-5 mini • 1 credits' },
+  };
+  const secondRequest = {
+    requestId: 'request-2',
+    timestamp: 2000,
+    message: 'Second message',
+    response: [],
+    completionTokens: 2,
+    result: { details: 'GPT-5 mini • 2 credits' },
+  };
+
+  try {
+    fs.writeFileSync(fixture, [
+      JSON.stringify({ kind: 0, v: { sessionId: 'chat-append-no-index', creationDate: 1000, requests: [firstRequest] } }),
+      JSON.stringify({ kind: 2, k: ['requests'], v: [secondRequest] }),
+      '',
+    ].join('\n'));
+
+    const result = parseChatSessionLog(fixture);
+
+    assert(result !== undefined, 'result should not be undefined');
+    assertEqual(result.userMessages.length, 2, 'append without index should not overwrite first request');
+    assertEqual(result.userMessages[0].content, 'First message', 'first request preserved');
+    assertEqual(result.userMessages[1].content, 'Second message', 'second request appended');
+    assertEqual(result.totalNanoAiu, 3000000000, 'both appended request costs counted');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('parseChatSessionLog - parses credit details but ignores multiplier details', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
   const fixture = path.join(tmpDir, 'chat-credit-details.jsonl');
@@ -515,6 +555,75 @@ test('parseChatSessionLog - parses credit details but ignores multiplier details
     assertEqual(result.modelTurnCount, 2, 'two model turns');
     assertEqual(result.totalNanoAiu, 2300000000, 'only credit details become AIC');
     assertEqual(result.totalTokens, 165, 'token totals still parse');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('parseDebugLog - matches completed subagent child logs by parent span', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const mainLog = path.join(tmpDir, 'main.jsonl');
+  const childA = path.join(tmpDir, 'runSubagent-default-call_a.jsonl');
+  const childB = path.join(tmpDir, 'runSubagent-default-call_b.jsonl');
+  const writeJsonl = (file, entries) => fs.writeFileSync(file, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+
+  try {
+    writeJsonl(childA, [
+      makeEntry({ sid: 'child-a', type: 'user_message', ts: 1300, spanId: 'child-a-msg', parentSpanId: 'subagent-a', attrs: { content: 'Child A' } }),
+      makeEntry({ sid: 'child-a', type: 'llm_request', ts: 1400, spanId: 'child-a-llm', parentSpanId: 'child-a-msg', attrs: { model: 'gpt-a', inputTokens: 10, outputTokens: 1, copilotUsageNanoAiu: 1000000000 } }),
+    ]);
+    writeJsonl(childB, [
+      makeEntry({ sid: 'child-b', type: 'user_message', ts: 1310, spanId: 'child-b-msg', parentSpanId: 'subagent-b', attrs: { content: 'Child B' } }),
+      makeEntry({ sid: 'child-b', type: 'llm_request', ts: 1410, spanId: 'child-b-llm', parentSpanId: 'child-b-msg', attrs: { model: 'gpt-b', inputTokens: 20, outputTokens: 2, copilotUsageNanoAiu: 2000000000 } }),
+    ]);
+    writeJsonl(mainLog, [
+      makeEntry({ sid: 'main', type: 'user_message', ts: 1000, spanId: 'main-msg', attrs: { content: 'Run two subagents' } }),
+      makeEntry({ sid: 'main', type: 'llm_request', ts: 1100, spanId: 'main-llm', parentSpanId: 'main-msg', attrs: { model: 'gpt-main', inputTokens: 100, outputTokens: 10, copilotUsageNanoAiu: 500000000 } }),
+      makeEntry({ sid: 'main', type: 'tool_call', name: 'runSubagent', ts: 1200, spanId: 'subagent-a', parentSpanId: 'main-llm', attrs: { args: JSON.stringify({ description: 'A' }) } }),
+      makeEntry({ sid: 'main', type: 'tool_call', name: 'runSubagent', ts: 1250, spanId: 'subagent-b', parentSpanId: 'main-llm', attrs: { args: JSON.stringify({ description: 'B' }) } }),
+      makeEntry({ sid: 'main', type: 'child_session_ref', ts: 1600, spanId: 'ref-b', parentSpanId: 'subagent-b', attrs: { childLogFile: path.basename(childB) } }),
+      makeEntry({ sid: 'main', type: 'child_session_ref', ts: 1601, spanId: 'ref-a', parentSpanId: 'subagent-a', attrs: { childLogFile: path.basename(childA) } }),
+    ]);
+
+    const result = parseDebugLog(mainLog);
+    const calls = result.userMessages[0].modelTurns[0].toolCalls;
+
+    assert(result !== undefined, 'result should not be undefined');
+    assertEqual(calls[0].spanId, 'subagent-a', 'first subagent span');
+    assertEqual(calls[0].subagentSummary.totalNanoAiu, 1000000000, 'child A attached to subagent A');
+    assertEqual(calls[1].spanId, 'subagent-b', 'second subagent span');
+    assertEqual(calls[1].subagentSummary.totalNanoAiu, 2000000000, 'child B attached to subagent B');
+    assertEqual(result.totalNanoAiu, 3500000000, 'parent total rolls up both children once');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('parseDebugLog - matches in-progress orphan subagent by child parent span', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const mainLog = path.join(tmpDir, 'main.jsonl');
+  const child = path.join(tmpDir, 'runSubagent-default-call_live.jsonl');
+  const writeJsonl = (file, entries) => fs.writeFileSync(file, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+
+  try {
+    writeJsonl(child, [
+      makeEntry({ sid: 'child-live', type: 'user_message', ts: 1300, spanId: 'child-live-msg', parentSpanId: 'subagent-b', attrs: { content: 'Live child' } }),
+      makeEntry({ sid: 'child-live', type: 'llm_request', ts: 1400, spanId: 'child-live-llm', parentSpanId: 'child-live-msg', attrs: { model: 'gpt-live', inputTokens: 30, outputTokens: 3, copilotUsageNanoAiu: 3000000000 } }),
+    ]);
+    writeJsonl(mainLog, [
+      makeEntry({ sid: 'main-live', type: 'user_message', ts: 1000, spanId: 'main-live-msg', attrs: { content: 'Run two live subagents' } }),
+      makeEntry({ sid: 'main-live', type: 'llm_request', ts: 1100, spanId: 'main-live-llm', parentSpanId: 'main-live-msg', attrs: { model: 'gpt-main', inputTokens: 100, outputTokens: 10, copilotUsageNanoAiu: 500000000 } }),
+      makeEntry({ sid: 'main-live', type: 'tool_call', name: 'runSubagent', ts: 1200, spanId: 'subagent-a', parentSpanId: 'main-live-llm', attrs: { args: JSON.stringify({ description: 'A' }) } }),
+      makeEntry({ sid: 'main-live', type: 'tool_call', name: 'runSubagent', ts: 1250, spanId: 'subagent-b', parentSpanId: 'main-live-llm', attrs: { args: JSON.stringify({ description: 'B' }) } }),
+    ]);
+
+    const result = parseDebugLog(mainLog);
+    const calls = result.userMessages[0].modelTurns[0].toolCalls;
+
+    assert(result !== undefined, 'result should not be undefined');
+    assertEqual(calls[0].subagentSummary, undefined, 'unmatched subagent stays unattached');
+    assertEqual(calls[1].subagentInProgress, true, 'matched subagent is marked in progress');
+    assertEqual(calls[1].subagentSummary.totalNanoAiu, 3000000000, 'live child attaches to matching span');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

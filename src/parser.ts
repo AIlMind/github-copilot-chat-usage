@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 export const NANO_AIU_PER_AIC = 1_000_000_000;
+const IN_PROGRESS_SUBAGENT_STALE_MS = 5 * 60 * 1000;
 
 export interface LlmRequestAttrs {
     model?: string;
@@ -57,12 +58,14 @@ export interface ToolCallSummary {
     displayLabel: string; // e.g. "Ran: git clone...", "Search: chat debug"
     durationMs: number;
     timestamp: number;
+    spanId?: string;
     isSubagent: boolean;
     source?: string;
     toolKind?: string;
     resultCount?: number;
     toolCallId?: string;
     subagentSummary?: SessionSummary; // populated if subagent log is parsed
+    subagentInProgress?: boolean;
 }
 
 export interface ModelTurnSummary {
@@ -113,6 +116,7 @@ export interface SessionSummary {
     sessionId: string;
     title?: string;
     sourceType?: 'debugLog' | 'chatSession';
+    inProgress?: boolean;
     userMessages: UserMessageSummary[];
     totalInputTokens: number;
     totalOutputTokens: number;
@@ -492,6 +496,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
                     displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
                     durationMs: t.dur,
                     timestamp: t.ts,
+                    spanId: t.spanId,
                     isSubagent: t.name === 'runSubagent',
                     source: t.attrs.source,
                     toolKind: t.attrs.toolKind,
@@ -506,6 +511,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
             durationMs: t.dur,
             timestamp: t.ts,
+            spanId: t.spanId,
             isSubagent: t.name === 'runSubagent',
             source: t.attrs.source,
             toolKind: t.attrs.toolKind,
@@ -1034,6 +1040,160 @@ function isTitleGenerationRequest(entry: LogEntry): boolean {
     return TITLE_GENERATION_NAMES.has(name);
 }
 
+function getSubagentToolCalls(summary: SessionSummary): ToolCallSummary[] {
+    const calls: ToolCallSummary[] = [];
+    for (const msg of summary.userMessages) {
+        for (const turn of msg.modelTurns) {
+            for (const tc of turn.toolCalls) {
+                if (tc.isSubagent) {
+                    calls.push(tc);
+                }
+            }
+        }
+    }
+    return calls;
+}
+
+function findUnattachedSubagentToolCall(summary: SessionSummary, predicate: (tc: ToolCallSummary) => boolean): ToolCallSummary | undefined {
+    return getSubagentToolCalls(summary).find(tc => !tc.subagentSummary && predicate(tc));
+}
+
+function readChildParentSpanId(filePath: string): string | undefined {
+    let content: string;
+    let fd: number | undefined;
+    try {
+        fd = fs.openSync(filePath, 'r');
+        const stat = fs.fstatSync(fd);
+        const bytesToRead = Math.min(stat.size, 64 * 1024);
+        const buffer = Buffer.alloc(bytesToRead);
+        const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, 0);
+        content = buffer.toString('utf-8', 0, bytesRead);
+    } catch {
+        return undefined;
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* ignore close failures */ }
+        }
+    }
+
+    const lines = content.split('\n').filter(l => l.trim());
+    for (const line of lines.slice(0, 25)) {
+        try {
+            const normalizedEntries = normalizeParsedEntries(JSON.parse(line), 0);
+            for (const entry of normalizedEntries) {
+                if (entry.parentSpanId && entry.type !== 'child_session_ref') {
+                    return entry.parentSpanId;
+                }
+            }
+        } catch {
+            continue;
+        }
+    }
+
+    return undefined;
+}
+
+function findLastModelTurn(summary: SessionSummary): { message: UserMessageSummary; turn: ModelTurnSummary } | undefined {
+    for (let msgIndex = summary.userMessages.length - 1; msgIndex >= 0; msgIndex--) {
+        const message = summary.userMessages[msgIndex];
+        const turn = message.modelTurns[message.modelTurns.length - 1];
+        if (turn) {
+            return { message, turn };
+        }
+    }
+    return undefined;
+}
+
+function createSyntheticSubagentCall(orphanFile: string, timestamp: number, childSummary: SessionSummary): ToolCallSummary {
+    const label = path.basename(orphanFile, '.jsonl')
+        .replace(/^runSubagent-/, '')
+        .replace(/[-_]+/g, ' ')
+        .trim() || 'in-progress';
+
+    return {
+        name: 'runSubagent',
+        displayLabel: `Subagent: ${label}`,
+        durationMs: 0,
+        timestamp,
+        spanId: `${path.basename(orphanFile, '.jsonl')}-synthetic`,
+        isSubagent: true,
+        source: 'debug-log',
+        subagentSummary: childSummary,
+        subagentInProgress: true,
+    };
+}
+
+function attachInProgressSubagents(summary: SessionSummary, sessionDir: string, childRefs: LogEntry[]): void {
+    const referencedChildFiles = new Set(
+        childRefs
+            .map(ref => typeof ref.attrs.childLogFile === 'string' ? path.basename(ref.attrs.childLogFile) : undefined)
+            .filter((value): value is string => !!value)
+    );
+
+    let dirFiles: string[];
+    try {
+        dirFiles = fs.readdirSync(sessionDir);
+    } catch {
+        return;
+    }
+
+    const orphanFiles = dirFiles.filter(file =>
+        file.startsWith('runSubagent-') &&
+        file.endsWith('.jsonl') &&
+        !referencedChildFiles.has(file)
+    );
+    if (orphanFiles.length === 0) {
+        return;
+    }
+
+    for (const orphanFile of orphanFiles) {
+        const childFile = path.join(sessionDir, orphanFile);
+        let stat: fs.Stats;
+        try {
+            stat = fs.statSync(childFile);
+        } catch {
+            continue;
+        }
+
+        if (Date.now() - stat.mtimeMs > IN_PROGRESS_SUBAGENT_STALE_MS) {
+            continue;
+        }
+
+        const childSummary = parseDebugLog(childFile);
+        if (!childSummary) { continue; }
+        childSummary.inProgress = true;
+
+        const unmatched = getSubagentToolCalls(summary).filter(tc => !tc.subagentSummary);
+        const childParentSpanId = readChildParentSpanId(childFile);
+        let target = childParentSpanId
+            ? unmatched.find(tc => tc.spanId === childParentSpanId)
+            : undefined;
+
+        if (!target) {
+            target = unmatched.find(tc => !!tc.toolCallId && orphanFile.includes(String(tc.toolCallId)));
+        }
+
+        if (!target && unmatched.length === 1 && orphanFiles.length === 1) {
+            target = unmatched[0];
+        }
+
+        if (target) {
+            target.subagentSummary = childSummary;
+            target.subagentInProgress = true;
+            continue;
+        }
+
+        if (orphanFiles.length === 1 && unmatched.length === 0) {
+            const lastTurn = findLastModelTurn(summary);
+            if (lastTurn) {
+                const synthetic = createSyntheticSubagentCall(orphanFile, stat.mtimeMs, childSummary);
+                lastTurn.turn.toolCalls.push(synthetic);
+                lastTurn.message.toolCalls.push(synthetic);
+            }
+        }
+    }
+}
+
 /** Parse a debug log file from disk */
 export function parseDebugLog(filePath: string): SessionSummary | undefined {
     if (!fs.existsSync(filePath)) {
@@ -1074,17 +1234,18 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
         const childSummary = parseDebugLog(childFile);
         if (!childSummary) { continue; }
 
-        // Find the matching runSubagent tool call by timestamp proximity
-        for (const msg of summary.userMessages) {
-            for (const turn of msg.modelTurns) {
-                for (const tc of turn.toolCalls) {
-                    if (tc.isSubagent && !tc.subagentSummary &&
-                        Math.abs(tc.timestamp - ref.ts) < 5000) {
-                        tc.subagentSummary = childSummary;
-                    }
-                }
-            }
+        const parentSpanId = ref.parentSpanId;
+        const target = parentSpanId
+            ? findUnattachedSubagentToolCall(summary, tc => tc.spanId === parentSpanId)
+            : findUnattachedSubagentToolCall(summary, tc => Math.abs(tc.timestamp - ref.ts) < 5000);
+
+        if (target) {
+            target.subagentSummary = childSummary;
         }
+    }
+
+    if (path.basename(filePath) === 'main.jsonl') {
+        attachInProgressSubagents(summary, sessionDir, childRefs);
     }
 
     // Roll up subagent costs into parent message and session totals
@@ -1110,6 +1271,10 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     summary.totalTokens = summary.userMessages.reduce((s, m) => s + m.totalTokens, 0);
     summary.totalNanoAiu = summary.userMessages.reduce((s, m) => s + m.totalNanoAiu, 0);
     summary.totalDurationMs = summary.userMessages.reduce((s, m) => s + m.totalDurationMs, 0);
+    summary.toolCallCount = summary.userMessages.reduce(
+        (s, m) => s + m.modelTurns.reduce((turnTotal, t) => turnTotal + t.toolCalls.length, 0),
+        0
+    );
 
     // Parse prompt composition from system_prompt and tools files
     summary.promptComposition = parsePromptComposition(sessionDir, entries);

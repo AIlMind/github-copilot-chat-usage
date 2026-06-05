@@ -621,8 +621,9 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
     }
 }
 
-function readSpendRequestsFromChatSession(filePath: string, fallbackTimestamp: number): SpendRequest[] {
+function readSpendRequestsFromChatSession(filePath: string): SpendRequest[] {
     const requests = new Map<string, SpendRequest>();
+    let nextAppendIndex = 0;
     let content: string;
     try {
         content = fs.readFileSync(filePath, 'utf-8');
@@ -646,6 +647,7 @@ function readSpendRequestsFromChatSession(filePath: string, fallbackTimestamp: n
             raw.v.requests.forEach((request: any, index: number) => {
                 updateSpendRequestFromValue(requests, String(index), request);
             });
+            nextAppendIndex = raw.v.requests.length;
             continue;
         }
 
@@ -654,16 +656,21 @@ function readSpendRequestsFromChatSession(filePath: string, fallbackTimestamp: n
         }
 
         if (raw.kind === 2 && raw.k.length === 1 && Array.isArray(raw.v)) {
-            const startIndex = toFiniteNumber(raw.i) ?? 0;
+            const startIndex = toFiniteNumber(raw.i) ?? nextAppendIndex;
             raw.v.forEach((request: any, offset: number) => {
                 updateSpendRequestFromValue(requests, String(startIndex + offset), request);
             });
+            nextAppendIndex = Math.max(nextAppendIndex, startIndex + raw.v.length);
             continue;
         }
 
         const index = requestIndexFromPath(raw.k);
         if (index === undefined) {
             continue;
+        }
+        const numericIndex = toFiniteNumber(index);
+        if (numericIndex !== undefined) {
+            nextAppendIndex = Math.max(nextAppendIndex, numericIndex + 1);
         }
 
         if (raw.kind === 3) {
@@ -680,8 +687,7 @@ function readSpendRequestsFromChatSession(filePath: string, fallbackTimestamp: n
     }
 
     return [...requests.values()]
-        .filter(request => request.nanoAiu > 0)
-        .map(request => ({ ...request, timestamp: request.timestamp ?? fallbackTimestamp }));
+        .filter(request => request.nanoAiu > 0);
 }
 
 function createSpendBucket(label: string): SpendBucket {
@@ -861,9 +867,12 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
             summary.scannedFiles++;
             const sessionId = path.basename(entry.name, '.jsonl');
             const sessionKey = `${chatDir.workspaceKey}:${sessionId}`;
-            const requests = readSpendRequestsFromChatSession(filePath, stat.mtimeMs);
+            const requests = readSpendRequestsFromChatSession(filePath);
             for (const request of requests) {
-                const timestamp = request.timestamp ?? stat.mtimeMs;
+                if (request.timestamp === undefined) {
+                    continue;
+                }
+                const timestamp = request.timestamp;
                 if (timestamp >= todayCutoff) {
                     addToSpendBucket(summary.today, request, todaySessions, sessionKey);
                     addToSpendWorkspaces(todayWorkspaces, request, sessionKey, chatDir);
@@ -963,8 +972,14 @@ function extractCustomTitle(content: string): string | undefined {
             if (obj.kind === 1 && typeof obj.v === 'string' && obj.v.trim()) {
                 return obj.v.trim();
             }
+            if (obj.kind === 0 && typeof obj.v?.customTitle === 'string' && obj.v.customTitle.trim()) {
+                return obj.v.customTitle.trim();
+            }
         } catch {
-            // The line may be partial if it started before the window we read.
+            const title = extractJsonStringProperty(content, 'customTitle', idx);
+            if (title) {
+                return title;
+            }
         }
         searchFrom = idx - 1;
     }
@@ -978,6 +993,22 @@ function readChatSessionTitle(filePath: string): string | undefined {
 
     const head = readFileWindow(filePath, TITLE_DEBUG_HEAD_BYTES);
     return head ? extractCustomTitle(head) : undefined;
+}
+
+function extractJsonStringProperty(content: string, propertyName: string, startIndex: number): string | undefined {
+    const afterIndex = content.slice(startIndex);
+    const escapedName = propertyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = afterIndex.match(new RegExp(`"${escapedName}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`));
+    if (!match) {
+        return undefined;
+    }
+
+    try {
+        const value = JSON.parse(match[1]);
+        return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 function readDebugLogTitle(filePath: string): TitleEntry | undefined {
@@ -1282,6 +1313,17 @@ function extractCommandName(displayLabel: string): string | undefined {
     return exe;
 }
 
+function formatMessageCostMeter(nanoAiu: number): string {
+    const aic = nanoAiu / NANO_AIU_PER_AIC;
+    if (aic >= 2000) {
+        const filledStars = Math.min(5, Math.floor((aic - 2000) / 500) + 1);
+        return '★'.repeat(filledStars) + '☆'.repeat(5 - filledStars);
+    }
+
+    const filledSquares = aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
+    return '■'.repeat(filledSquares) + '□'.repeat(5 - filledSquares);
+}
+
 class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private _onDidChangeTreeData = new vscode.EventEmitter<TreeItemData | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -1464,11 +1506,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const mergedNote = m.mergedMessages.length > 0
                     ? ` (+${m.mergedMessages.length})`
                     : '';
-                const aic = parseFloat(formatAic(m.totalNanoAiu));
-                const filled = aic >= 2000 ? 5 : aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
-                const meter = aic >= 2000
-                    ? '✦✦✦✦✦'
-                    : '■'.repeat(filled) + '□'.repeat(5 - filled);
+                const meter = formatMessageCostMeter(m.totalNanoAiu);
                 // Fixed-width label: pad/truncate to 28 chars so descriptions align
                 const rawPreview = (m.content || '(empty)') + mergedNote;
                 const label = rawPreview.length > 28 ? rawPreview.slice(0, 27) + '…' : rawPreview.padEnd(28);
@@ -1566,6 +1604,18 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 if (c.resultCount !== undefined) {
                     descriptionParts.push(`${formatNumber(c.resultCount)} result${c.resultCount === 1 ? '' : 's'}`);
                 }
+                if (c.isSubagent) {
+                    item.iconPath = new vscode.ThemeIcon('rocket');
+                    if (c.subagentInProgress) {
+                        descriptionParts.push('in progress');
+                    }
+                    if (c.subagentSummary) {
+                        descriptionParts.push(`${formatAic(c.subagentSummary.totalNanoAiu)} AIC`);
+                        descriptionParts.push(`${c.subagentSummary.modelTurnCount} turns`);
+                    }
+                } else {
+                    item.iconPath = new vscode.ThemeIcon('wrench');
+                }
                 item.description = descriptionParts.join(' | ');
                 item.tooltip = [
                     `Tool: ${c.name}`,
@@ -1573,17 +1623,9 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     c.source ? `Source: ${c.source}` : undefined,
                     c.resultCount !== undefined ? `Results: ${formatNumber(c.resultCount)}` : undefined,
                     c.toolCallId ? `Call ID: ${c.toolCallId}` : undefined,
+                    c.subagentInProgress ? 'Subagent: in progress' : undefined,
                     `Label: ${c.displayLabel}`,
                 ].filter(Boolean).join('\n');
-                if (c.isSubagent) {
-                    item.iconPath = new vscode.ThemeIcon('rocket');
-                    if (c.subagentSummary) {
-                        const subagentDescription = `${formatAic(c.subagentSummary.totalNanoAiu)} AIC | ${c.subagentSummary.modelTurnCount} turns`;
-                        item.description = item.description ? `${item.description} | ${subagentDescription}` : subagentDescription;
-                    }
-                } else {
-                    item.iconPath = new vscode.ThemeIcon('wrench');
-                }
                 return item;
             }
             case 'subagentTurn': {
@@ -1865,6 +1907,9 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 if (c.subagentSummary) {
                     const s = c.subagentSummary;
                     const children: TreeItemData[] = [
+                        ...(c.subagentInProgress
+                            ? [{ kind: 'stat' as const, label: 'Subagent Status', value: 'in progress' }]
+                            : []),
                         { kind: 'stat', label: 'Subagent Cost', value: `${formatAic(s.totalNanoAiu)} AIC` },
                         { kind: 'stat', label: 'Subagent Tokens', value: `in:${formatNumber(s.totalInputTokens)} out:${formatNumber(s.totalOutputTokens)}` },
                     ];

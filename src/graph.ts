@@ -63,6 +63,7 @@ export interface GraphToolCall {
     toolKind?: string;
     resultCount?: number;
     subagentCostAic?: number;
+    subagentInProgress?: boolean;
 }
 
 export interface ToolUsageEntry {
@@ -269,7 +270,15 @@ export class SessionGraph {
                 lines.push(`### ${msg.index + 1}: "${msg.content}" [${cost} AIC | ${msg.turnCount} turns | ${msg.toolCallCount} tool calls]`);
                 for (const turn of msg.turns) {
                     const tools = turn.toolCalls
-                        .map(tc => tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel)
+                        .map(tc => {
+                            let label = tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel;
+                            if (tc.subagentInProgress) {
+                                label += ' [in progress]';
+                            } else if (tc.isSubagent && tc.subagentCostAic !== undefined) {
+                                label += ` (${tc.subagentCostAic.toFixed(1)} AIC)`;
+                            }
+                            return label;
+                        })
                         .join(', ');
                     lines.push(`  Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
                 }
@@ -324,6 +333,7 @@ export class SessionGraph {
                 toolKind: tc.toolKind,
                 resultCount: tc.resultCount,
                 subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
+                subagentInProgress: tc.subagentInProgress || false,
             })),
         };
     }
