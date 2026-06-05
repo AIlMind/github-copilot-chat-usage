@@ -1548,6 +1548,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     { kind: 'stat', label: 'Tokens', value: `in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)} cache:${formatNumber(t.cachedTokens)}` },
                     { kind: 'stat', label: 'Cache', value: `${cachePercent}% hit (${formatNumber(t.freshTokens)} fresh tokens)` },
                     { kind: 'stat', label: 'Duration / TTFT', value: `${formatDuration(t.durationMs)} / ${formatDuration(t.ttftMs)}` },
+                    { kind: 'stat', label: 'DateTime', value: `${new Date(t.timestamp).toLocaleString()}` },
                 ];
                 // Tool calls for this turn
                 for (const tc of t.toolCalls) {
