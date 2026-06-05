@@ -56,18 +56,33 @@ interface SessionScanResult<T extends SessionCandidate = SessionCandidate> {
     hasOlder: boolean;
 }
 
-interface SpendBucket {
+interface ChatSessionDirEntry {
+    dir: string;
+    workspaceKey: string;
+    workspaceLabel: string;
+}
+
+interface SpendBucketBase {
     label: string;
     nanoAiu: number;
     inputTokens: number;
     outputTokens: number;
     requestCount: number;
     sessionCount: number;
-    models?: SpendModelBucket[];
 }
 
-interface SpendModelBucket extends SpendBucket {
+interface SpendBucket extends SpendBucketBase {
+    models?: SpendModelBucket[];
+    workspaces?: SpendWorkspaceBucket[];
+}
+
+interface SpendModelBucket extends SpendBucketBase {
     key: string;
+}
+
+interface SpendWorkspaceBucket extends SpendBucketBase {
+    key: string;
+    models?: SpendModelBucket[];
 }
 
 interface SpendSummary {
@@ -89,6 +104,12 @@ interface SpendRequest {
 interface SpendModelAccumulator {
     modelBuckets: Map<string, SpendModelBucket>;
     modelSessionSets: Map<string, Set<string>>;
+}
+
+interface SpendWorkspaceAccumulator {
+    workspaceBuckets: Map<string, SpendWorkspaceBucket>;
+    workspaceSessionSets: Map<string, Set<string>>;
+    workspaceModels: Map<string, SpendModelAccumulator>;
 }
 
 function pathExists(candidate: string | undefined): candidate is string {
@@ -210,12 +231,160 @@ function collectChatSessionDirs(root: string, maxDepth: number, results: Set<str
     }
 }
 
-function findAllChatSessionDirs(refresh = false): string[] {
+function labelFromPath(filePath: string | undefined): string | undefined {
+    if (!filePath) { return undefined; }
+
+    const trimmed = filePath.replace(/[\\/]+$/, '');
+    const base = path.basename(trimmed);
+    if (!base || base === '.' || base === path.sep) {
+        return undefined;
+    }
+
+    return base.toLowerCase().endsWith('.code-workspace')
+        ? base.slice(0, -'.code-workspace'.length)
+        : base;
+}
+
+function fsPathFromUriString(value: string | undefined): string | undefined {
+    if (!value) { return undefined; }
+
+    try {
+        const uri = vscode.Uri.parse(value);
+        if (uri.scheme === 'file') {
+            return uri.fsPath;
+        }
+        if (uri.path) {
+            return decodeURIComponent(uri.path);
+        }
+    } catch {
+        // Fall back to treating the value as a path below.
+    }
+
+    return value;
+}
+
+function labelFromWorkspaceFolder(folder: any, workspaceFilePath: string): string | undefined {
+    if (!folder || typeof folder !== 'object') {
+        return undefined;
+    }
+
+    if (typeof folder.name === 'string' && folder.name.trim()) {
+        return folder.name.trim();
+    }
+
+    if (typeof folder.uri === 'string') {
+        return labelFromPath(fsPathFromUriString(folder.uri));
+    }
+
+    if (typeof folder.path === 'string' && folder.path.trim()) {
+        const folderPath = path.isAbsolute(folder.path)
+            ? folder.path
+            : path.resolve(path.dirname(workspaceFilePath), folder.path);
+        return labelFromPath(folderPath);
+    }
+
+    return undefined;
+}
+
+function readWorkspaceFileLabel(workspaceFilePath: string | undefined): string | undefined {
+    if (!workspaceFilePath || !fs.existsSync(workspaceFilePath)) {
+        return undefined;
+    }
+
+    try {
+        const workspace = JSON.parse(fs.readFileSync(workspaceFilePath, 'utf-8'));
+        const folders = Array.isArray(workspace.folders)
+            ? workspace.folders
+                .map((folder: any) => labelFromWorkspaceFolder(folder, workspaceFilePath))
+                .filter((label: string | undefined): label is string => !!label)
+            : [];
+
+        if (folders.length === 1) {
+            return folders[0];
+        }
+        if (folders.length > 1) {
+            return `${folders[0]} +${folders.length - 1}`;
+        }
+    } catch {
+        return undefined;
+    }
+
+    return undefined;
+}
+
+function resolveWorkspaceStorageLabel(workspaceStorageDir: string): string {
+    const cached = workspaceLabelCache.get(workspaceStorageDir);
+    if (cached) {
+        return cached;
+    }
+
+    const fallback = path.basename(workspaceStorageDir).slice(0, 8) || 'Unknown Workspace';
+    let label: string | undefined;
+    const workspaceJson = path.join(workspaceStorageDir, 'workspace.json');
+
+    try {
+        const workspace = JSON.parse(fs.readFileSync(workspaceJson, 'utf-8'));
+        if (typeof workspace.folder === 'string') {
+            label = labelFromPath(fsPathFromUriString(workspace.folder));
+        }
+
+        if (!label && typeof workspace.workspace === 'string') {
+            const workspacePath = fsPathFromUriString(workspace.workspace);
+            label = readWorkspaceFileLabel(workspacePath) || labelFromPath(workspacePath);
+            if (label === 'workspace.json') {
+                label = undefined;
+            }
+        }
+    } catch {
+        label = undefined;
+    }
+
+    const resolved = label || fallback;
+    workspaceLabelCache.set(workspaceStorageDir, resolved);
+    return resolved;
+}
+
+function chatSessionDirEntry(dir: string): ChatSessionDirEntry {
+    const resolvedDir = path.resolve(dir);
+    const base = path.basename(resolvedDir);
+
+    if (base === 'emptyWindowChatSessions') {
+        return {
+            dir: resolvedDir,
+            workspaceKey: resolvedDir,
+            workspaceLabel: 'Empty Window',
+        };
+    }
+
+    if (base === 'chatSessions') {
+        const workspaceStorageDir = path.dirname(resolvedDir);
+        return {
+            dir: resolvedDir,
+            workspaceKey: workspaceStorageDir,
+            workspaceLabel: resolveWorkspaceStorageLabel(workspaceStorageDir),
+        };
+    }
+
+    return {
+        dir: resolvedDir,
+        workspaceKey: resolvedDir,
+        workspaceLabel: labelFromPath(path.dirname(resolvedDir)) || labelFromPath(resolvedDir) || 'Unknown Workspace',
+    };
+}
+
+function addChatSessionDir(results: Map<string, ChatSessionDirEntry>, dir: string): void {
+    const entry = chatSessionDirEntry(dir);
+    if (!results.has(entry.dir)) {
+        results.set(entry.dir, entry);
+    }
+}
+
+function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
     if (!refresh && chatSessionDirsCache && chatSessionDirsCache.expiresAt > Date.now()) {
         return chatSessionDirsCache.dirs;
     }
 
-    const results = new Set<string>();
+    const results = new Map<string, ChatSessionDirEntry>();
     for (const wsStorageRoot of getWorkspaceStorageRoots()) {
         let workspaceDirs: string[];
         try {
@@ -227,14 +396,14 @@ function findAllChatSessionDirs(refresh = false): string[] {
         for (const dir of workspaceDirs) {
             const chatSessionsDir = path.join(wsStorageRoot, dir, 'chatSessions');
             if (fs.existsSync(chatSessionsDir)) {
-                results.add(chatSessionsDir);
+                addChatSessionDir(results, chatSessionsDir);
             }
         }
 
         const userRoot = path.dirname(wsStorageRoot);
         const emptyWindowDir = path.join(userRoot, 'globalStorage', 'emptyWindowChatSessions');
         if (fs.existsSync(emptyWindowDir)) {
-            results.add(emptyWindowDir);
+            addChatSessionDir(results, emptyWindowDir);
         }
     }
 
@@ -242,10 +411,14 @@ function findAllChatSessionDirs(refresh = false): string[] {
         .getConfiguration('copilotUsageTracker')
         .get<number>('maxSearchDepth', 6);
     for (const root of getConfiguredSearchRoots()) {
-        collectChatSessionDirs(root, maxDepth, results);
+        const configuredDirs = new Set<string>();
+        collectChatSessionDirs(root, maxDepth, configuredDirs);
+        for (const dir of configuredDirs) {
+            addChatSessionDir(results, dir);
+        }
     }
 
-    const dirs = [...results];
+    const dirs = [...results.values()];
     chatSessionDirsCache = { dirs, expiresAt: Date.now() + DEBUG_DIR_CACHE_MS };
     return dirs;
 }
@@ -521,6 +694,10 @@ function createSpendModelBucket(key: string, label: string): SpendModelBucket {
     return { key, ...createSpendBucket(label) };
 }
 
+function createSpendWorkspaceBucket(key: string, label: string): SpendWorkspaceBucket {
+    return { key, ...createSpendBucket(label) };
+}
+
 function createSpendModelAccumulator(): SpendModelAccumulator {
     return {
         modelBuckets: new Map<string, SpendModelBucket>(),
@@ -528,7 +705,15 @@ function createSpendModelAccumulator(): SpendModelAccumulator {
     };
 }
 
-function addToSpendBucket(bucket: SpendBucket, request: SpendRequest, sessionSet: Set<string>, sessionId: string): void {
+function createSpendWorkspaceAccumulator(): SpendWorkspaceAccumulator {
+    return {
+        workspaceBuckets: new Map<string, SpendWorkspaceBucket>(),
+        workspaceSessionSets: new Map<string, Set<string>>(),
+        workspaceModels: new Map<string, SpendModelAccumulator>(),
+    };
+}
+
+function addToSpendBucket(bucket: SpendBucketBase, request: SpendRequest, sessionSet: Set<string>, sessionId: string): void {
     bucket.nanoAiu += request.nanoAiu;
     bucket.inputTokens += request.inputTokens;
     bucket.outputTokens += request.outputTokens;
@@ -569,6 +754,15 @@ function sortedSpendModelBuckets(buckets: Map<string, SpendModelBucket>): SpendM
     });
 }
 
+function sortedSpendWorkspaceBuckets(buckets: Map<string, SpendWorkspaceBucket>): SpendWorkspaceBucket[] {
+    return [...buckets.values()].sort((a, b) => {
+        if (b.nanoAiu !== a.nanoAiu) {
+            return b.nanoAiu - a.nanoAiu;
+        }
+        return a.label.localeCompare(b.label);
+    });
+}
+
 function addToSpendModels(accumulator: SpendModelAccumulator, request: SpendRequest, sessionId: string): void {
     addToSpendModelBucket(
         accumulator.modelBuckets,
@@ -580,8 +774,45 @@ function addToSpendModels(accumulator: SpendModelAccumulator, request: SpendRequ
     );
 }
 
+function addToSpendWorkspaces(
+    accumulator: SpendWorkspaceAccumulator,
+    request: SpendRequest,
+    sessionId: string,
+    workspace: ChatSessionDirEntry
+): void {
+    let bucket = accumulator.workspaceBuckets.get(workspace.workspaceKey);
+    if (!bucket) {
+        bucket = createSpendWorkspaceBucket(workspace.workspaceKey, workspace.workspaceLabel);
+        accumulator.workspaceBuckets.set(workspace.workspaceKey, bucket);
+    }
+
+    let sessionSet = accumulator.workspaceSessionSets.get(workspace.workspaceKey);
+    if (!sessionSet) {
+        sessionSet = new Set<string>();
+        accumulator.workspaceSessionSets.set(workspace.workspaceKey, sessionSet);
+    }
+
+    addToSpendBucket(bucket, request, sessionSet, sessionId);
+
+    let models = accumulator.workspaceModels.get(workspace.workspaceKey);
+    if (!models) {
+        models = createSpendModelAccumulator();
+        accumulator.workspaceModels.set(workspace.workspaceKey, models);
+    }
+    addToSpendModels(models, request, sessionId);
+}
+
 function finalizeSpendModels(accumulator: SpendModelAccumulator): SpendModelBucket[] {
     return sortedSpendModelBuckets(accumulator.modelBuckets);
+}
+
+function finalizeSpendWorkspaces(accumulator: SpendWorkspaceAccumulator): SpendWorkspaceBucket[] {
+    const workspaces = sortedSpendWorkspaceBuckets(accumulator.workspaceBuckets);
+    for (const workspace of workspaces) {
+        const models = accumulator.workspaceModels.get(workspace.key);
+        workspace.models = models ? finalizeSpendModels(models) : [];
+    }
+    return workspaces;
 }
 
 type SpendScanMode = 'today' | 'full';
@@ -610,15 +841,15 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
     const todaySessions = new Set<string>();
     const weekSessions = new Set<string>();
     const monthSessions = new Set<string>();
-    const todayModels = createSpendModelAccumulator();
-    const weekModels = createSpendModelAccumulator();
-    const monthModels = createSpendModelAccumulator();
+    const todayWorkspaces = createSpendWorkspaceAccumulator();
+    const weekWorkspaces = createSpendWorkspaceAccumulator();
+    const monthWorkspaces = createSpendWorkspaceAccumulator();
     const fileCutoff = includeHistory ? monthCutoff : todayCutoff;
 
-    for (const dir of findAllChatSessionDirs(refresh)) {
+    for (const chatDir of findAllChatSessionDirs(refresh)) {
         let entries: fs.Dirent[];
         try {
-            entries = fs.readdirSync(dir, { withFileTypes: true });
+            entries = fs.readdirSync(chatDir.dir, { withFileTypes: true });
         } catch {
             continue;
         }
@@ -628,7 +859,7 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
                 continue;
             }
 
-            const filePath = path.join(dir, entry.name);
+            const filePath = path.join(chatDir.dir, entry.name);
             let stat: fs.Stats;
             try {
                 stat = fs.statSync(filePath);
@@ -641,34 +872,35 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
 
             summary.scannedFiles++;
             const sessionId = path.basename(entry.name, '.jsonl');
+            const sessionKey = `${chatDir.workspaceKey}:${sessionId}`;
             const requests = readSpendRequestsFromChatSession(filePath, stat.mtimeMs);
             for (const request of requests) {
                 const timestamp = request.timestamp ?? stat.mtimeMs;
                 if (timestamp >= todayCutoff) {
-                    addToSpendBucket(summary.today, request, todaySessions, sessionId);
-                    addToSpendModels(todayModels, request, sessionId);
+                    addToSpendBucket(summary.today, request, todaySessions, sessionKey);
+                    addToSpendWorkspaces(todayWorkspaces, request, sessionKey, chatDir);
                 }
                 if (includeHistory && summary.week && summary.month) {
                     if (timestamp >= monthCutoff) {
-                        addToSpendBucket(summary.month, request, monthSessions, sessionId);
-                        addToSpendModels(monthModels, request, sessionId);
+                        addToSpendBucket(summary.month, request, monthSessions, sessionKey);
+                        addToSpendWorkspaces(monthWorkspaces, request, sessionKey, chatDir);
                     }
                     if (timestamp >= weekCutoff) {
-                        addToSpendBucket(summary.week, request, weekSessions, sessionId);
-                        addToSpendModels(weekModels, request, sessionId);
+                        addToSpendBucket(summary.week, request, weekSessions, sessionKey);
+                        addToSpendWorkspaces(weekWorkspaces, request, sessionKey, chatDir);
                     }
                 }
             }
         }
     }
 
-    summary.today.models = finalizeSpendModels(todayModels);
+    summary.today.workspaces = finalizeSpendWorkspaces(todayWorkspaces);
     if (includeHistory) {
         if (summary.week) {
-            summary.week.models = finalizeSpendModels(weekModels);
+            summary.week.workspaces = finalizeSpendWorkspaces(weekWorkspaces);
         }
         if (summary.month) {
-            summary.month.models = finalizeSpendModels(monthModels);
+            summary.month.workspaces = finalizeSpendWorkspaces(monthWorkspaces);
         }
     }
 
@@ -692,9 +924,10 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
 const titleCache = new Map<string, TitleEntry>();
 const sessionCandidateById = new Map<string, SessionCandidate>();
 let debugLogDirsCache: { expiresAt: number; dirs: string[] } | undefined;
-let chatSessionDirsCache: { expiresAt: number; dirs: string[] } | undefined;
+let chatSessionDirsCache: { expiresAt: number; dirs: ChatSessionDirEntry[] } | undefined;
 let todaySpendSummaryCache: { expiresAt: number; summary: SpendSummary } | undefined;
 let fullSpendSummaryCache: { expiresAt: number; summary: SpendSummary } | undefined;
+const workspaceLabelCache = new Map<string, string>();
 
 function rememberSessionCandidate(candidate: SessionCandidate): void {
     const existing = sessionCandidateById.get(candidate.id);
@@ -953,6 +1186,8 @@ function parseSessionCandidate(candidate: SessionCandidate) {
 type TreeItemData =
     | { kind: 'spendSummary'; summary: SpendSummary }
     | { kind: 'spendBucket'; bucket: SpendBucket }
+    | { kind: 'spendWorkspaceBucket'; bucket: SpendWorkspaceBucket }
+    | { kind: 'spendWorkspaceEmpty' }
     | { kind: 'spendModelBucket'; bucket: SpendModelBucket }
     | { kind: 'spendModelEmpty' }
     | { kind: 'spendLastRefresh'; timestamp: number }
@@ -1111,7 +1346,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const b = element.bucket;
                 const item = new vscode.TreeItem(
                     b.label,
-                    b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                    b.workspaces ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
                 );
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
@@ -1124,6 +1359,29 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `Output tokens: ${formatNumber(b.outputTokens)}`,
                     `${b.requestCount} billed messages across ${b.sessionCount} sessions.`,
                 ].join('\n');
+                return item;
+            }
+            case 'spendWorkspaceBucket': {
+                const b = element.bucket;
+                const item = new vscode.TreeItem(
+                    b.label,
+                    b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                );
+                item.description = `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | ${b.requestCount} req`;
+                item.iconPath = new vscode.ThemeIcon('root-folder');
+                item.tooltip = [
+                    `${formatAic(b.nanoAiu)} AIC`,
+                    formatUsdEstimate(b.nanoAiu),
+                    `Input tokens: ${formatNumber(b.inputTokens)}`,
+                    `Output tokens: ${formatNumber(b.outputTokens)}`,
+                    `${b.requestCount} billed requests across ${b.sessionCount} sessions.`,
+                ].join('\n');
+                return item;
+            }
+            case 'spendWorkspaceEmpty': {
+                const item = new vscode.TreeItem('No billed workspaces', vscode.TreeItemCollapsibleState.None);
+                item.description = 'none found';
+                item.iconPath = new vscode.ThemeIcon('circle-slash');
                 return item;
             }
             case 'spendModelBucket': {
@@ -1461,6 +1719,19 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         }
 
         if (element.kind === 'spendBucket') {
+            const workspaces = element.bucket.workspaces;
+            if (!workspaces) {
+                return [];
+            }
+            return workspaces.length > 0
+                ? workspaces.map(bucket => ({
+                    kind: 'spendWorkspaceBucket' as const,
+                    bucket,
+                }))
+                : [{ kind: 'spendWorkspaceEmpty' as const }];
+        }
+
+        if (element.kind === 'spendWorkspaceBucket') {
             const models = element.bucket.models;
             if (!models) {
                 return [];
