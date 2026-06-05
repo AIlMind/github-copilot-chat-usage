@@ -3,7 +3,7 @@
   "publisher": "ailmind",
   "displayName": "GitHub Copilot Chat Usage",
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "MIT",
   "icon": "images/ailmind-icon-128.png",
   "homepage": "https://ailmind.com",

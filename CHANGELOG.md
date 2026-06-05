@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Adds workspace breakdowns to Spend Summary.
+- Groups Spend Summary details into Workspace Summary and Models sections.
+- Improves subagent parsing, including nested child sessions and in-progress subagents.
+- Handles appended chat-session request patches more reliably.
+- Avoids counting timestampless spend records as today's spend.
+
 ## 0.4.0
 
 - Adds a Spend Summary section.
