@@ -39,8 +39,8 @@ const INITIAL_PICK_DAYS = 3;
 const PICK_LOAD_MORE_DAYS = 10;
 const DEBUG_DIR_CACHE_MS = 30_000;
 const SPEND_LOOKBACK_DAYS = 30;
-const SPEND_SCAN_CACHE_MS = 30_000;
 const SPEND_AUTO_REFRESH_MS = 5 * 60 * 1000;
+const SPEND_SCAN_CACHE_MS = SPEND_AUTO_REFRESH_MS;
 const TITLE_CHAT_TAIL_BYTES = 256 * 1024;
 const TITLE_DEBUG_HEAD_BYTES = 16 * 1024;
 
@@ -82,7 +82,6 @@ interface SpendModelBucket extends SpendBucketBase {
 
 interface SpendWorkspaceBucket extends SpendBucketBase {
     key: string;
-    models?: SpendModelBucket[];
 }
 
 interface SpendSummary {
@@ -109,7 +108,6 @@ interface SpendModelAccumulator {
 interface SpendWorkspaceAccumulator {
     workspaceBuckets: Map<string, SpendWorkspaceBucket>;
     workspaceSessionSets: Map<string, Set<string>>;
-    workspaceModels: Map<string, SpendModelAccumulator>;
 }
 
 function pathExists(candidate: string | undefined): candidate is string {
@@ -709,7 +707,6 @@ function createSpendWorkspaceAccumulator(): SpendWorkspaceAccumulator {
     return {
         workspaceBuckets: new Map<string, SpendWorkspaceBucket>(),
         workspaceSessionSets: new Map<string, Set<string>>(),
-        workspaceModels: new Map<string, SpendModelAccumulator>(),
     };
 }
 
@@ -793,13 +790,6 @@ function addToSpendWorkspaces(
     }
 
     addToSpendBucket(bucket, request, sessionSet, sessionId);
-
-    let models = accumulator.workspaceModels.get(workspace.workspaceKey);
-    if (!models) {
-        models = createSpendModelAccumulator();
-        accumulator.workspaceModels.set(workspace.workspaceKey, models);
-    }
-    addToSpendModels(models, request, sessionId);
 }
 
 function finalizeSpendModels(accumulator: SpendModelAccumulator): SpendModelBucket[] {
@@ -807,12 +797,7 @@ function finalizeSpendModels(accumulator: SpendModelAccumulator): SpendModelBuck
 }
 
 function finalizeSpendWorkspaces(accumulator: SpendWorkspaceAccumulator): SpendWorkspaceBucket[] {
-    const workspaces = sortedSpendWorkspaceBuckets(accumulator.workspaceBuckets);
-    for (const workspace of workspaces) {
-        const models = accumulator.workspaceModels.get(workspace.key);
-        workspace.models = models ? finalizeSpendModels(models) : [];
-    }
-    return workspaces;
+    return sortedSpendWorkspaceBuckets(accumulator.workspaceBuckets);
 }
 
 type SpendScanMode = 'today' | 'full';
@@ -844,6 +829,9 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
     const todayWorkspaces = createSpendWorkspaceAccumulator();
     const weekWorkspaces = createSpendWorkspaceAccumulator();
     const monthWorkspaces = createSpendWorkspaceAccumulator();
+    const todayModels = createSpendModelAccumulator();
+    const weekModels = createSpendModelAccumulator();
+    const monthModels = createSpendModelAccumulator();
     const fileCutoff = includeHistory ? monthCutoff : todayCutoff;
 
     for (const chatDir of findAllChatSessionDirs(refresh)) {
@@ -879,15 +867,18 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
                 if (timestamp >= todayCutoff) {
                     addToSpendBucket(summary.today, request, todaySessions, sessionKey);
                     addToSpendWorkspaces(todayWorkspaces, request, sessionKey, chatDir);
+                    addToSpendModels(todayModels, request, sessionKey);
                 }
                 if (includeHistory && summary.week && summary.month) {
                     if (timestamp >= monthCutoff) {
                         addToSpendBucket(summary.month, request, monthSessions, sessionKey);
                         addToSpendWorkspaces(monthWorkspaces, request, sessionKey, chatDir);
+                        addToSpendModels(monthModels, request, sessionKey);
                     }
                     if (timestamp >= weekCutoff) {
                         addToSpendBucket(summary.week, request, weekSessions, sessionKey);
                         addToSpendWorkspaces(weekWorkspaces, request, sessionKey, chatDir);
+                        addToSpendModels(weekModels, request, sessionKey);
                     }
                 }
             }
@@ -895,12 +886,15 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
     }
 
     summary.today.workspaces = finalizeSpendWorkspaces(todayWorkspaces);
+    summary.today.models = finalizeSpendModels(todayModels);
     if (includeHistory) {
         if (summary.week) {
             summary.week.workspaces = finalizeSpendWorkspaces(weekWorkspaces);
+            summary.week.models = finalizeSpendModels(weekModels);
         }
         if (summary.month) {
             summary.month.workspaces = finalizeSpendWorkspaces(monthWorkspaces);
+            summary.month.models = finalizeSpendModels(monthModels);
         }
     }
 
@@ -1186,8 +1180,10 @@ function parseSessionCandidate(candidate: SessionCandidate) {
 type TreeItemData =
     | { kind: 'spendSummary'; summary: SpendSummary }
     | { kind: 'spendBucket'; bucket: SpendBucket }
+    | { kind: 'spendWorkspaceSummary'; workspaces: SpendWorkspaceBucket[] | undefined }
     | { kind: 'spendWorkspaceBucket'; bucket: SpendWorkspaceBucket }
     | { kind: 'spendWorkspaceEmpty' }
+    | { kind: 'spendModelSummary'; models: SpendModelBucket[] | undefined }
     | { kind: 'spendModelBucket'; bucket: SpendModelBucket }
     | { kind: 'spendModelEmpty' }
     | { kind: 'spendLastRefresh'; timestamp: number }
@@ -1317,6 +1313,14 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         this.requestFullSpendSummary = loader;
     }
 
+    requestSpendHistory(): void {
+        this.spendHistoryRequested = true;
+        if ((!this.spendSummary?.week || !this.spendSummary?.month) && this.spendRefreshMode !== 'full') {
+            this.requestFullSpendSummary?.();
+        }
+        this._onDidChangeTreeData.fire();
+    }
+
     hasSpendHistoryBeenRequested(): boolean {
         return this.spendHistoryRequested;
     }
@@ -1346,7 +1350,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const b = element.bucket;
                 const item = new vscode.TreeItem(
                     b.label,
-                    b.workspaces ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                    b.workspaces || b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
                 );
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
@@ -1361,12 +1365,19 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 ].join('\n');
                 return item;
             }
+            case 'spendWorkspaceSummary': {
+                const count = element.workspaces?.length ?? 0;
+                const item = new vscode.TreeItem(
+                    'Workspace Summary',
+                    element.workspaces ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                );
+                item.description = `${count} ${count === 1 ? 'workspace' : 'workspaces'}`;
+                item.iconPath = new vscode.ThemeIcon('root-folder');
+                return item;
+            }
             case 'spendWorkspaceBucket': {
                 const b = element.bucket;
-                const item = new vscode.TreeItem(
-                    b.label,
-                    b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                const item = new vscode.TreeItem(b.label, vscode.TreeItemCollapsibleState.None);
                 item.description = `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | ${b.requestCount} req`;
                 item.iconPath = new vscode.ThemeIcon('root-folder');
                 item.tooltip = [
@@ -1382,6 +1393,16 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const item = new vscode.TreeItem('No billed workspaces', vscode.TreeItemCollapsibleState.None);
                 item.description = 'none found';
                 item.iconPath = new vscode.ThemeIcon('circle-slash');
+                return item;
+            }
+            case 'spendModelSummary': {
+                const count = element.models?.length ?? 0;
+                const item = new vscode.TreeItem(
+                    'Models',
+                    element.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                );
+                item.description = `${count} ${count === 1 ? 'model' : 'models'}`;
+                item.iconPath = new vscode.ThemeIcon('symbol-method');
                 return item;
             }
             case 'spendModelBucket': {
@@ -1702,24 +1723,36 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         }
 
         if (element.kind === 'spendSummary') {
-            this.spendHistoryRequested = true;
-            if (!element.summary.week || !element.summary.month) {
-                if (this.spendRefreshMode !== 'full') {
-                    this.requestFullSpendSummary?.();
-                }
-                return [{ kind: 'spendLoading' }];
+            const children: TreeItemData[] = [
+                { kind: 'spendBucket', bucket: element.summary.today },
+            ];
+
+            if (element.summary.week && element.summary.month) {
+                children.push(
+                    { kind: 'spendBucket', bucket: element.summary.week },
+                    { kind: 'spendBucket', bucket: element.summary.month }
+                );
+            } else if (this.spendHistoryRequested) {
+                children.push({ kind: 'spendLoading' });
             }
 
-            return [
-                { kind: 'spendBucket', bucket: element.summary.today },
-                { kind: 'spendBucket', bucket: element.summary.week },
-                { kind: 'spendBucket', bucket: element.summary.month },
-                { kind: 'spendLastRefresh', timestamp: element.summary.generatedAt },
-            ];
+            children.push({ kind: 'spendLastRefresh', timestamp: element.summary.generatedAt });
+            return children;
         }
 
         if (element.kind === 'spendBucket') {
-            const workspaces = element.bucket.workspaces;
+            const children: TreeItemData[] = [];
+            if (element.bucket.workspaces) {
+                children.push({ kind: 'spendWorkspaceSummary', workspaces: element.bucket.workspaces });
+            }
+            if (element.bucket.models) {
+                children.push({ kind: 'spendModelSummary', models: element.bucket.models });
+            }
+            return children;
+        }
+
+        if (element.kind === 'spendWorkspaceSummary') {
+            const workspaces = element.workspaces;
             if (!workspaces) {
                 return [];
             }
@@ -1731,8 +1764,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 : [{ kind: 'spendWorkspaceEmpty' as const }];
         }
 
-        if (element.kind === 'spendWorkspaceBucket') {
-            const models = element.bucket.models;
+        if (element.kind === 'spendModelSummary') {
+            const models = element.models;
             if (!models) {
                 return [];
             }
@@ -1994,10 +2027,18 @@ export function activate(context: vscode.ExtensionContext) {
     const treeProvider = new UsageTreeProvider();
     treeProvider.setDebugLogsEnabled(isDebugLogsSettingEnabled());
 
-    vscode.window.createTreeView('copilotUsageTree', {
+    const treeView = vscode.window.createTreeView('copilotUsageTree', {
         treeDataProvider: treeProvider,
         showCollapseAll: true,
     });
+    context.subscriptions.push(
+        treeView,
+        treeView.onDidExpandElement(event => {
+            if (event.element.kind === 'spendSummary') {
+                treeProvider.requestSpendHistory();
+            }
+        })
+    );
 
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration(DEBUG_LOGS_SETTING)) {
@@ -2103,7 +2144,6 @@ export function activate(context: vscode.ExtensionContext) {
                         applyResolvedTitle(parsed.summary, currentSessionCandidate);
                         treeProvider.setSummary(parsed.summary);
                         setCurrentGraph(parsed.summary);
-                        scheduleSpendSummaryRefresh('today', true, 1000);
                     }
                 }
             }, 500);
@@ -2125,7 +2165,6 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('copilotUsageTracker.analyzeSession', () => {
             autoLoad();
             watchCurrentSession();
-            scheduleVisibleSpendSummaryRefresh(true);
             vscode.window.showInformationMessage('Copilot Usage: Loaded most recent session.');
         })
     );
@@ -2224,7 +2263,6 @@ export function activate(context: vscode.ExtensionContext) {
                         currentSessionCandidate = picked.session;
                         currentSessionFile = parsed.sourceFile;
                         watchCurrentSession();
-                        scheduleVisibleSpendSummaryRefresh(true);
                         const titleDisplay = parsed.summary.title || parsed.summary.sessionId.slice(0, 8) + '...';
                         vscode.window.showInformationMessage(
                             `Loaded "${titleDisplay}" | ${formatAic(parsed.summary.totalNanoAiu)} AIC | ${formatNumber(parsed.summary.totalTokens)} tokens`
