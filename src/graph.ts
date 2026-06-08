@@ -180,7 +180,7 @@ export class SessionGraph {
                 totalDurationMs: s.totalDurationMs,
                 messageCount: s.userMessages.length,
                 modelTurnCount: s.modelTurnCount,
-                toolCallCount: s.toolCallCount,
+                toolCallCount: this.countSummaryToolCalls(s),
                 avgCostPerMessage: s.userMessages.length > 0 ? totalCost / s.userMessages.length : 0,
                 avgTurnsPerMessage: s.userMessages.length > 0 ? s.modelTurnCount / s.userMessages.length : 0,
                 cacheHitRatio: s.totalInputTokens > 0 ? s.totalCachedTokens / s.totalInputTokens : 0,
@@ -274,7 +274,7 @@ export class SessionGraph {
         const used = tools.filter(t => t.count > 0);
         const unused = tools.filter(t => t.count === 0);
         if (used.length > 0) {
-            lines.push('## Tool Usage');
+            lines.push('## Tool Usage (including subagents)');
             for (const t of used) {
                 lines.push(`  ${t.name}: ${t.count}x (${formatDuration(t.totalDurationMs)})`);
             }
@@ -286,7 +286,7 @@ export class SessionGraph {
 
         // Commands
         if (this.commands.length > 0) {
-            lines.push('## Commands');
+            lines.push('## Commands (including subagents)');
             for (const c of this.commands) {
                 lines.push(`  ${c.executable}: ${c.count}x`);
             }
@@ -386,7 +386,7 @@ export class SessionGraph {
             totalTokens: m.totalTokens,
             durationMs: m.totalDurationMs,
             turnCount: m.modelTurns.length,
-            toolCallCount: m.toolCalls.length,
+            toolCallCount: this.countMessageToolCalls(m),
             continuations: m.mergedMessages.length,
             turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i, subagentDepth)),
         };
@@ -449,20 +449,7 @@ export class SessionGraph {
 
     private computeToolUsage(): Map<string, ToolUsageEntry> {
         const counts = new Map<string, { count: number; totalDurationMs: number }>();
-
-        for (const msg of this.summary.userMessages) {
-            for (const turn of msg.modelTurns) {
-                for (const tc of turn.toolCalls) {
-                    const existing = counts.get(tc.name);
-                    if (existing) {
-                        existing.count++;
-                        existing.totalDurationMs += tc.durationMs;
-                    } else {
-                        counts.set(tc.name, { count: 1, totalDurationMs: tc.durationMs });
-                    }
-                }
-            }
-        }
+        this.addToolUsageFromSummary(this.summary, counts);
 
         // Add tools from prompt composition that were never used
         if (this.summary.promptComposition) {
@@ -486,10 +473,50 @@ export class SessionGraph {
         return result;
     }
 
+    private addToolUsageFromSummary(
+        summary: SessionSummary,
+        counts: Map<string, { count: number; totalDurationMs: number }>,
+        seen = new Set<SessionSummary>()
+    ): void {
+        if (seen.has(summary)) {
+            return;
+        }
+        seen.add(summary);
+
+        for (const msg of summary.userMessages) {
+            for (const turn of msg.modelTurns) {
+                for (const tc of turn.toolCalls) {
+                    const existing = counts.get(tc.name);
+                    if (existing) {
+                        existing.count++;
+                        existing.totalDurationMs += tc.durationMs;
+                    } else {
+                        counts.set(tc.name, { count: 1, totalDurationMs: tc.durationMs });
+                    }
+                    if (tc.subagentSummary) {
+                        this.addToolUsageFromSummary(tc.subagentSummary, counts, seen);
+                    }
+                }
+            }
+        }
+    }
+
     private computeCommands(): CommandEntry[] {
         const counts = new Map<string, number>();
+        this.addCommandsFromSummary(this.summary, counts);
 
-        for (const msg of this.summary.userMessages) {
+        return [...counts.entries()]
+            .map(([executable, count]) => ({ executable, count }))
+            .sort((a, b) => b.count - a.count);
+    }
+
+    private addCommandsFromSummary(summary: SessionSummary, counts: Map<string, number>, seen = new Set<SessionSummary>()): void {
+        if (seen.has(summary)) {
+            return;
+        }
+        seen.add(summary);
+
+        for (const msg of summary.userMessages) {
             for (const turn of msg.modelTurns) {
                 for (const tc of turn.toolCalls) {
                     if (tc.name === 'run_in_terminal') {
@@ -498,13 +525,29 @@ export class SessionGraph {
                             counts.set(exe, (counts.get(exe) || 0) + 1);
                         }
                     }
+                    if (tc.subagentSummary) {
+                        this.addCommandsFromSummary(tc.subagentSummary, counts, seen);
+                    }
                 }
             }
         }
+    }
 
-        return [...counts.entries()]
-            .map(([executable, count]) => ({ executable, count }))
-            .sort((a, b) => b.count - a.count);
+    private countSummaryToolCalls(summary: SessionSummary, seen = new Set<SessionSummary>()): number {
+        if (seen.has(summary)) {
+            return 0;
+        }
+        seen.add(summary);
+
+        return summary.userMessages.reduce((sum, message) => sum + this.countMessageToolCalls(message, seen), 0);
+    }
+
+    private countMessageToolCalls(message: UserMessageSummary, seen = new Set<SessionSummary>()): number {
+        return message.modelTurns.reduce((messageTotal, turn) => {
+            return messageTotal + turn.toolCalls.reduce((turnTotal, tc) => {
+                return turnTotal + 1 + (tc.subagentSummary ? this.countSummaryToolCalls(tc.subagentSummary, seen) : 0);
+            }, 0);
+        }, 0);
     }
 
     private computeRisks(): RiskFlag[] {

@@ -863,6 +863,7 @@ test('SessionGraph - serializes nested subagent messages and turns', () => {
       makeEntry({ sid: 'child', type: 'user_message', ts: 1300, spanId: 'child-msg', parentSpanId: 'subagent-child', attrs: { content: 'Inspect nested files' } }),
       makeEntry({ sid: 'child', type: 'llm_request', ts: 1400, spanId: 'child-llm', parentSpanId: 'child-msg', attrs: { model: 'gpt-child', debugName: 'child-turn', inputTokens: 42, outputTokens: 7, copilotUsageNanoAiu: 1200000000 } }),
       makeEntry({ sid: 'child', type: 'tool_call', name: 'read_file', ts: 1450, spanId: 'child-tool', parentSpanId: 'child-llm', attrs: { args: JSON.stringify({ filePath: '/tmp/nested.txt' }) } }),
+      makeEntry({ sid: 'child', type: 'tool_call', name: 'run_in_terminal', ts: 1460, spanId: 'child-terminal', parentSpanId: 'child-llm', attrs: { args: JSON.stringify({ command: 'git status --short' }) } }),
     ]);
     writeJsonl(mainLog, [
       makeEntry({ sid: 'main-graph', type: 'user_message', ts: 1000, spanId: 'main-msg', attrs: { content: 'Run nested subagent' } }),
@@ -881,10 +882,21 @@ test('SessionGraph - serializes nested subagent messages and turns', () => {
     assert(subagent, 'graph tool call should include nested subagent graph');
     assertEqual(subagent.messages[0].content, 'Inspect nested files', 'nested subagent message retained');
     assertEqual(subagent.messages[0].turns[0].debugName, 'child-turn', 'nested subagent turn retained');
+    assertEqual(subagent.toolCallCount, 2, 'subagent tool count includes child tools');
+    assertEqual(graph.stats.toolCallCount, 3, 'session tool count includes nested child tools');
+    assertEqual(graph.messages[0].toolCallCount, 3, 'message tool count includes nested child tools');
+    assertEqual(graph.toolUsage.get('runSubagent').count, 1, 'parent subagent tool counted');
+    assertEqual(graph.toolUsage.get('read_file').count, 1, 'nested read_file tool counted');
+    assertEqual(graph.toolUsage.get('run_in_terminal').count, 1, 'nested terminal tool counted');
+    assertEqual(graph.commands[0].executable, 'git', 'nested command executable counted');
+    assertEqual(graph.commands[0].count, 1, 'nested command count included');
+    assert(serialized.includes('## Tool Usage (including subagents)'), 'serialized graph marks recursive tool usage');
+    assert(serialized.includes('## Commands (including subagents)'), 'serialized graph marks recursive commands');
     assert(serialized.includes('Subagent: Nested inspector'), 'serialized graph includes subagent section');
     assert(serialized.includes('Message 1: "Inspect nested files"'), 'serialized graph includes child message');
     assert(serialized.includes('Turn 1: child-turn'), 'serialized graph includes child turn');
     assert(serialized.includes('Read: nested.txt'), 'serialized graph includes child tool call');
+    assert(serialized.includes('Ran: git status --short'), 'serialized graph includes child terminal tool call');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
