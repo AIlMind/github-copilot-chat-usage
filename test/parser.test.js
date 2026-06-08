@@ -48,7 +48,7 @@ function makeEntry(data) {
   };
 }
 
-function makeSpendRequest({ timestamp, credits = 1, inputTokens = 10, outputTokens = 2, details, nanoAiu }) {
+function makeSpendRequest({ timestamp, credits = 1, inputTokens = 10, outputTokens = 2, details, nanoAiu, metadataResponseId }) {
   const usage = {
     prompt_tokens: inputTokens,
     completion_tokens: outputTokens,
@@ -65,6 +65,7 @@ function makeSpendRequest({ timestamp, credits = 1, inputTokens = 10, outputToke
     result: {
       details: details ?? `GPT-5 mini \u2022 ${credits} credits`,
       metadata: {
+        ...(metadataResponseId ? { responseId: metadataResponseId } : {}),
         usage,
       },
     },
@@ -782,7 +783,46 @@ test('computeSpendSummaryFromChatSessionDirs - ignores stale parser-version cent
     assertEqual(summary.today.nanoAiu, 5000000000, 'stale cache cost ignored');
     assertEqual(summary.today.inputTokens, 50, 'stale cache input tokens ignored');
     assertEqual(summary.today.outputTokens, 5, 'stale cache output tokens ignored');
-    assertEqual(JSON.parse(fs.readFileSync(cacheFile, 'utf-8')).version, 3, 'cache rewritten with current parser version');
+    assertEqual(JSON.parse(fs.readFileSync(cacheFile, 'utf-8')).version, 4, 'cache rewritten with current parser version');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('computeSpendSummaryFromChatSessionDirs - dedupes forked copied requests by metadata responseId', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const chatDir = path.join(tmpDir, 'chatSessions');
+  const original = path.join(chatDir, 'original.jsonl');
+  const forked = path.join(chatDir, 'forked.jsonl');
+  const now = Date.UTC(2026, 0, 15, 12, 0, 0);
+  const yesterday = now - 24 * 60 * 60 * 1000;
+  const dirs = [{ dir: chatDir, workspaceKey: 'workspace-a', workspaceLabel: 'Workspace A' }];
+
+  try {
+    fs.mkdirSync(chatDir, { recursive: true });
+    writeSpendSession(original, makeSpendRequest({
+      timestamp: yesterday,
+      credits: 1.6,
+      inputTokens: 28076,
+      outputTokens: 91,
+      metadataResponseId: 'same-billed-response',
+    }));
+    writeSpendSession(forked, makeSpendRequest({
+      timestamp: now - 1000,
+      credits: 1.6,
+      inputTokens: 28076,
+      outputTokens: 91,
+      metadataResponseId: 'same-billed-response',
+    }));
+
+    const summary = computeSpendSummaryFromChatSessionDirs('full', dirs, { now });
+
+    assertEqual(summary.today.nanoAiu, 0, 'forked copy should not move old spend into today');
+    assertEqual(summary.today.requestCount, 0, 'forked copy should not count as a today request');
+    assertEqual(summary.month.nanoAiu, 1600000000, 'copied fork request counted once');
+    assertEqual(summary.month.inputTokens, 28076, 'copied fork input counted once');
+    assertEqual(summary.month.outputTokens, 91, 'copied fork output counted once');
+    assertEqual(summary.month.requestCount, 1, 'duplicate response counted as one request');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

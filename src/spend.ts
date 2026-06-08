@@ -5,7 +5,7 @@ import { StringDecoder } from 'string_decoder';
 import { parseCreditDetailsNanoAiu } from './parser';
 
 const SPEND_LOOKBACK_DAYS = 30;
-const SPEND_FILE_CACHE_VERSION = 3;
+const SPEND_FILE_CACHE_VERSION = 4;
 const SPEND_FILE_CACHE_MAX_AGE_MS = (SPEND_LOOKBACK_DAYS + 14) * 24 * 60 * 60 * 1000;
 const SPEND_FILE_CACHE_NAME = 'spend-file-cache.json';
 
@@ -51,6 +51,7 @@ export interface SpendRequest {
     inputTokens: number;
     outputTokens: number;
     model: string;
+    dedupeKey?: string;
 }
 
 export type SpendScanMode = 'today' | 'full';
@@ -83,6 +84,12 @@ interface SpendFileCacheStore {
 interface ComputeSpendSummaryOptions {
     cacheFilePath?: string;
     now?: number;
+}
+
+interface SpendRequestCandidate {
+    request: SpendRequest & { timestamp: number };
+    sessionKey: string;
+    workspace: ChatSessionDirEntry;
 }
 
 function toFiniteNumber(value: unknown): number | undefined {
@@ -174,6 +181,10 @@ function isNanoAiuKey(key: unknown): boolean {
     return key === 'copilotUsageNanoAiu' || key === 'nanoAiu' || key === 'nanoAiU';
 }
 
+function isResponseIdKey(key: unknown): boolean {
+    return key === 'responseId' || key === 'response_id';
+}
+
 function applySpendRequestTokens(request: SpendRequest, value: any): void {
     if (!value || typeof value !== 'object') {
         return;
@@ -215,6 +226,41 @@ function applySpendRequestTokens(request: SpendRequest, value: any): void {
     }
     if (outputTokens !== undefined) {
         request.outputTokens = outputTokens;
+    }
+}
+
+function normalizeSpendDedupeKey(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+
+    const key = value.trim();
+    return key ? `response:${key}` : undefined;
+}
+
+function readSpendRequestDedupeKey(value: any): string | undefined {
+    if (!value || typeof value !== 'object') {
+        return undefined;
+    }
+
+    const metadata = value.result?.metadata ?? value.metadata;
+    const usage = metadata?.usage ?? value.usage;
+    return normalizeSpendDedupeKey(
+        metadata?.responseId ??
+        metadata?.response_id ??
+        usage?.responseId ??
+        usage?.response_id ??
+        value.result?.responseId ??
+        value.result?.response_id ??
+        value.responseId ??
+        value.response_id
+    );
+}
+
+function applySpendRequestDedupeKey(request: SpendRequest, value: any, overwrite = false): void {
+    const key = readSpendRequestDedupeKey(value);
+    if (key && (overwrite || !request.dedupeKey)) {
+        request.dedupeKey = key;
     }
 }
 
@@ -262,6 +308,7 @@ function updateSpendRequestFromValue(requests: Map<string, SpendRequest>, index:
     }
 
     const details = value.result?.details ?? value.details;
+    applySpendRequestDedupeKey(request, value, true);
     applySpendRequestNanoAiu(request, value);
     applySpendRequestModel(request, parseCreditDetailsModel(details) ?? value.modelId ?? value.model);
     applySpendRequestTokens(request, value);
@@ -300,6 +347,11 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
         return;
     }
 
+    if (isResponseIdKey(pathParts[2])) {
+        applySpendRequestDedupeKey(request, { responseId: value });
+        return;
+    }
+
     if (pathParts[2] === 'modelId' || pathParts[2] === 'model') {
         applySpendRequestModel(request, value);
         return;
@@ -310,6 +362,7 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
     }
 
     if (pathParts.length === 3) {
+        applySpendRequestDedupeKey(request, { result: value }, true);
         applySpendRequestNanoAiu(request, { result: value });
         applySpendRequestModel(request, parseCreditDetailsModel(value?.details));
         applySpendRequestTokens(request, { result: value });
@@ -324,11 +377,15 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
 
     if (pathParts[3] === 'metadata') {
         if (pathParts.length === 4) {
+            applySpendRequestDedupeKey(request, { metadata: value }, true);
             applySpendRequestNanoAiu(request, { metadata: value });
             applySpendRequestTokens(request, { metadata: value });
         } else if (pathParts[4] === 'usage' && pathParts.length === 5) {
+            applySpendRequestDedupeKey(request, { usage: value }, true);
             applySpendRequestNanoAiu(request, { usage: value });
             applySpendRequestTokens(request, { usage: value });
+        } else if (isResponseIdKey(pathParts[4])) {
+            applySpendRequestDedupeKey(request, { metadata: { responseId: value } }, true);
         } else if (pathParts[4] === 'usage' && isInputTokenKey(pathParts[5])) {
             const inputTokens = toFiniteNumber(value);
             if (inputTokens !== undefined) {
@@ -344,6 +401,8 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
             if (nanoAiu !== undefined) {
                 request.nanoAiu = nanoAiu;
             }
+        } else if (pathParts[4] === 'usage' && isResponseIdKey(pathParts[5])) {
+            applySpendRequestDedupeKey(request, { usage: { responseId: value } }, true);
         } else if (isInputTokenKey(pathParts[4])) {
             const inputTokens = toFiniteNumber(value);
             if (inputTokens !== undefined) {
@@ -361,6 +420,7 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
             }
         }
     } else {
+        applySpendRequestDedupeKey(request, { result: value }, true);
         applySpendRequestNanoAiu(request, { result: value });
         applySpendRequestTokens(request, { result: value });
     }
@@ -575,6 +635,30 @@ function addToSpendWorkspaces(
     addToSpendBucket(bucket, request, sessionSet, sessionId);
 }
 
+function shouldReplaceSpendCandidate(existing: SpendRequestCandidate, candidate: SpendRequestCandidate): boolean {
+    if (candidate.request.timestamp !== existing.request.timestamp) {
+        return candidate.request.timestamp < existing.request.timestamp;
+    }
+
+    return candidate.sessionKey.localeCompare(existing.sessionKey) < 0;
+}
+
+function collectSpendCandidate(
+    dedupedCandidates: Map<string, SpendRequestCandidate>,
+    undedupedCandidates: SpendRequestCandidate[],
+    candidate: SpendRequestCandidate
+): void {
+    if (!candidate.request.dedupeKey) {
+        undedupedCandidates.push(candidate);
+        return;
+    }
+
+    const existing = dedupedCandidates.get(candidate.request.dedupeKey);
+    if (!existing || shouldReplaceSpendCandidate(existing, candidate)) {
+        dedupedCandidates.set(candidate.request.dedupeKey, candidate);
+    }
+}
+
 function finalizeSpendModels(accumulator: SpendModelAccumulator): SpendModelBucket[] {
     return sortedSpendModelBuckets(accumulator.modelBuckets);
 }
@@ -714,6 +798,8 @@ export function computeSpendSummaryFromChatSessionDirs(
     const monthModels = createSpendModelAccumulator();
     const fileCutoff = includeHistory ? monthCutoff : todayCutoff;
     const fileCache = readSpendFileCache(options.cacheFilePath);
+    const dedupedCandidates = new Map<string, SpendRequestCandidate>();
+    const undedupedCandidates: SpendRequestCandidate[] = [];
     let fileCacheChanged = false;
 
     for (const chatDir of chatSessionDirs) {
@@ -754,24 +840,34 @@ export function computeSpendSummaryFromChatSessionDirs(
                 if (request.timestamp === undefined) {
                     continue;
                 }
-                const timestamp = request.timestamp;
-                if (timestamp >= todayCutoff) {
-                    addToSpendBucket(summary.today, request, todaySessions, sessionKey);
-                    addToSpendWorkspaces(todayWorkspaces, request, sessionKey, chatDir);
-                    addToSpendModels(todayModels, request, sessionKey);
-                }
-                if (includeHistory && summary.week && summary.month) {
-                    if (timestamp >= monthCutoff) {
-                        addToSpendBucket(summary.month, request, monthSessions, sessionKey);
-                        addToSpendWorkspaces(monthWorkspaces, request, sessionKey, chatDir);
-                        addToSpendModels(monthModels, request, sessionKey);
-                    }
-                    if (timestamp >= weekCutoff) {
-                        addToSpendBucket(summary.week, request, weekSessions, sessionKey);
-                        addToSpendWorkspaces(weekWorkspaces, request, sessionKey, chatDir);
-                        addToSpendModels(weekModels, request, sessionKey);
-                    }
-                }
+
+                collectSpendCandidate(dedupedCandidates, undedupedCandidates, {
+                    request: request as SpendRequest & { timestamp: number },
+                    sessionKey,
+                    workspace: chatDir,
+                });
+            }
+        }
+    }
+
+    const candidates = [...dedupedCandidates.values(), ...undedupedCandidates];
+    for (const { request, sessionKey, workspace } of candidates) {
+        const timestamp = request.timestamp;
+        if (timestamp >= todayCutoff) {
+            addToSpendBucket(summary.today, request, todaySessions, sessionKey);
+            addToSpendWorkspaces(todayWorkspaces, request, sessionKey, workspace);
+            addToSpendModels(todayModels, request, sessionKey);
+        }
+        if (includeHistory && summary.week && summary.month) {
+            if (timestamp >= monthCutoff) {
+                addToSpendBucket(summary.month, request, monthSessions, sessionKey);
+                addToSpendWorkspaces(monthWorkspaces, request, sessionKey, workspace);
+                addToSpendModels(monthModels, request, sessionKey);
+            }
+            if (timestamp >= weekCutoff) {
+                addToSpendBucket(summary.week, request, weekSessions, sessionKey);
+                addToSpendWorkspaces(weekWorkspaces, request, sessionKey, workspace);
+                addToSpendModels(weekModels, request, sessionKey);
             }
         }
     }
