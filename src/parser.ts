@@ -791,10 +791,16 @@ function getChatRequestOutputTokens(request: any): number {
     return toNumber(firstDefined(
         request.completionTokens,
         request.outputTokens,
+        request.completion_tokens,
+        request.output_tokens,
         request.result?.metadata?.completionTokens,
         request.result?.metadata?.outputTokens,
+        request.result?.metadata?.completion_tokens,
+        request.result?.metadata?.output_tokens,
         request.result?.metadata?.usage?.completionTokens,
-        request.result?.metadata?.usage?.outputTokens
+        request.result?.metadata?.usage?.outputTokens,
+        request.result?.metadata?.usage?.completion_tokens,
+        request.result?.metadata?.usage?.output_tokens
     )) || 0;
 }
 
@@ -802,9 +808,16 @@ function getChatRequestInputTokens(request: any): number {
     return toNumber(firstDefined(
         request.promptTokens,
         request.inputTokens,
+        request.prompt_tokens,
+        request.input_tokens,
         request.result?.metadata?.promptTokens,
+        request.result?.metadata?.inputTokens,
+        request.result?.metadata?.prompt_tokens,
+        request.result?.metadata?.input_tokens,
         request.result?.metadata?.usage?.promptTokens,
-        request.result?.metadata?.usage?.inputTokens
+        request.result?.metadata?.usage?.inputTokens,
+        request.result?.metadata?.usage?.prompt_tokens,
+        request.result?.metadata?.usage?.input_tokens
     )) || 0;
 }
 

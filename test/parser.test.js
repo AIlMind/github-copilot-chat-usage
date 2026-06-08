@@ -10,6 +10,10 @@ const {
   formatDuration,
   isSystemContinuation,
 } = require('../out/parser');
+const {
+  computeSpendSummaryFromChatSessionDirs,
+  readSpendRequestsFromChatSession,
+} = require('../out/spend');
 
 let passed = 0;
 let failed = 0;
@@ -40,6 +44,32 @@ function makeEntry(data) {
     ...data,
     attrs: { ...(data.attrs || {}) },
   };
+}
+
+function makeSpendRequest({ timestamp, credits = 1, inputTokens = 10, outputTokens = 2 }) {
+  return {
+    requestId: `request-${timestamp}`,
+    timestamp,
+    modelId: 'copilot/gpt-5-mini',
+    result: {
+      details: `GPT-5 mini \u2022 ${credits} credits`,
+      metadata: {
+        usage: {
+          prompt_tokens: inputTokens,
+          completion_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens,
+        },
+      },
+    },
+  };
+}
+
+function writeSpendSession(filePath, request) {
+  fs.writeFileSync(filePath, [
+    JSON.stringify({ kind: 0, v: { sessionId: path.basename(filePath, '.jsonl'), requests: [] } }),
+    JSON.stringify({ kind: 2, k: ['requests'], v: [request] }),
+    '',
+  ].join('\n'));
 }
 
 test('isSystemContinuation - identifies terminal notifications', () => {
@@ -555,6 +585,134 @@ test('parseChatSessionLog - parses credit details but ignores multiplier details
     assertEqual(result.modelTurnCount, 2, 'two model turns');
     assertEqual(result.totalNanoAiu, 2300000000, 'only credit details become AIC');
     assertEqual(result.totalTokens, 165, 'token totals still parse');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('parseChatSessionLog - parses snake_case usage token fields', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const fixture = path.join(tmpDir, 'chat-snake-usage.jsonl');
+  const state = {
+    version: 3,
+    creationDate: 1000,
+    sessionId: 'chat-snake-usage',
+    requests: [
+      {
+        requestId: 'request-1',
+        timestamp: 1000,
+        message: 'Use snake case tokens',
+        agent: { name: 'agent' },
+        modelId: 'copilot/gpt-5-mini',
+        response: [],
+        elapsedMs: 100,
+        result: {
+          details: 'GPT-5 mini \u2022 2 credits',
+          metadata: {
+            usage: {
+              prompt_tokens: 170279,
+              completion_tokens: 3220,
+              total_tokens: 173499,
+            },
+          },
+        },
+      },
+    ],
+  };
+
+  try {
+    fs.writeFileSync(fixture, JSON.stringify({ kind: 0, v: state }) + '\n');
+    const result = parseChatSessionLog(fixture);
+
+    assert(result !== undefined, 'result should not be undefined');
+    assertEqual(result.totalInputTokens, 170279, 'snake_case prompt_tokens counted');
+    assertEqual(result.totalOutputTokens, 3220, 'snake_case completion_tokens counted');
+    assertEqual(result.totalTokens, 173499, 'total tokens from parsed input/output');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('readSpendRequestsFromChatSession - parses snake_case usage token fields', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const fixture = path.join(tmpDir, 'spend-snake-usage.jsonl');
+
+  try {
+    writeSpendSession(fixture, makeSpendRequest({
+      timestamp: 1000,
+      credits: 2.5,
+      inputTokens: 170279,
+      outputTokens: 3220,
+    }));
+
+    const requests = readSpendRequestsFromChatSession(fixture);
+
+    assertEqual(requests.length, 1, 'one billed spend request');
+    assertEqual(requests[0].inputTokens, 170279, 'snake_case prompt_tokens counted');
+    assertEqual(requests[0].outputTokens, 3220, 'snake_case completion_tokens counted');
+    assertEqual(requests[0].nanoAiu, 2500000000, 'credit details counted');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('computeSpendSummaryFromChatSessionDirs - reuses unchanged central file cache', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const chatDir = path.join(tmpDir, 'chatSessions');
+  const fixture = path.join(chatDir, 'spend-cache.jsonl');
+  const cacheFile = path.join(tmpDir, 'global', 'spend-file-cache.json');
+  const now = Date.UTC(2026, 0, 15, 12, 0, 0);
+  const dirs = [{ dir: chatDir, workspaceKey: 'workspace-a', workspaceLabel: 'Workspace A' }];
+
+  try {
+    fs.mkdirSync(chatDir, { recursive: true });
+    writeSpendSession(fixture, makeSpendRequest({ timestamp: now - 1000, credits: 1, inputTokens: 10, outputTokens: 2 }));
+
+    const first = computeSpendSummaryFromChatSessionDirs('full', dirs, { cacheFilePath: cacheFile, now });
+    assertEqual(first.today.nanoAiu, 1000000000, 'initial summary cost');
+    assertEqual(first.today.inputTokens, 10, 'initial input tokens');
+    assert(fs.existsSync(cacheFile), 'central cache file should be written');
+
+    const originalOpenSync = fs.openSync;
+    fs.openSync = function patchedOpenSync(file, ...args) {
+      if (path.resolve(String(file)) === path.resolve(fixture)) {
+        throw new Error('source should not be reparsed when stat matches cache');
+      }
+      return originalOpenSync.call(fs, file, ...args);
+    };
+
+    try {
+      const second = computeSpendSummaryFromChatSessionDirs('full', dirs, { cacheFilePath: cacheFile, now });
+      assertEqual(second.today.nanoAiu, 1000000000, 'cached summary cost');
+      assertEqual(second.today.inputTokens, 10, 'cached input tokens');
+    } finally {
+      fs.openSync = originalOpenSync;
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('computeSpendSummaryFromChatSessionDirs - reparses changed cached files', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const chatDir = path.join(tmpDir, 'chatSessions');
+  const fixture = path.join(chatDir, 'spend-cache-change.jsonl');
+  const cacheFile = path.join(tmpDir, 'global', 'spend-file-cache.json');
+  const now = Date.UTC(2026, 0, 15, 12, 0, 0);
+  const dirs = [{ dir: chatDir, workspaceKey: 'workspace-a', workspaceLabel: 'Workspace A' }];
+
+  try {
+    fs.mkdirSync(chatDir, { recursive: true });
+    writeSpendSession(fixture, makeSpendRequest({ timestamp: now - 1000, credits: 1, inputTokens: 10, outputTokens: 2 }));
+    const first = computeSpendSummaryFromChatSessionDirs('full', dirs, { cacheFilePath: cacheFile, now });
+    assertEqual(first.today.nanoAiu, 1000000000, 'initial summary cost');
+
+    writeSpendSession(fixture, makeSpendRequest({ timestamp: now - 1000, credits: 3, inputTokens: 30, outputTokens: 6 }));
+    fs.utimesSync(fixture, new Date(now + 10000), new Date(now + 10000));
+
+    const second = computeSpendSummaryFromChatSessionDirs('full', dirs, { cacheFilePath: cacheFile, now });
+    assertEqual(second.today.nanoAiu, 3000000000, 'changed file summary cost');
+    assertEqual(second.today.inputTokens, 30, 'changed file input tokens');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
