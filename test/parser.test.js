@@ -15,6 +15,7 @@ const {
   computeSpendSummaryFromChatSessionDirs,
   readSpendRequestsFromChatSession,
 } = require('../out/spend');
+const { SessionGraph } = require('../out/graph');
 
 let passed = 0;
 let failed = 0;
@@ -846,6 +847,44 @@ test('parseDebugLog - matches completed subagent child logs by parent span', () 
     assertEqual(calls[1].spanId, 'subagent-b', 'second subagent span');
     assertEqual(calls[1].subagentSummary.totalNanoAiu, 2000000000, 'child B attached to subagent B');
     assertEqual(result.totalNanoAiu, 3500000000, 'parent total rolls up both children once');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SessionGraph - serializes nested subagent messages and turns', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const mainLog = path.join(tmpDir, 'main.jsonl');
+  const child = path.join(tmpDir, 'runSubagent-default-call_child.jsonl');
+  const writeJsonl = (file, entries) => fs.writeFileSync(file, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+
+  try {
+    writeJsonl(child, [
+      makeEntry({ sid: 'child', type: 'user_message', ts: 1300, spanId: 'child-msg', parentSpanId: 'subagent-child', attrs: { content: 'Inspect nested files' } }),
+      makeEntry({ sid: 'child', type: 'llm_request', ts: 1400, spanId: 'child-llm', parentSpanId: 'child-msg', attrs: { model: 'gpt-child', debugName: 'child-turn', inputTokens: 42, outputTokens: 7, copilotUsageNanoAiu: 1200000000 } }),
+      makeEntry({ sid: 'child', type: 'tool_call', name: 'read_file', ts: 1450, spanId: 'child-tool', parentSpanId: 'child-llm', attrs: { args: JSON.stringify({ filePath: '/tmp/nested.txt' }) } }),
+    ]);
+    writeJsonl(mainLog, [
+      makeEntry({ sid: 'main-graph', type: 'user_message', ts: 1000, spanId: 'main-msg', attrs: { content: 'Run nested subagent' } }),
+      makeEntry({ sid: 'main-graph', type: 'llm_request', ts: 1100, spanId: 'main-llm', parentSpanId: 'main-msg', attrs: { model: 'gpt-main', debugName: 'main-turn', inputTokens: 100, outputTokens: 10, copilotUsageNanoAiu: 500000000 } }),
+      makeEntry({ sid: 'main-graph', type: 'tool_call', name: 'runSubagent', ts: 1200, spanId: 'subagent-child', parentSpanId: 'main-llm', attrs: { args: JSON.stringify({ description: 'Nested inspector' }) } }),
+      makeEntry({ sid: 'main-graph', type: 'child_session_ref', ts: 1600, spanId: 'ref-child', parentSpanId: 'subagent-child', attrs: { childLogFile: path.basename(child) } }),
+    ]);
+
+    const summary = parseDebugLog(mainLog);
+    assert(summary !== undefined, 'result should not be undefined');
+
+    const graph = new SessionGraph(summary);
+    const subagent = graph.messages[0].turns[0].toolCalls[0].subagent;
+    const serialized = graph.serialize({ includeMessages: true, maxMessages: 5 });
+
+    assert(subagent, 'graph tool call should include nested subagent graph');
+    assertEqual(subagent.messages[0].content, 'Inspect nested files', 'nested subagent message retained');
+    assertEqual(subagent.messages[0].turns[0].debugName, 'child-turn', 'nested subagent turn retained');
+    assert(serialized.includes('Subagent: Nested inspector'), 'serialized graph includes subagent section');
+    assert(serialized.includes('Message 1: "Inspect nested files"'), 'serialized graph includes child message');
+    assert(serialized.includes('Turn 1: child-turn'), 'serialized graph includes child turn');
+    assert(serialized.includes('Read: nested.txt'), 'serialized graph includes child tool call');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

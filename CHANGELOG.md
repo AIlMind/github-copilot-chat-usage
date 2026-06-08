@@ -7,6 +7,7 @@
 - Parses snake_case chat-session usage token fields.
 - Invalidates stale Spend Summary file-cache entries when parser behavior changes.
 - Counts direct `nanoAiu` usage fields and token-only usage rows in Spend Summary totals.
+- Includes nested subagent messages and turns in the `@usage` session graph tool output.
 - Uses the VS Code UI language for displayed datetimes.
 
 ## 0.5.0

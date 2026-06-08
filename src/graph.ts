@@ -54,6 +54,22 @@ export interface GraphTurn {
     toolCalls: GraphToolCall[];
 }
 
+export interface GraphSubagent {
+    sessionId: string;
+    title?: string;
+    inProgress: boolean;
+    costAic: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    totalTokens: number;
+    durationMs: number;
+    messageCount: number;
+    modelTurnCount: number;
+    toolCallCount: number;
+    messages: GraphMessage[];
+}
+
 export interface GraphToolCall {
     name: string;
     displayLabel: string;
@@ -64,6 +80,7 @@ export interface GraphToolCall {
     resultCount?: number;
     subagentCostAic?: number;
     subagentInProgress?: boolean;
+    subagent?: GraphSubagent;
 }
 
 export interface ToolUsageEntry {
@@ -112,6 +129,24 @@ export interface GraphComparison {
     toolUsageDiff: { name: string; countA: number; countB: number }[];
     commandDiff: { executable: string; countA: number; countB: number }[];
 }
+
+export interface SerializeOptions {
+    includeMessages?: boolean;
+    maxMessages?: number;
+    includeSubagents?: boolean;
+    maxSubagentMessages?: number;
+    maxSubagentDepth?: number;
+}
+
+interface ResolvedSerializeOptions {
+    includeMessages: boolean;
+    maxMessages: number;
+    includeSubagents: boolean;
+    maxSubagentMessages: number;
+    maxSubagentDepth: number;
+}
+
+const MAX_GRAPH_SUBAGENT_DEPTH = 4;
 
 // ---- SessionGraph class ----
 
@@ -217,8 +252,14 @@ export class SessionGraph {
      * Serialize to a compact string for LLM context.
      * Produces a structured text summary suitable for injection into a chat prompt.
      */
-    serialize(options?: { includeMessages?: boolean; maxMessages?: number }): string {
-        const opts = { includeMessages: true, maxMessages: 30, ...options };
+    serialize(options?: SerializeOptions): string {
+        const opts: ResolvedSerializeOptions = {
+            includeMessages: options?.includeMessages ?? true,
+            maxMessages: options?.maxMessages ?? 30,
+            includeSubagents: options?.includeSubagents ?? true,
+            maxSubagentMessages: options?.maxSubagentMessages ?? 10,
+            maxSubagentDepth: options?.maxSubagentDepth ?? 3,
+        };
         const lines: string[] = [];
 
         const s = this.stats;
@@ -269,18 +310,7 @@ export class SessionGraph {
                 const cost = msg.costAic.toFixed(1);
                 lines.push(`### ${msg.index + 1}: "${msg.content}" [${cost} AIC | ${msg.turnCount} turns | ${msg.toolCallCount} tool calls]`);
                 for (const turn of msg.turns) {
-                    const tools = turn.toolCalls
-                        .map(tc => {
-                            let label = tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel;
-                            if (tc.subagentInProgress) {
-                                label += ' [in progress]';
-                            } else if (tc.isSubagent && tc.subagentCostAic !== undefined) {
-                                label += ` (${tc.subagentCostAic.toFixed(1)} AIC)`;
-                            }
-                            return label;
-                        })
-                        .join(', ');
-                    lines.push(`  Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+                    lines.push(...this.serializeTurn(turn, '  ', opts, 0));
                 }
             }
             if (this.messages.length > opts.maxMessages) {
@@ -293,7 +323,58 @@ export class SessionGraph {
 
     // ---- Private computation methods ----
 
-    private buildGraphMessage(m: UserMessageSummary, index: number): GraphMessage {
+    private serializeTurn(turn: GraphTurn, indent: string, opts: ResolvedSerializeOptions, subagentDepth: number): string[] {
+        const lines: string[] = [];
+        const tools = turn.toolCalls.map(tc => this.formatToolCallLabel(tc)).join(', ');
+        lines.push(`${indent}Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+
+        if (!opts.includeSubagents) {
+            return lines;
+        }
+
+        for (const tc of turn.toolCalls) {
+            lines.push(...this.serializeSubagent(tc, `${indent}  `, opts, subagentDepth + 1));
+        }
+        return lines;
+    }
+
+    private serializeSubagent(tc: GraphToolCall, indent: string, opts: ResolvedSerializeOptions, depth: number): string[] {
+        if (!tc.subagent || depth > opts.maxSubagentDepth) {
+            return [];
+        }
+
+        const sub = tc.subagent;
+        const status = sub.inProgress ? 'in progress' : 'complete';
+        const label = tc.displayLabel.replace(/^Subagent:\s*/i, '') || tc.displayLabel;
+        const lines = [
+            `${indent}Subagent: ${label} [${status} | ${sub.costAic.toFixed(2)} AIC | tokens in:${formatNumber(sub.inputTokens)} out:${formatNumber(sub.outputTokens)} cache:${formatNumber(sub.cachedTokens)} | ${sub.messageCount} messages | ${sub.modelTurnCount} turns | ${sub.toolCallCount} tool calls]`,
+        ];
+
+        const messages = sub.messages.slice(0, opts.maxSubagentMessages);
+        for (const msg of messages) {
+            lines.push(`${indent}  Message ${msg.index + 1}: "${msg.content}" [${msg.costAic.toFixed(1)} AIC | ${msg.turnCount} turns | ${msg.toolCallCount} tool calls]`);
+            for (const turn of msg.turns) {
+                lines.push(...this.serializeTurn(turn, `${indent}    `, opts, depth));
+            }
+        }
+
+        if (sub.messages.length > opts.maxSubagentMessages) {
+            lines.push(`${indent}  ... ${sub.messages.length - opts.maxSubagentMessages} more subagent messages`);
+        }
+        return lines;
+    }
+
+    private formatToolCallLabel(tc: GraphToolCall): string {
+        let label = tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel;
+        if (tc.subagentInProgress) {
+            label += ' [in progress]';
+        } else if (tc.isSubagent && tc.subagentCostAic !== undefined) {
+            label += ` (${tc.subagentCostAic.toFixed(1)} AIC)`;
+        }
+        return label;
+    }
+
+    private buildGraphMessage(m: UserMessageSummary, index: number, subagentDepth = 0): GraphMessage {
         return {
             index,
             content: capWords(m.content, 100),
@@ -307,11 +388,11 @@ export class SessionGraph {
             turnCount: m.modelTurns.length,
             toolCallCount: m.toolCalls.length,
             continuations: m.mergedMessages.length,
-            turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i)),
+            turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i, subagentDepth)),
         };
     }
 
-    private buildGraphTurn(t: ModelTurnSummary, index: number): GraphTurn {
+    private buildGraphTurn(t: ModelTurnSummary, index: number, subagentDepth = 0): GraphTurn {
         return {
             index,
             model: t.model,
@@ -324,17 +405,45 @@ export class SessionGraph {
             cacheHitRatio: t.cacheHitRatio,
             durationMs: t.durationMs,
             ttftMs: t.ttftMs,
-            toolCalls: t.toolCalls.map(tc => ({
-                name: tc.name,
-                displayLabel: tc.displayLabel.slice(0, 80),
-                durationMs: tc.durationMs,
-                isSubagent: tc.isSubagent,
-                source: tc.source,
-                toolKind: tc.toolKind,
-                resultCount: tc.resultCount,
-                subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
-                subagentInProgress: tc.subagentInProgress || false,
-            })),
+            toolCalls: t.toolCalls.map(tc => this.buildGraphToolCall(tc, subagentDepth)),
+        };
+    }
+
+    private buildGraphToolCall(tc: ToolCallSummary, subagentDepth: number): GraphToolCall {
+        const call: GraphToolCall = {
+            name: tc.name,
+            displayLabel: tc.displayLabel.slice(0, 80),
+            durationMs: tc.durationMs,
+            isSubagent: tc.isSubagent,
+            source: tc.source,
+            toolKind: tc.toolKind,
+            resultCount: tc.resultCount,
+            subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
+            subagentInProgress: tc.subagentInProgress || false,
+        };
+
+        if (tc.subagentSummary && subagentDepth < MAX_GRAPH_SUBAGENT_DEPTH) {
+            call.subagent = this.buildGraphSubagent(tc.subagentSummary, subagentDepth + 1);
+        }
+
+        return call;
+    }
+
+    private buildGraphSubagent(summary: SessionSummary, subagentDepth: number): GraphSubagent {
+        return {
+            sessionId: summary.sessionId,
+            title: summary.title,
+            inProgress: summary.inProgress || false,
+            costAic: summary.totalNanoAiu / 1_000_000_000,
+            inputTokens: summary.totalInputTokens,
+            outputTokens: summary.totalOutputTokens,
+            cachedTokens: summary.totalCachedTokens,
+            totalTokens: summary.totalTokens,
+            durationMs: summary.totalDurationMs,
+            messageCount: summary.userMessages.length,
+            modelTurnCount: summary.modelTurnCount,
+            toolCallCount: summary.toolCallCount,
+            messages: summary.userMessages.map((m, i) => this.buildGraphMessage(m, i, subagentDepth)),
         };
     }
 
