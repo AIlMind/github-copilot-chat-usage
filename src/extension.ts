@@ -870,7 +870,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     ? 'refreshing...'
                     : `today ${formatAic(s.today.nanoAiu)} AIC | ${formatUsdEstimate(s.today.nanoAiu)}`;
                 item.iconPath = new vscode.ThemeIcon('graph-line');
-                item.tooltip = `Estimated from chat-session credit rows only.\nCollapsed view computes today's spend only. Expand to compute 7-day and 30-day spend.`;
+                item.tooltip = `Estimated from chat-session request usage and credit rows.\nCollapsed view computes today's spend only. Expand to compute 7-day and 30-day spend.`;
                 return item;
             }
             case 'spendBucket': {
@@ -888,7 +888,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     formatUsdEstimate(b.nanoAiu),
                     `Input tokens: ${formatNumber(b.inputTokens)}`,
                     `Output tokens: ${formatNumber(b.outputTokens)}`,
-                    `${b.requestCount} billed messages across ${b.sessionCount} sessions.`,
+                    `${b.requestCount} parsed requests across ${b.sessionCount} sessions.`,
                 ].join('\n');
                 return item;
             }
@@ -912,12 +912,12 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     formatUsdEstimate(b.nanoAiu),
                     `Input tokens: ${formatNumber(b.inputTokens)}`,
                     `Output tokens: ${formatNumber(b.outputTokens)}`,
-                    `${b.requestCount} billed requests across ${b.sessionCount} sessions.`,
+                    `${b.requestCount} parsed requests across ${b.sessionCount} sessions.`,
                 ].join('\n');
                 return item;
             }
             case 'spendWorkspaceEmpty': {
-                const item = new vscode.TreeItem('No billed workspaces', vscode.TreeItemCollapsibleState.None);
+                const item = new vscode.TreeItem('No workspace usage', vscode.TreeItemCollapsibleState.None);
                 item.description = 'none found';
                 item.iconPath = new vscode.ThemeIcon('circle-slash');
                 return item;
@@ -942,12 +942,12 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     formatUsdEstimate(b.nanoAiu),
                     `Input tokens: ${formatNumber(b.inputTokens)}`,
                     `Output tokens: ${formatNumber(b.outputTokens)}`,
-                    `${b.requestCount} billed requests across ${b.sessionCount} sessions.`,
+                    `${b.requestCount} parsed requests across ${b.sessionCount} sessions.`,
                 ].join('\n');
                 return item;
             }
             case 'spendModelEmpty': {
-                const item = new vscode.TreeItem('No billed models', vscode.TreeItemCollapsibleState.None);
+                const item = new vscode.TreeItem('No model usage', vscode.TreeItemCollapsibleState.None);
                 item.description = 'none found';
                 item.iconPath = new vscode.ThemeIcon('circle-slash');
                 return item;

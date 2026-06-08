@@ -1,4 +1,5 @@
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -46,19 +47,24 @@ function makeEntry(data) {
   };
 }
 
-function makeSpendRequest({ timestamp, credits = 1, inputTokens = 10, outputTokens = 2 }) {
+function makeSpendRequest({ timestamp, credits = 1, inputTokens = 10, outputTokens = 2, details, nanoAiu }) {
+  const usage = {
+    prompt_tokens: inputTokens,
+    completion_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
+  };
+  if (nanoAiu !== undefined) {
+    usage.nanoAiu = nanoAiu;
+  }
+
   return {
     requestId: `request-${timestamp}`,
     timestamp,
     modelId: 'copilot/gpt-5-mini',
     result: {
-      details: `GPT-5 mini \u2022 ${credits} credits`,
+      details: details ?? `GPT-5 mini \u2022 ${credits} credits`,
       metadata: {
-        usage: {
-          prompt_tokens: inputTokens,
-          completion_tokens: outputTokens,
-          total_tokens: inputTokens + outputTokens,
-        },
+        usage,
       },
     },
   };
@@ -656,6 +662,53 @@ test('readSpendRequestsFromChatSession - parses snake_case usage token fields', 
   }
 });
 
+test('readSpendRequestsFromChatSession - parses direct usage nanoAiu fields', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const fixture = path.join(tmpDir, 'spend-direct-nano.jsonl');
+
+  try {
+    writeSpendSession(fixture, makeSpendRequest({
+      timestamp: 1000,
+      details: 'GPT-5 mini',
+      nanoAiu: 4200000000,
+      inputTokens: 12345,
+      outputTokens: 678,
+    }));
+
+    const requests = readSpendRequestsFromChatSession(fixture);
+
+    assertEqual(requests.length, 1, 'one spend request');
+    assertEqual(requests[0].inputTokens, 12345, 'input tokens counted');
+    assertEqual(requests[0].outputTokens, 678, 'output tokens counted');
+    assertEqual(requests[0].nanoAiu, 4200000000, 'direct nanoAiu counted');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('readSpendRequestsFromChatSession - keeps token-only usage rows', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const fixture = path.join(tmpDir, 'spend-token-only.jsonl');
+
+  try {
+    writeSpendSession(fixture, makeSpendRequest({
+      timestamp: 1000,
+      details: 'GPT-5 mini',
+      inputTokens: 999,
+      outputTokens: 111,
+    }));
+
+    const requests = readSpendRequestsFromChatSession(fixture);
+
+    assertEqual(requests.length, 1, 'token-only spend request retained');
+    assertEqual(requests[0].inputTokens, 999, 'input tokens counted');
+    assertEqual(requests[0].outputTokens, 111, 'output tokens counted');
+    assertEqual(requests[0].nanoAiu, 0, 'missing credits stay zero');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('computeSpendSummaryFromChatSessionDirs - reuses unchanged central file cache', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
   const chatDir = path.join(tmpDir, 'chatSessions');
@@ -688,6 +741,47 @@ test('computeSpendSummaryFromChatSessionDirs - reuses unchanged central file cac
     } finally {
       fs.openSync = originalOpenSync;
     }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('computeSpendSummaryFromChatSessionDirs - ignores stale parser-version central file cache', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-parser-'));
+  const chatDir = path.join(tmpDir, 'chatSessions');
+  const fixture = path.join(chatDir, 'spend-cache-stale.jsonl');
+  const cacheFile = path.join(tmpDir, 'global', 'spend-file-cache.json');
+  const now = Date.UTC(2026, 0, 15, 12, 0, 0);
+  const dirs = [{ dir: chatDir, workspaceKey: 'workspace-a', workspaceLabel: 'Workspace A' }];
+
+  try {
+    fs.mkdirSync(chatDir, { recursive: true });
+    writeSpendSession(fixture, makeSpendRequest({ timestamp: now - 1000, credits: 5, inputTokens: 50, outputTokens: 5 }));
+
+    const stat = fs.statSync(fixture);
+    const cacheKey = crypto.createHash('sha256').update(path.resolve(fixture)).digest('hex');
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      version: 2,
+      entries: {
+        [cacheKey]: {
+          parserVersion: 2,
+          path: path.resolve(fixture),
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+          requests: [{ timestamp: now - 1000, nanoAiu: 1, inputTokens: 1, outputTokens: 1, model: 'stale' }],
+          parsedAt: now,
+          lastSeenAt: now,
+        },
+      },
+    }));
+
+    const summary = computeSpendSummaryFromChatSessionDirs('full', dirs, { cacheFilePath: cacheFile, now });
+
+    assertEqual(summary.today.nanoAiu, 5000000000, 'stale cache cost ignored');
+    assertEqual(summary.today.inputTokens, 50, 'stale cache input tokens ignored');
+    assertEqual(summary.today.outputTokens, 5, 'stale cache output tokens ignored');
+    assertEqual(JSON.parse(fs.readFileSync(cacheFile, 'utf-8')).version, 3, 'cache rewritten with current parser version');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

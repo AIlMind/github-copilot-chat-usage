@@ -5,7 +5,7 @@ import { StringDecoder } from 'string_decoder';
 import { parseCreditDetailsNanoAiu } from './parser';
 
 const SPEND_LOOKBACK_DAYS = 30;
-const SPEND_FILE_CACHE_VERSION = 2;
+const SPEND_FILE_CACHE_VERSION = 3;
 const SPEND_FILE_CACHE_MAX_AGE_MS = (SPEND_LOOKBACK_DAYS + 14) * 24 * 60 * 60 * 1000;
 const SPEND_FILE_CACHE_NAME = 'spend-file-cache.json';
 
@@ -170,6 +170,10 @@ function isOutputTokenKey(key: unknown): boolean {
     return key === 'completionTokens' || key === 'outputTokens' || key === 'completion_tokens' || key === 'output_tokens';
 }
 
+function isNanoAiuKey(key: unknown): boolean {
+    return key === 'copilotUsageNanoAiu' || key === 'nanoAiu' || key === 'nanoAiU';
+}
+
 function applySpendRequestTokens(request: SpendRequest, value: any): void {
     if (!value || typeof value !== 'object') {
         return;
@@ -214,6 +218,38 @@ function applySpendRequestTokens(request: SpendRequest, value: any): void {
     }
 }
 
+function readSpendRequestNanoAiu(value: any): number {
+    if (!value || typeof value !== 'object') {
+        return 0;
+    }
+
+    const metadata = value.result?.metadata ?? value.metadata;
+    const usage = metadata?.usage ?? value.usage;
+    const direct = firstFiniteNumber(
+        value.copilotUsageNanoAiu,
+        value.nanoAiu,
+        value.nanoAiU,
+        metadata?.copilotUsageNanoAiu,
+        metadata?.nanoAiu,
+        metadata?.nanoAiU,
+        usage?.copilotUsageNanoAiu,
+        usage?.nanoAiu,
+        usage?.nanoAiU
+    );
+    if (direct !== undefined) {
+        return direct;
+    }
+
+    return parseCreditDetailsNanoAiu(value.result?.details ?? value.details);
+}
+
+function applySpendRequestNanoAiu(request: SpendRequest, value: any): void {
+    const nanoAiu = readSpendRequestNanoAiu(value);
+    if (nanoAiu > 0) {
+        request.nanoAiu = nanoAiu;
+    }
+}
+
 function updateSpendRequestFromValue(requests: Map<string, SpendRequest>, index: string, value: any): void {
     if (!value || typeof value !== 'object') {
         return;
@@ -225,11 +261,9 @@ function updateSpendRequestFromValue(requests: Map<string, SpendRequest>, index:
         request.timestamp = timestamp;
     }
 
-    const nanoAiu = parseCreditDetailsNanoAiu(value.result?.details);
-    if (nanoAiu > 0) {
-        request.nanoAiu = nanoAiu;
-    }
-    applySpendRequestModel(request, parseCreditDetailsModel(value.result?.details) ?? value.modelId ?? value.model);
+    const details = value.result?.details ?? value.details;
+    applySpendRequestNanoAiu(request, value);
+    applySpendRequestModel(request, parseCreditDetailsModel(details) ?? value.modelId ?? value.model);
     applySpendRequestTokens(request, value);
 }
 
@@ -258,6 +292,14 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
         return;
     }
 
+    if (isNanoAiuKey(pathParts[2])) {
+        const nanoAiu = toFiniteNumber(value);
+        if (nanoAiu !== undefined) {
+            request.nanoAiu = nanoAiu;
+        }
+        return;
+    }
+
     if (pathParts[2] === 'modelId' || pathParts[2] === 'model') {
         applySpendRequestModel(request, value);
         return;
@@ -267,17 +309,25 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
         return;
     }
 
-    const details = pathParts[3] === 'details' ? value : value?.details;
-    const nanoAiu = parseCreditDetailsNanoAiu(details);
-    if (nanoAiu > 0) {
-        request.nanoAiu = nanoAiu;
+    if (pathParts.length === 3) {
+        applySpendRequestNanoAiu(request, { result: value });
+        applySpendRequestModel(request, parseCreditDetailsModel(value?.details));
+        applySpendRequestTokens(request, { result: value });
+        return;
     }
-    applySpendRequestModel(request, parseCreditDetailsModel(details));
+
+    if (pathParts[3] === 'details') {
+        applySpendRequestNanoAiu(request, { details: value });
+        applySpendRequestModel(request, parseCreditDetailsModel(value));
+        return;
+    }
 
     if (pathParts[3] === 'metadata') {
         if (pathParts.length === 4) {
+            applySpendRequestNanoAiu(request, { metadata: value });
             applySpendRequestTokens(request, { metadata: value });
         } else if (pathParts[4] === 'usage' && pathParts.length === 5) {
+            applySpendRequestNanoAiu(request, { usage: value });
             applySpendRequestTokens(request, { usage: value });
         } else if (pathParts[4] === 'usage' && isInputTokenKey(pathParts[5])) {
             const inputTokens = toFiniteNumber(value);
@@ -289,6 +339,11 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
             if (outputTokens !== undefined) {
                 request.outputTokens = outputTokens;
             }
+        } else if (pathParts[4] === 'usage' && isNanoAiuKey(pathParts[5])) {
+            const nanoAiu = toFiniteNumber(value);
+            if (nanoAiu !== undefined) {
+                request.nanoAiu = nanoAiu;
+            }
         } else if (isInputTokenKey(pathParts[4])) {
             const inputTokens = toFiniteNumber(value);
             if (inputTokens !== undefined) {
@@ -299,8 +354,14 @@ function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[]
             if (outputTokens !== undefined) {
                 request.outputTokens = outputTokens;
             }
+        } else if (isNanoAiuKey(pathParts[4])) {
+            const nanoAiu = toFiniteNumber(value);
+            if (nanoAiu !== undefined) {
+                request.nanoAiu = nanoAiu;
+            }
         }
     } else {
+        applySpendRequestNanoAiu(request, { result: value });
         applySpendRequestTokens(request, { result: value });
     }
 }
@@ -403,7 +464,7 @@ export function readSpendRequestsFromChatSession(filePath: string): SpendRequest
     }
 
     return [...requests.values()]
-        .filter(request => request.nanoAiu > 0);
+        .filter(request => request.nanoAiu > 0 || request.inputTokens > 0 || request.outputTokens > 0);
 }
 
 function createSpendBucket(label: string): SpendBucket {

@@ -5,6 +5,8 @@
 - Adds a central user-level Spend Summary cache shared across workspaces.
 - Reuses parsed spend data for unchanged chat-session files based on file mtime and size.
 - Parses snake_case chat-session usage token fields.
+- Invalidates stale Spend Summary file-cache entries when parser behavior changes.
+- Counts direct `nanoAiu` usage fields and token-only usage rows in Spend Summary totals.
 - Uses the VS Code UI language for displayed datetimes.
 
 ## 0.5.0
