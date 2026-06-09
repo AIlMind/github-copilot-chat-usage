@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+- Adds daily and weekly AIC spending limits with a progress bar indicator in the VS Code status bar.
+- The status bar shows a compact visual bar (████████░░) with color transitions: green → yellow → red as you approach the limit.
+- Shows a VS Code warning notification the first time a limit is exceeded.
+- Clicking the status bar opens a Quick Pick with a usage summary and quick links to settings and the usage view.
+- Adds `copilotUsageTracker.dailyLimitAic` setting (default: 500 AIC).
+- Adds `copilotUsageTracker.weeklyLimitAic` setting (default: 3500 AIC).
+- Adds `copilotUsageTracker.showWeeklyInStatusBar` setting (default: false) to optionally show the weekly bar.
+
 ## 0.6.0
 
 - Adds a central user-level Spend Summary cache shared across workspaces.

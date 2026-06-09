@@ -3,7 +3,7 @@
   "publisher": "ailmind",
   "displayName": "GitHub Copilot Chat Usage",
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "license": "MIT",
   "icon": "images/ailmind-icon-128.png",
   "homepage": "https://ailmind.com",
@@ -33,6 +33,7 @@
     "onCommand:copilotUsageTracker.analyzeSession",
     "onCommand:copilotUsageTracker.pickSession",
     "onCommand:copilotUsageTracker.refresh",
+    "onCommand:copilotUsageTracker.showUsageSummary",
     "onView:copilotUsageTree",
     "onChatParticipant:copilot-usage-tracker.usage",
     "onLanguageModelTool:usage-search-sessions",
@@ -59,6 +60,11 @@
         "command": "copilotUsageTracker.refresh",
         "title": "Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "copilotUsageTracker.showUsageSummary",
+        "title": "Copilot Usage: Show Usage Summary",
+        "icon": "$(dashboard)"
       }
     ],
     "viewsContainers": {
@@ -180,6 +186,23 @@
           "minimum": 1,
           "maximum": 12,
           "description": "Maximum recursion depth when scanning configured and default log roots."
+        },
+        "copilotUsageTracker.dailyLimitAic": {
+          "type": "number",
+          "default": 500,
+          "minimum": 1,
+          "description": "Daily AI Credit limit for the status bar progress indicator. Set to 0 to disable the daily limit indicator."
+        },
+        "copilotUsageTracker.weeklyLimitAic": {
+          "type": "number",
+          "default": 3500,
+          "minimum": 1,
+          "description": "Weekly AI Credit limit for the status bar progress indicator. Set to 0 to disable the weekly limit indicator."
+        },
+        "copilotUsageTracker.showWeeklyInStatusBar": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the weekly AIC progress bar in the status bar alongside the daily bar."
         }
       }
     }
