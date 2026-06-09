@@ -809,6 +809,170 @@ function formatMessageCostMeter(nanoAiu: number): string {
     return '■'.repeat(filledSquares) + '□'.repeat(5 - filledSquares);
 }
 
+// ---- Status bar progress indicators for daily/weekly spend limits ----
+
+const STATUS_BAR_PRIORITY_DAILY = 100;
+const STATUS_BAR_PRIORITY_WEEKLY = 99;
+const STATUS_BAR_MAX_SEGMENTS = 8;
+
+function statusBarProgressBar(progress: number, segments = STATUS_BAR_MAX_SEGMENTS): string {
+    const clamped = Math.min(progress, 1);
+    const filled = Math.round(clamped * segments);
+    const empty = segments - filled;
+    return '█'.repeat(filled) + '░'.repeat(empty);
+}
+
+function statusBarColorForProgress(progress: number): string {
+    if (progress >= 0.85) { return '#ef4444'; }  // Red
+    if (progress >= 0.6) { return '#eab308'; }   // Yellow
+    return '#22c55e';                              // Green
+}
+
+function formatAicShort(nanoAiu: number): string {
+    const aic = nanoAiu / NANO_AIU_PER_AIC;
+    if (aic >= 1_000_000) { return `${(aic / 1_000_000).toFixed(1)}M`; }
+    if (aic >= 1_000) { return `${(aic / 1_000).toFixed(1)}k`; }
+    return aic < 10 ? aic.toFixed(2) : Math.round(aic).toLocaleString();
+}
+
+/** Tracks whether we've already notified the user about exceeding a limit. */
+const _notifiedDailyOverLimit = new Map<string, boolean>();
+
+class StatusBarManager implements vscode.Disposable {
+    private readonly dailyItem: vscode.StatusBarItem;
+    private readonly weeklyItem: vscode.StatusBarItem;
+    private static readonly CONFIG_SECTION = 'copilotUsageTracker';
+
+    private lastDailyAic = 0;
+    private lastWeeklyAic = 0;
+    private lastDailyLimit = 0;
+    private lastWeeklyLimit = 0;
+
+    constructor() {
+        this.dailyItem = vscode.window.createStatusBarItem(
+            vscode.StatusBarAlignment.Right,
+            STATUS_BAR_PRIORITY_DAILY
+        );
+        this.dailyItem.name = 'Copilot Usage: Daily Limit';
+        this.dailyItem.tooltip = 'Daily AI Credit usage vs configured limit';
+
+        this.weeklyItem = vscode.window.createStatusBarItem(
+            vscode.StatusBarAlignment.Right,
+            STATUS_BAR_PRIORITY_WEEKLY
+        );
+        this.weeklyItem.name = 'Copilot Usage: Weekly Limit';
+        this.weeklyItem.tooltip = 'Weekly AI Credit usage vs configured limit';
+
+        // Click actions
+        this.dailyItem.command = 'copilotUsageTracker.showUsageSummary';
+        this.weeklyItem.command = 'copilotUsageTracker.showUsageSummary';
+    }
+
+    update(spendSummary: SpendSummary | undefined): void {
+        const config = vscode.workspace.getConfiguration(StatusBarManager.CONFIG_SECTION);
+        const dailyLimit = config.get<number>('dailyLimitAic', 500);
+        const weeklyLimit = config.get<number>('weeklyLimitAic', 3500);
+        const showWeekly = config.get<boolean>('showWeeklyInStatusBar', false);
+
+        this.updateItem(
+            this.dailyItem,
+            spendSummary?.today,
+            dailyLimit,
+            'Daily',
+            this.lastDailyAic,
+            this.lastDailyLimit,
+            (v) => { this.lastDailyAic = v; },
+            (v) => { this.lastDailyLimit = v; },
+            'daily',
+        );
+        this.updateItem(
+            this.weeklyItem,
+            spendSummary?.week,
+            weeklyLimit,
+            'Weekly',
+            this.lastWeeklyAic,
+            this.lastWeeklyLimit,
+            (v) => { this.lastWeeklyAic = v; },
+            (v) => { this.lastWeeklyLimit = v; },
+            'weekly',
+            showWeekly,
+        );
+    }
+
+    private updateItem(
+        item: vscode.StatusBarItem,
+        bucket: SpendBucket | undefined,
+        limitAic: number,
+        label: string,
+        lastAic: number,
+        lastLimit: number,
+        setLastAic: (v: number) => void,
+        setLastLimit: (v: number) => void,
+        periodKey: string,
+        visible = true,
+    ): void {
+        if (!bucket || limitAic <= 0 || !visible) {
+            item.hide();
+            return;
+        }
+
+        const prevAic = lastAic;
+        const prevLimit = lastLimit;
+        const aic = bucket.nanoAiu / NANO_AIU_PER_AIC;
+        setLastAic(aic);
+        setLastLimit(limitAic);
+
+        // ---- Notification: first time crossing over 100% ----
+        if (prevAic > 0 && prevAic <= prevLimit && aic > limitAic) {
+            const key = `${periodKey}:${Math.round(limitAic)}`;
+            if (!_notifiedDailyOverLimit.get(key)) {
+                _notifiedDailyOverLimit.set(key, true);
+                const overshoot = (aic - limitAic).toFixed(1);
+                vscode.window.showWarningMessage(
+                    `Copilot Usage: ${label} limit exceeded! ` +
+                    `Using ${formatAicShort(bucket.nanoAiu)} / ${limitAic.toLocaleString()} AIC ` +
+                    `(${overshoot} over limit).`
+                );
+            }
+        }
+        // Reset notification flag if limit changes (user adjusted settings)
+        if (prevLimit !== limitAic) {
+            _notifiedDailyOverLimit.delete(`${periodKey}:${Math.round(prevLimit)}`);
+        }
+
+        const progress = limitAic > 0 ? aic / limitAic : 0;
+        const pct = Math.round(Math.min(progress, 1) * 100);
+        const aicStr = formatAicShort(bucket.nanoAiu);
+        const limitStr = limitAic.toLocaleString();
+        const overLimit = progress > 1;
+        const warningIcon = overLimit ? '⚠ ' : '';
+        const bar = statusBarProgressBar(progress);
+
+        // Compact: "⚠ ████████ 572/500 (100%)"
+        item.text = `${warningIcon}${bar} ${aicStr}/${limitStr} (${pct}%)`;
+        item.color = statusBarColorForProgress(progress);
+        item.tooltip = [
+            `${label} AI Credit usage`,
+            `━━━━━━━━━━━━━━━━━━━`,
+            `Usage:   ${formatAicShort(bucket.nanoAiu)} AIC`,
+            `Limit:   ${limitStr} AIC`,
+            `${overLimit ? `Excess:  +${(aic - limitAic).toFixed(1)} AIC` : `Remaining: ${Math.max(0, limitAic - aic).toFixed(1)} AIC`}`,
+            `Progress: ${Math.round(progress * 100)}%`,
+            `Cost:    ${formatUsdEstimate(bucket.nanoAiu)}`,
+            `━━━━━━━━━━━━━━━━━━━`,
+            `${bucket.requestCount} request${bucket.requestCount === 1 ? '' : 's'} · ${bucket.sessionCount} session${bucket.sessionCount === 1 ? '' : 's'}`,
+            `Click for usage summary →`,
+        ].join('\n');
+        item.show();
+    }
+
+    dispose(): void {
+        this.dailyItem.dispose();
+        this.weeklyItem.dispose();
+        _notifiedDailyOverLimit.clear();
+    }
+}
+
 class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private _onDidChangeTreeData = new vscode.EventEmitter<TreeItemData | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -850,6 +1014,10 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
 
     hasSpendHistoryBeenRequested(): boolean {
         return this.spendHistoryRequested;
+    }
+
+    getCurrentSpendSummary(): SpendSummary | undefined {
+        return this.spendSummary;
     }
 
     setDebugLogsEnabled(enabled: boolean): void {
@@ -1552,8 +1720,75 @@ function createSessionPickItems(
     return items;
 }
 
+// ---- Quick Pick: usage summary on status-bar click ----
+
+function buildUsageSummaryQuickPickItems(summary: SpendSummary): vscode.QuickPickItem[] {
+    const items: vscode.QuickPickItem[] = [
+        {
+            label: '$(dashboard) Copilot Usage Summary',
+            kind: vscode.QuickPickItemKind.Separator,
+        },
+        {
+            label: `Today: ${formatAic(summary.today.nanoAiu)} AIC`,
+            description: `${formatUsdEstimate(summary.today.nanoAiu)}`,
+            detail: `${summary.today.requestCount} requests · ${summary.today.sessionCount} sessions · ${formatNumber(summary.today.inputTokens)} in / ${formatNumber(summary.today.outputTokens)} out tokens`,
+        },
+    ];
+
+    const config = vscode.workspace.getConfiguration('copilotUsageTracker');
+    const dailyLimit = config.get<number>('dailyLimitAic', 500);
+    if (dailyLimit > 0) {
+        const dailyAic = summary.today.nanoAiu / NANO_AIU_PER_AIC;
+        const dailyPct = Math.round(Math.min(dailyAic / dailyLimit, 1) * 100);
+        items.push({
+            label: `  Daily Limit: ${formatAic(summary.today.nanoAiu)} / ${dailyLimit} AIC`,
+            description: `${dailyPct}% used`,
+        });
+    }
+
+    if (summary.week) {
+        items.push({
+            label: `Last 7 days: ${formatAic(summary.week.nanoAiu)} AIC`,
+            description: `${formatUsdEstimate(summary.week.nanoAiu)}`,
+            detail: `${summary.week.requestCount} requests · ${summary.week.sessionCount} sessions · ${formatNumber(summary.week.inputTokens)} in / ${formatNumber(summary.week.outputTokens)} out tokens`,
+        });
+        const weeklyLimit = config.get<number>('weeklyLimitAic', 3500);
+        if (weeklyLimit > 0) {
+            const weeklyAic = summary.week.nanoAiu / NANO_AIU_PER_AIC;
+            const weeklyPct = Math.round(Math.min(weeklyAic / weeklyLimit, 1) * 100);
+            items.push({
+                label: `  Weekly Limit: ${formatAic(summary.week.nanoAiu)} / ${weeklyLimit} AIC`,
+                description: `${weeklyPct}% used`,
+            });
+        }
+    }
+
+    if (summary.month) {
+        items.push({
+            label: `Last 30 days: ${formatAic(summary.month.nanoAiu)} AIC`,
+            description: `${formatUsdEstimate(summary.month.nanoAiu)}`,
+            detail: `${summary.month.requestCount} requests · ${summary.month.sessionCount} sessions`,
+        });
+    }
+
+    items.push(
+        { label: '', kind: vscode.QuickPickItemKind.Separator },
+        {
+            label: '$(gear) Open Settings',
+            description: 'Adjust daily/weekly AIC limits',
+        },
+        {
+            label: '$(graph-line) Open Copilot Usage View',
+            description: 'See full breakdown in the side panel',
+        },
+    );
+
+    return items;
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const treeProvider = new UsageTreeProvider();
+    const statusBar = new StatusBarManager();
     const spendFileCachePath = getSpendFileCachePath(context.globalStorageUri?.fsPath);
     treeProvider.setDebugLogsEnabled(isDebugLogsSettingEnabled());
 
@@ -1567,12 +1802,21 @@ export function activate(context: vscode.ExtensionContext) {
             if (event.element.kind === 'spendSummary') {
                 treeProvider.requestSpendHistory();
             }
-        })
+        }),
+        statusBar
     );
 
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration(DEBUG_LOGS_SETTING)) {
             treeProvider.setDebugLogsEnabled(isDebugLogsSettingEnabled());
+        }
+        if (event.affectsConfiguration('copilotUsageTracker.dailyLimitAic') ||
+            event.affectsConfiguration('copilotUsageTracker.weeklyLimitAic')) {
+            // Re-render status bar with new limits using latest spend data
+            const currentSpend = treeProvider.getCurrentSpendSummary();
+            if (currentSpend) {
+                statusBar.update(currentSpend);
+            }
         }
     }));
 
@@ -1592,7 +1836,9 @@ export function activate(context: vscode.ExtensionContext) {
         spendRefreshTimer = setTimeout(() => {
             spendRefreshTimer = undefined;
             try {
-                treeProvider.setSpendSummary(computeSpendSummary(mode, refresh, spendFileCachePath));
+                const summary = computeSpendSummary(mode, refresh, spendFileCachePath);
+                treeProvider.setSpendSummary(summary);
+                statusBar.update(summary);
             } catch (err) {
                 console.warn('Copilot Usage: failed to compute spend summary', err);
             }
@@ -1704,6 +1950,38 @@ export function activate(context: vscode.ExtensionContext) {
             autoLoad();
             watchCurrentSession();
             scheduleVisibleSpendSummaryRefresh(true);
+        })
+    );
+
+    // Quick Pick: usage summary shown when clicking the status bar
+    context.subscriptions.push(
+        vscode.commands.registerCommand('copilotUsageTracker.showUsageSummary', () => {
+            const summary = treeProvider.getCurrentSpendSummary();
+            if (!summary) {
+                vscode.window.showInformationMessage('Copilot Usage: No spend data available yet. Please wait for the next refresh.');
+                return;
+            }
+
+            const quickPick = vscode.window.createQuickPick();
+            quickPick.title = 'Copilot Usage Summary';
+            quickPick.matchOnDescription = true;
+            quickPick.ignoreFocusOut = false;
+            quickPick.items = buildUsageSummaryQuickPickItems(summary);
+            quickPick.onDidAccept(() => {
+                const picked = quickPick.selectedItems[0];
+                if (!picked) { return; }
+                if (picked.label.startsWith('$(gear)')) {
+                    quickPick.hide();
+                    vscode.commands.executeCommand('workbench.action.openSettings', '@ext:ailmind.github-copilot-chat-usage');
+                } else if (picked.label.startsWith('$(graph-line)')) {
+                    quickPick.hide();
+                    vscode.commands.executeCommand('workbench.view.extension.copilot-usage');
+                } else {
+                    quickPick.hide();
+                }
+            });
+            quickPick.onDidHide(() => quickPick.dispose());
+            quickPick.show();
         })
     );
 

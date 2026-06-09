@@ -15,6 +15,9 @@ GitHub documents Copilot usage in AI credits, where "1 AI credit = $0.01 USD" in
 - Inspect built-in tool calls such as searches, file reads, edits, diagnostics, todos, and terminal commands.
 - Use `@usage` in Copilot Chat to ask AI questions about the currently loaded session or recent sessions.
 - Open the GitHub AI credits documentation directly from the AIC row.
+- **Daily and weekly spending limits**: Set a budget in AIC and track it via a progress bar in the VS Code status bar. The bar changes from green → yellow → red as you approach the limit.
+- **Over-limit alert**: Receive a VS Code notification the first time you exceed a limit.
+- **Quick summary**: Click the status bar progress indicator to open a usage summary Quick Pick with links to settings and the usage view.
 
 ## Setup
 
@@ -34,10 +37,21 @@ This extension reads local VS Code/Copilot Chat storage files from your machine.
 
 When you use the `@usage` chat participant, the extension sends the selected session summary to the VS Code language model you are using so it can answer your question. Session summaries may include message previews, tool names, terminal command summaries, token counts, and cost totals.
 
+## Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `copilotUsageTracker.dailyLimitAic` | `500` | Daily AI Credit limit for the status bar progress indicator. Set to `0` to disable. |
+| `copilotUsageTracker.weeklyLimitAic` | `3500` | Weekly AI Credit limit for the status bar progress indicator. Set to `0` to disable. |
+| `copilotUsageTracker.showWeeklyInStatusBar` | `false` | Show the weekly AIC progress bar alongside the daily bar. |
+| `copilotUsageTracker.searchRoots` | `[]` | Additional directories to scan for Copilot/VS Code chat debug logs. |
+| `copilotUsageTracker.maxSearchDepth` | `6` | Maximum recursion depth when scanning configured and default log roots. |
+
 ## Commands
 
 - `Copilot Usage: Analyze Current Session`
 - `Copilot Usage: Pick Session to Analyze`
+- `Copilot Usage: Show Usage Summary` — Opens the usage summary Quick Pick (also triggered by clicking the status bar)
 - `Refresh`
 
 ## Build
