@@ -30,6 +30,7 @@
     "costs"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:copilotUsageTracker.analyzeSession",
     "onCommand:copilotUsageTracker.pickSession",
     "onCommand:copilotUsageTracker.refresh",
