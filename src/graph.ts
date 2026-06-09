@@ -54,6 +54,22 @@ export interface GraphTurn {
     toolCalls: GraphToolCall[];
 }
 
+export interface GraphSubagent {
+    sessionId: string;
+    title?: string;
+    inProgress: boolean;
+    costAic: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    totalTokens: number;
+    durationMs: number;
+    messageCount: number;
+    modelTurnCount: number;
+    toolCallCount: number;
+    messages: GraphMessage[];
+}
+
 export interface GraphToolCall {
     name: string;
     displayLabel: string;
@@ -63,6 +79,8 @@ export interface GraphToolCall {
     toolKind?: string;
     resultCount?: number;
     subagentCostAic?: number;
+    subagentInProgress?: boolean;
+    subagent?: GraphSubagent;
 }
 
 export interface ToolUsageEntry {
@@ -112,6 +130,24 @@ export interface GraphComparison {
     commandDiff: { executable: string; countA: number; countB: number }[];
 }
 
+export interface SerializeOptions {
+    includeMessages?: boolean;
+    maxMessages?: number;
+    includeSubagents?: boolean;
+    maxSubagentMessages?: number;
+    maxSubagentDepth?: number;
+}
+
+interface ResolvedSerializeOptions {
+    includeMessages: boolean;
+    maxMessages: number;
+    includeSubagents: boolean;
+    maxSubagentMessages: number;
+    maxSubagentDepth: number;
+}
+
+const MAX_GRAPH_SUBAGENT_DEPTH = 4;
+
 // ---- SessionGraph class ----
 
 export class SessionGraph {
@@ -144,7 +180,7 @@ export class SessionGraph {
                 totalDurationMs: s.totalDurationMs,
                 messageCount: s.userMessages.length,
                 modelTurnCount: s.modelTurnCount,
-                toolCallCount: s.toolCallCount,
+                toolCallCount: this.countSummaryToolCalls(s),
                 avgCostPerMessage: s.userMessages.length > 0 ? totalCost / s.userMessages.length : 0,
                 avgTurnsPerMessage: s.userMessages.length > 0 ? s.modelTurnCount / s.userMessages.length : 0,
                 cacheHitRatio: s.totalInputTokens > 0 ? s.totalCachedTokens / s.totalInputTokens : 0,
@@ -216,8 +252,14 @@ export class SessionGraph {
      * Serialize to a compact string for LLM context.
      * Produces a structured text summary suitable for injection into a chat prompt.
      */
-    serialize(options?: { includeMessages?: boolean; maxMessages?: number }): string {
-        const opts = { includeMessages: true, maxMessages: 30, ...options };
+    serialize(options?: SerializeOptions): string {
+        const opts: ResolvedSerializeOptions = {
+            includeMessages: options?.includeMessages ?? true,
+            maxMessages: options?.maxMessages ?? 30,
+            includeSubagents: options?.includeSubagents ?? true,
+            maxSubagentMessages: options?.maxSubagentMessages ?? 10,
+            maxSubagentDepth: options?.maxSubagentDepth ?? 3,
+        };
         const lines: string[] = [];
 
         const s = this.stats;
@@ -232,7 +274,7 @@ export class SessionGraph {
         const used = tools.filter(t => t.count > 0);
         const unused = tools.filter(t => t.count === 0);
         if (used.length > 0) {
-            lines.push('## Tool Usage');
+            lines.push('## Tool Usage (including subagents)');
             for (const t of used) {
                 lines.push(`  ${t.name}: ${t.count}x (${formatDuration(t.totalDurationMs)})`);
             }
@@ -244,7 +286,7 @@ export class SessionGraph {
 
         // Commands
         if (this.commands.length > 0) {
-            lines.push('## Commands');
+            lines.push('## Commands (including subagents)');
             for (const c of this.commands) {
                 lines.push(`  ${c.executable}: ${c.count}x`);
             }
@@ -268,10 +310,7 @@ export class SessionGraph {
                 const cost = msg.costAic.toFixed(1);
                 lines.push(`### ${msg.index + 1}: "${msg.content}" [${cost} AIC | ${msg.turnCount} turns | ${msg.toolCallCount} tool calls]`);
                 for (const turn of msg.turns) {
-                    const tools = turn.toolCalls
-                        .map(tc => tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel)
-                        .join(', ');
-                    lines.push(`  Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+                    lines.push(...this.serializeTurn(turn, '  ', opts, 0));
                 }
             }
             if (this.messages.length > opts.maxMessages) {
@@ -284,7 +323,58 @@ export class SessionGraph {
 
     // ---- Private computation methods ----
 
-    private buildGraphMessage(m: UserMessageSummary, index: number): GraphMessage {
+    private serializeTurn(turn: GraphTurn, indent: string, opts: ResolvedSerializeOptions, subagentDepth: number): string[] {
+        const lines: string[] = [];
+        const tools = turn.toolCalls.map(tc => this.formatToolCallLabel(tc)).join(', ');
+        lines.push(`${indent}Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+
+        if (!opts.includeSubagents) {
+            return lines;
+        }
+
+        for (const tc of turn.toolCalls) {
+            lines.push(...this.serializeSubagent(tc, `${indent}  `, opts, subagentDepth + 1));
+        }
+        return lines;
+    }
+
+    private serializeSubagent(tc: GraphToolCall, indent: string, opts: ResolvedSerializeOptions, depth: number): string[] {
+        if (!tc.subagent || depth > opts.maxSubagentDepth) {
+            return [];
+        }
+
+        const sub = tc.subagent;
+        const status = sub.inProgress ? 'in progress' : 'complete';
+        const label = tc.displayLabel.replace(/^Subagent:\s*/i, '') || tc.displayLabel;
+        const lines = [
+            `${indent}Subagent: ${label} [${status} | ${sub.costAic.toFixed(2)} AIC | tokens in:${formatNumber(sub.inputTokens)} out:${formatNumber(sub.outputTokens)} cache:${formatNumber(sub.cachedTokens)} | ${sub.messageCount} messages | ${sub.modelTurnCount} turns | ${sub.toolCallCount} tool calls]`,
+        ];
+
+        const messages = sub.messages.slice(0, opts.maxSubagentMessages);
+        for (const msg of messages) {
+            lines.push(`${indent}  Message ${msg.index + 1}: "${msg.content}" [${msg.costAic.toFixed(1)} AIC | ${msg.turnCount} turns | ${msg.toolCallCount} tool calls]`);
+            for (const turn of msg.turns) {
+                lines.push(...this.serializeTurn(turn, `${indent}    `, opts, depth));
+            }
+        }
+
+        if (sub.messages.length > opts.maxSubagentMessages) {
+            lines.push(`${indent}  ... ${sub.messages.length - opts.maxSubagentMessages} more subagent messages`);
+        }
+        return lines;
+    }
+
+    private formatToolCallLabel(tc: GraphToolCall): string {
+        let label = tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel;
+        if (tc.subagentInProgress) {
+            label += ' [in progress]';
+        } else if (tc.isSubagent && tc.subagentCostAic !== undefined) {
+            label += ` (${tc.subagentCostAic.toFixed(1)} AIC)`;
+        }
+        return label;
+    }
+
+    private buildGraphMessage(m: UserMessageSummary, index: number, subagentDepth = 0): GraphMessage {
         return {
             index,
             content: capWords(m.content, 100),
@@ -296,13 +386,13 @@ export class SessionGraph {
             totalTokens: m.totalTokens,
             durationMs: m.totalDurationMs,
             turnCount: m.modelTurns.length,
-            toolCallCount: m.toolCalls.length,
+            toolCallCount: this.countMessageToolCalls(m),
             continuations: m.mergedMessages.length,
-            turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i)),
+            turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i, subagentDepth)),
         };
     }
 
-    private buildGraphTurn(t: ModelTurnSummary, index: number): GraphTurn {
+    private buildGraphTurn(t: ModelTurnSummary, index: number, subagentDepth = 0): GraphTurn {
         return {
             index,
             model: t.model,
@@ -315,35 +405,51 @@ export class SessionGraph {
             cacheHitRatio: t.cacheHitRatio,
             durationMs: t.durationMs,
             ttftMs: t.ttftMs,
-            toolCalls: t.toolCalls.map(tc => ({
-                name: tc.name,
-                displayLabel: tc.displayLabel.slice(0, 80),
-                durationMs: tc.durationMs,
-                isSubagent: tc.isSubagent,
-                source: tc.source,
-                toolKind: tc.toolKind,
-                resultCount: tc.resultCount,
-                subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
-            })),
+            toolCalls: t.toolCalls.map(tc => this.buildGraphToolCall(tc, subagentDepth)),
+        };
+    }
+
+    private buildGraphToolCall(tc: ToolCallSummary, subagentDepth: number): GraphToolCall {
+        const call: GraphToolCall = {
+            name: tc.name,
+            displayLabel: tc.displayLabel.slice(0, 80),
+            durationMs: tc.durationMs,
+            isSubagent: tc.isSubagent,
+            source: tc.source,
+            toolKind: tc.toolKind,
+            resultCount: tc.resultCount,
+            subagentCostAic: tc.subagentSummary ? tc.subagentSummary.totalNanoAiu / 1_000_000_000 : undefined,
+            subagentInProgress: tc.subagentInProgress || false,
+        };
+
+        if (tc.subagentSummary && subagentDepth < MAX_GRAPH_SUBAGENT_DEPTH) {
+            call.subagent = this.buildGraphSubagent(tc.subagentSummary, subagentDepth + 1);
+        }
+
+        return call;
+    }
+
+    private buildGraphSubagent(summary: SessionSummary, subagentDepth: number): GraphSubagent {
+        return {
+            sessionId: summary.sessionId,
+            title: summary.title,
+            inProgress: summary.inProgress || false,
+            costAic: summary.totalNanoAiu / 1_000_000_000,
+            inputTokens: summary.totalInputTokens,
+            outputTokens: summary.totalOutputTokens,
+            cachedTokens: summary.totalCachedTokens,
+            totalTokens: summary.totalTokens,
+            durationMs: summary.totalDurationMs,
+            messageCount: summary.userMessages.length,
+            modelTurnCount: summary.modelTurnCount,
+            toolCallCount: summary.toolCallCount,
+            messages: summary.userMessages.map((m, i) => this.buildGraphMessage(m, i, subagentDepth)),
         };
     }
 
     private computeToolUsage(): Map<string, ToolUsageEntry> {
         const counts = new Map<string, { count: number; totalDurationMs: number }>();
-
-        for (const msg of this.summary.userMessages) {
-            for (const turn of msg.modelTurns) {
-                for (const tc of turn.toolCalls) {
-                    const existing = counts.get(tc.name);
-                    if (existing) {
-                        existing.count++;
-                        existing.totalDurationMs += tc.durationMs;
-                    } else {
-                        counts.set(tc.name, { count: 1, totalDurationMs: tc.durationMs });
-                    }
-                }
-            }
-        }
+        this.addToolUsageFromSummary(this.summary, counts);
 
         // Add tools from prompt composition that were never used
         if (this.summary.promptComposition) {
@@ -367,10 +473,50 @@ export class SessionGraph {
         return result;
     }
 
+    private addToolUsageFromSummary(
+        summary: SessionSummary,
+        counts: Map<string, { count: number; totalDurationMs: number }>,
+        seen = new Set<SessionSummary>()
+    ): void {
+        if (seen.has(summary)) {
+            return;
+        }
+        seen.add(summary);
+
+        for (const msg of summary.userMessages) {
+            for (const turn of msg.modelTurns) {
+                for (const tc of turn.toolCalls) {
+                    const existing = counts.get(tc.name);
+                    if (existing) {
+                        existing.count++;
+                        existing.totalDurationMs += tc.durationMs;
+                    } else {
+                        counts.set(tc.name, { count: 1, totalDurationMs: tc.durationMs });
+                    }
+                    if (tc.subagentSummary) {
+                        this.addToolUsageFromSummary(tc.subagentSummary, counts, seen);
+                    }
+                }
+            }
+        }
+    }
+
     private computeCommands(): CommandEntry[] {
         const counts = new Map<string, number>();
+        this.addCommandsFromSummary(this.summary, counts);
 
-        for (const msg of this.summary.userMessages) {
+        return [...counts.entries()]
+            .map(([executable, count]) => ({ executable, count }))
+            .sort((a, b) => b.count - a.count);
+    }
+
+    private addCommandsFromSummary(summary: SessionSummary, counts: Map<string, number>, seen = new Set<SessionSummary>()): void {
+        if (seen.has(summary)) {
+            return;
+        }
+        seen.add(summary);
+
+        for (const msg of summary.userMessages) {
             for (const turn of msg.modelTurns) {
                 for (const tc of turn.toolCalls) {
                     if (tc.name === 'run_in_terminal') {
@@ -379,13 +525,29 @@ export class SessionGraph {
                             counts.set(exe, (counts.get(exe) || 0) + 1);
                         }
                     }
+                    if (tc.subagentSummary) {
+                        this.addCommandsFromSummary(tc.subagentSummary, counts, seen);
+                    }
                 }
             }
         }
+    }
 
-        return [...counts.entries()]
-            .map(([executable, count]) => ({ executable, count }))
-            .sort((a, b) => b.count - a.count);
+    private countSummaryToolCalls(summary: SessionSummary, seen = new Set<SessionSummary>()): number {
+        if (seen.has(summary)) {
+            return 0;
+        }
+        seen.add(summary);
+
+        return summary.userMessages.reduce((sum, message) => sum + this.countMessageToolCalls(message, seen), 0);
+    }
+
+    private countMessageToolCalls(message: UserMessageSummary, seen = new Set<SessionSummary>()): number {
+        return message.modelTurns.reduce((messageTotal, turn) => {
+            return messageTotal + turn.toolCalls.reduce((turnTotal, tc) => {
+                return turnTotal + 1 + (tc.subagentSummary ? this.countSummaryToolCalls(tc.subagentSummary, seen) : 0);
+            }, 0);
+        }, 0);
     }
 
     private computeRisks(): RiskFlag[] {

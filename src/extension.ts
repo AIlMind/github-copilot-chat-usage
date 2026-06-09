@@ -10,7 +10,6 @@ import {
     ToolDefinitionSize,
     findSiblingChatSessionLog,
     NANO_AIU_PER_AIC,
-    parseCreditDetailsNanoAiu,
     parseCopilotSessionFile,
     quickPeekHasBillingData,
     formatNumber,
@@ -19,6 +18,15 @@ import {
     estimateTokens,
 } from './parser';
 import { setCurrentGraph, registerChatParticipant } from './participant';
+import {
+    ChatSessionDirEntry,
+    SpendBucket,
+    SpendModelBucket,
+    SpendSummary,
+    SpendWorkspaceBucket,
+    computeSpendSummaryFromChatSessionDirs,
+    getSpendFileCachePath,
+} from './spend';
 
 /**
  * Title priority levels (higher = better):
@@ -38,9 +46,8 @@ const DEBUG_LOGS_SETTING = 'github.copilot.chat.agentDebugLog.fileLogging.enable
 const INITIAL_PICK_DAYS = 3;
 const PICK_LOAD_MORE_DAYS = 10;
 const DEBUG_DIR_CACHE_MS = 30_000;
-const SPEND_LOOKBACK_DAYS = 30;
-const SPEND_SCAN_CACHE_MS = 30_000;
 const SPEND_AUTO_REFRESH_MS = 5 * 60 * 1000;
+const SPEND_SCAN_CACHE_MS = SPEND_AUTO_REFRESH_MS;
 const TITLE_CHAT_TAIL_BYTES = 256 * 1024;
 const TITLE_DEBUG_HEAD_BYTES = 16 * 1024;
 
@@ -54,41 +61,6 @@ interface SessionCandidate {
 interface SessionScanResult<T extends SessionCandidate = SessionCandidate> {
     sessions: T[];
     hasOlder: boolean;
-}
-
-interface SpendBucket {
-    label: string;
-    nanoAiu: number;
-    inputTokens: number;
-    outputTokens: number;
-    requestCount: number;
-    sessionCount: number;
-    models?: SpendModelBucket[];
-}
-
-interface SpendModelBucket extends SpendBucket {
-    key: string;
-}
-
-interface SpendSummary {
-    today: SpendBucket;
-    week?: SpendBucket;
-    month?: SpendBucket;
-    scannedFiles: number;
-    generatedAt: number;
-}
-
-interface SpendRequest {
-    timestamp?: number;
-    nanoAiu: number;
-    inputTokens: number;
-    outputTokens: number;
-    model: string;
-}
-
-interface SpendModelAccumulator {
-    modelBuckets: Map<string, SpendModelBucket>;
-    modelSessionSets: Map<string, Set<string>>;
 }
 
 function pathExists(candidate: string | undefined): candidate is string {
@@ -108,6 +80,14 @@ function formatUsdEstimate(nanoAiu: number): string {
     const aic = nanoAiu / NANO_AIU_PER_AIC;
     const usd = aic / 100;
     return `$${usd < 1 ? usd.toFixed(4) : usd.toFixed(2)} USD est.`;
+}
+
+function formatLocalDateTime(timestamp: number): string {
+    return new Date(timestamp).toLocaleString(vscode.env.language || undefined);
+}
+
+function formatLocalTime(timestamp: number): string {
+    return new Date(timestamp).toLocaleTimeString(vscode.env.language || undefined);
 }
 
 function isDebugLogsSettingEnabled(): boolean {
@@ -210,12 +190,160 @@ function collectChatSessionDirs(root: string, maxDepth: number, results: Set<str
     }
 }
 
-function findAllChatSessionDirs(refresh = false): string[] {
+function labelFromPath(filePath: string | undefined): string | undefined {
+    if (!filePath) { return undefined; }
+
+    const trimmed = filePath.replace(/[\\/]+$/, '');
+    const base = path.basename(trimmed);
+    if (!base || base === '.' || base === path.sep) {
+        return undefined;
+    }
+
+    return base.toLowerCase().endsWith('.code-workspace')
+        ? base.slice(0, -'.code-workspace'.length)
+        : base;
+}
+
+function fsPathFromUriString(value: string | undefined): string | undefined {
+    if (!value) { return undefined; }
+
+    try {
+        const uri = vscode.Uri.parse(value);
+        if (uri.scheme === 'file') {
+            return uri.fsPath;
+        }
+        if (uri.path) {
+            return decodeURIComponent(uri.path);
+        }
+    } catch {
+        // Fall back to treating the value as a path below.
+    }
+
+    return value;
+}
+
+function labelFromWorkspaceFolder(folder: any, workspaceFilePath: string): string | undefined {
+    if (!folder || typeof folder !== 'object') {
+        return undefined;
+    }
+
+    if (typeof folder.name === 'string' && folder.name.trim()) {
+        return folder.name.trim();
+    }
+
+    if (typeof folder.uri === 'string') {
+        return labelFromPath(fsPathFromUriString(folder.uri));
+    }
+
+    if (typeof folder.path === 'string' && folder.path.trim()) {
+        const folderPath = path.isAbsolute(folder.path)
+            ? folder.path
+            : path.resolve(path.dirname(workspaceFilePath), folder.path);
+        return labelFromPath(folderPath);
+    }
+
+    return undefined;
+}
+
+function readWorkspaceFileLabel(workspaceFilePath: string | undefined): string | undefined {
+    if (!workspaceFilePath || !fs.existsSync(workspaceFilePath)) {
+        return undefined;
+    }
+
+    try {
+        const workspace = JSON.parse(fs.readFileSync(workspaceFilePath, 'utf-8'));
+        const folders = Array.isArray(workspace.folders)
+            ? workspace.folders
+                .map((folder: any) => labelFromWorkspaceFolder(folder, workspaceFilePath))
+                .filter((label: string | undefined): label is string => !!label)
+            : [];
+
+        if (folders.length === 1) {
+            return folders[0];
+        }
+        if (folders.length > 1) {
+            return `${folders[0]} +${folders.length - 1}`;
+        }
+    } catch {
+        return undefined;
+    }
+
+    return undefined;
+}
+
+function resolveWorkspaceStorageLabel(workspaceStorageDir: string): string {
+    const cached = workspaceLabelCache.get(workspaceStorageDir);
+    if (cached) {
+        return cached;
+    }
+
+    const fallback = path.basename(workspaceStorageDir).slice(0, 8) || 'Unknown Workspace';
+    let label: string | undefined;
+    const workspaceJson = path.join(workspaceStorageDir, 'workspace.json');
+
+    try {
+        const workspace = JSON.parse(fs.readFileSync(workspaceJson, 'utf-8'));
+        if (typeof workspace.folder === 'string') {
+            label = labelFromPath(fsPathFromUriString(workspace.folder));
+        }
+
+        if (!label && typeof workspace.workspace === 'string') {
+            const workspacePath = fsPathFromUriString(workspace.workspace);
+            label = readWorkspaceFileLabel(workspacePath) || labelFromPath(workspacePath);
+            if (label === 'workspace.json') {
+                label = undefined;
+            }
+        }
+    } catch {
+        label = undefined;
+    }
+
+    const resolved = label || fallback;
+    workspaceLabelCache.set(workspaceStorageDir, resolved);
+    return resolved;
+}
+
+function chatSessionDirEntry(dir: string): ChatSessionDirEntry {
+    const resolvedDir = path.resolve(dir);
+    const base = path.basename(resolvedDir);
+
+    if (base === 'emptyWindowChatSessions') {
+        return {
+            dir: resolvedDir,
+            workspaceKey: resolvedDir,
+            workspaceLabel: 'Empty Window',
+        };
+    }
+
+    if (base === 'chatSessions') {
+        const workspaceStorageDir = path.dirname(resolvedDir);
+        return {
+            dir: resolvedDir,
+            workspaceKey: workspaceStorageDir,
+            workspaceLabel: resolveWorkspaceStorageLabel(workspaceStorageDir),
+        };
+    }
+
+    return {
+        dir: resolvedDir,
+        workspaceKey: resolvedDir,
+        workspaceLabel: labelFromPath(path.dirname(resolvedDir)) || labelFromPath(resolvedDir) || 'Unknown Workspace',
+    };
+}
+
+function addChatSessionDir(results: Map<string, ChatSessionDirEntry>, dir: string): void {
+    const entry = chatSessionDirEntry(dir);
+    if (!results.has(entry.dir)) {
+        results.set(entry.dir, entry);
+    }
+}
+
+function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
     if (!refresh && chatSessionDirsCache && chatSessionDirsCache.expiresAt > Date.now()) {
         return chatSessionDirsCache.dirs;
     }
 
-    const results = new Set<string>();
+    const results = new Map<string, ChatSessionDirEntry>();
     for (const wsStorageRoot of getWorkspaceStorageRoots()) {
         let workspaceDirs: string[];
         try {
@@ -227,14 +355,14 @@ function findAllChatSessionDirs(refresh = false): string[] {
         for (const dir of workspaceDirs) {
             const chatSessionsDir = path.join(wsStorageRoot, dir, 'chatSessions');
             if (fs.existsSync(chatSessionsDir)) {
-                results.add(chatSessionsDir);
+                addChatSessionDir(results, chatSessionsDir);
             }
         }
 
         const userRoot = path.dirname(wsStorageRoot);
         const emptyWindowDir = path.join(userRoot, 'globalStorage', 'emptyWindowChatSessions');
         if (fs.existsSync(emptyWindowDir)) {
-            results.add(emptyWindowDir);
+            addChatSessionDir(results, emptyWindowDir);
         }
     }
 
@@ -242,438 +370,30 @@ function findAllChatSessionDirs(refresh = false): string[] {
         .getConfiguration('copilotUsageTracker')
         .get<number>('maxSearchDepth', 6);
     for (const root of getConfiguredSearchRoots()) {
-        collectChatSessionDirs(root, maxDepth, results);
+        const configuredDirs = new Set<string>();
+        collectChatSessionDirs(root, maxDepth, configuredDirs);
+        for (const dir of configuredDirs) {
+            addChatSessionDir(results, dir);
+        }
     }
 
-    const dirs = [...results];
+    const dirs = [...results.values()];
     chatSessionDirsCache = { dirs, expiresAt: Date.now() + DEBUG_DIR_CACHE_MS };
     return dirs;
 }
 
-function toFiniteNumber(value: unknown): number | undefined {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-        return value;
-    }
-    if (typeof value === 'string' && value.trim()) {
-        const parsed = Number(value);
-        return Number.isFinite(parsed) ? parsed : undefined;
-    }
-    return undefined;
-}
-
-function requestIndexFromPath(pathParts: unknown[]): string | undefined {
-    if (pathParts[0] !== 'requests' || pathParts.length < 2) {
-        return undefined;
-    }
-    const index = pathParts[1];
-    return typeof index === 'number' || typeof index === 'string' ? String(index) : undefined;
-}
-
-function parseCreditDetailsModel(detailsValue: unknown): string | undefined {
-    if (typeof detailsValue !== 'string') {
-        return undefined;
-    }
-
-    const match = detailsValue.match(/^\s*(.*?)\s*•\s*\d+(?:\.\d+)?\s+(?:ai\s+)?credits?\b/i);
-    const model = match?.[1]?.trim();
-    return model || undefined;
-}
-
-function normalizeSpendModel(modelValue: unknown): string | undefined {
-    if (typeof modelValue !== 'string') {
-        return undefined;
-    }
-
-    const model = modelValue.trim();
-    if (!model) {
-        return undefined;
-    }
-
-    return model.replace(/^copilot\//i, '');
-}
-
-function applySpendRequestModel(request: SpendRequest, modelValue: unknown): void {
-    const model = normalizeSpendModel(modelValue);
-    if (!model) {
-        return;
-    }
-
-    if (request.model === 'Unknown model' || request.model === 'auto' || model !== 'auto') {
-        request.model = model;
-    }
-}
-
-function ensureSpendRequest(requests: Map<string, SpendRequest>, index: string): SpendRequest {
-    let request = requests.get(index);
-    if (!request) {
-        request = {
-            nanoAiu: 0,
-            inputTokens: 0,
-            outputTokens: 0,
-            model: 'Unknown model',
-        };
-        requests.set(index, request);
-    }
-    return request;
-}
-
-function firstFiniteNumber(...values: unknown[]): number | undefined {
-    for (const value of values) {
-        const parsed = toFiniteNumber(value);
-        if (parsed !== undefined) {
-            return parsed;
-        }
-    }
-    return undefined;
-}
-
-function applySpendRequestTokens(request: SpendRequest, value: any): void {
-    if (!value || typeof value !== 'object') {
-        return;
-    }
-
-    const metadata = value.result?.metadata ?? value.metadata;
-    const usage = metadata?.usage ?? value.usage;
-    const inputTokens = firstFiniteNumber(
-        value.promptTokens,
-        value.inputTokens,
-        metadata?.promptTokens,
-        metadata?.inputTokens,
-        usage?.promptTokens,
-        usage?.inputTokens
-    );
-    const outputTokens = firstFiniteNumber(
-        value.completionTokens,
-        value.outputTokens,
-        metadata?.completionTokens,
-        metadata?.outputTokens,
-        usage?.completionTokens,
-        usage?.outputTokens
-    );
-
-    if (inputTokens !== undefined) {
-        request.inputTokens = inputTokens;
-    }
-    if (outputTokens !== undefined) {
-        request.outputTokens = outputTokens;
-    }
-}
-
-function updateSpendRequestFromValue(requests: Map<string, SpendRequest>, index: string, value: any): void {
-    if (!value || typeof value !== 'object') {
-        return;
-    }
-
-    const request = ensureSpendRequest(requests, index);
-    const timestamp = toFiniteNumber(value.timestamp);
-    if (timestamp !== undefined) {
-        request.timestamp = timestamp;
-    }
-
-    const nanoAiu = parseCreditDetailsNanoAiu(value.result?.details);
-    if (nanoAiu > 0) {
-        request.nanoAiu = nanoAiu;
-    }
-    applySpendRequestModel(request, parseCreditDetailsModel(value.result?.details) ?? value.modelId ?? value.model);
-    applySpendRequestTokens(request, value);
-}
-
-function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[], value: any): void {
-    if (pathParts[2] === 'timestamp') {
-        const timestamp = toFiniteNumber(value);
-        if (timestamp !== undefined) {
-            request.timestamp = timestamp;
-        }
-        return;
-    }
-
-    if (pathParts[2] === 'promptTokens' || pathParts[2] === 'inputTokens') {
-        const inputTokens = toFiniteNumber(value);
-        if (inputTokens !== undefined) {
-            request.inputTokens = inputTokens;
-        }
-        return;
-    }
-
-    if (pathParts[2] === 'completionTokens' || pathParts[2] === 'outputTokens') {
-        const outputTokens = toFiniteNumber(value);
-        if (outputTokens !== undefined) {
-            request.outputTokens = outputTokens;
-        }
-        return;
-    }
-
-    if (pathParts[2] === 'modelId' || pathParts[2] === 'model') {
-        applySpendRequestModel(request, value);
-        return;
-    }
-
-    if (pathParts[2] !== 'result') {
-        return;
-    }
-
-    const details = pathParts[3] === 'details' ? value : value?.details;
-    const nanoAiu = parseCreditDetailsNanoAiu(details);
-    if (nanoAiu > 0) {
-        request.nanoAiu = nanoAiu;
-    }
-    applySpendRequestModel(request, parseCreditDetailsModel(details));
-
-    if (pathParts[3] === 'metadata') {
-        if (pathParts.length === 4) {
-            applySpendRequestTokens(request, { metadata: value });
-        } else if (pathParts[4] === 'usage' && pathParts.length === 5) {
-            applySpendRequestTokens(request, { usage: value });
-        } else if (pathParts[4] === 'usage' && (pathParts[5] === 'promptTokens' || pathParts[5] === 'inputTokens')) {
-            const inputTokens = toFiniteNumber(value);
-            if (inputTokens !== undefined) {
-                request.inputTokens = inputTokens;
-            }
-        } else if (pathParts[4] === 'usage' && (pathParts[5] === 'completionTokens' || pathParts[5] === 'outputTokens')) {
-            const outputTokens = toFiniteNumber(value);
-            if (outputTokens !== undefined) {
-                request.outputTokens = outputTokens;
-            }
-        } else if (pathParts[4] === 'promptTokens' || pathParts[4] === 'inputTokens') {
-            const inputTokens = toFiniteNumber(value);
-            if (inputTokens !== undefined) {
-                request.inputTokens = inputTokens;
-            }
-        } else if (pathParts[4] === 'completionTokens' || pathParts[4] === 'outputTokens') {
-            const outputTokens = toFiniteNumber(value);
-            if (outputTokens !== undefined) {
-                request.outputTokens = outputTokens;
-            }
-        }
-    } else {
-        applySpendRequestTokens(request, { result: value });
-    }
-}
-
-function readSpendRequestsFromChatSession(filePath: string, fallbackTimestamp: number): SpendRequest[] {
-    const requests = new Map<string, SpendRequest>();
-    let content: string;
-    try {
-        content = fs.readFileSync(filePath, 'utf-8');
-    } catch {
-        return [];
-    }
-
-    for (const line of content.split('\n')) {
-        if (!line.trim() || !line.includes('requests')) {
-            continue;
-        }
-
-        let raw: any;
-        try {
-            raw = JSON.parse(line);
-        } catch {
-            continue;
-        }
-
-        if (raw.kind === 0 && Array.isArray(raw.v?.requests)) {
-            raw.v.requests.forEach((request: any, index: number) => {
-                updateSpendRequestFromValue(requests, String(index), request);
-            });
-            continue;
-        }
-
-        if (!Array.isArray(raw.k) || raw.k[0] !== 'requests') {
-            continue;
-        }
-
-        if (raw.kind === 2 && raw.k.length === 1 && Array.isArray(raw.v)) {
-            const startIndex = toFiniteNumber(raw.i) ?? 0;
-            raw.v.forEach((request: any, offset: number) => {
-                updateSpendRequestFromValue(requests, String(startIndex + offset), request);
-            });
-            continue;
-        }
-
-        const index = requestIndexFromPath(raw.k);
-        if (index === undefined) {
-            continue;
-        }
-
-        if (raw.kind === 3) {
-            requests.delete(index);
-            continue;
-        }
-
-        if (raw.k.length === 2) {
-            updateSpendRequestFromValue(requests, index, raw.v);
-            continue;
-        }
-
-        updateSpendRequestFromPatch(ensureSpendRequest(requests, index), raw.k, raw.v);
-    }
-
-    return [...requests.values()]
-        .filter(request => request.nanoAiu > 0)
-        .map(request => ({ ...request, timestamp: request.timestamp ?? fallbackTimestamp }));
-}
-
-function createSpendBucket(label: string): SpendBucket {
-    return { label, nanoAiu: 0, inputTokens: 0, outputTokens: 0, requestCount: 0, sessionCount: 0 };
-}
-
-function createSpendModelBucket(key: string, label: string): SpendModelBucket {
-    return { key, ...createSpendBucket(label) };
-}
-
-function createSpendModelAccumulator(): SpendModelAccumulator {
-    return {
-        modelBuckets: new Map<string, SpendModelBucket>(),
-        modelSessionSets: new Map<string, Set<string>>(),
-    };
-}
-
-function addToSpendBucket(bucket: SpendBucket, request: SpendRequest, sessionSet: Set<string>, sessionId: string): void {
-    bucket.nanoAiu += request.nanoAiu;
-    bucket.inputTokens += request.inputTokens;
-    bucket.outputTokens += request.outputTokens;
-    bucket.requestCount++;
-    sessionSet.add(sessionId);
-    bucket.sessionCount = sessionSet.size;
-}
-
-function addToSpendModelBucket(
-    buckets: Map<string, SpendModelBucket>,
-    sessionSets: Map<string, Set<string>>,
-    key: string,
-    label: string,
-    request: SpendRequest,
-    sessionId: string
-): void {
-    let bucket = buckets.get(key);
-    if (!bucket) {
-        bucket = createSpendModelBucket(key, label);
-        buckets.set(key, bucket);
-    }
-
-    let sessionSet = sessionSets.get(key);
-    if (!sessionSet) {
-        sessionSet = new Set<string>();
-        sessionSets.set(key, sessionSet);
-    }
-
-    addToSpendBucket(bucket, request, sessionSet, sessionId);
-}
-
-function sortedSpendModelBuckets(buckets: Map<string, SpendModelBucket>): SpendModelBucket[] {
-    return [...buckets.values()].sort((a, b) => {
-        if (b.nanoAiu !== a.nanoAiu) {
-            return b.nanoAiu - a.nanoAiu;
-        }
-        return a.label.localeCompare(b.label);
-    });
-}
-
-function addToSpendModels(accumulator: SpendModelAccumulator, request: SpendRequest, sessionId: string): void {
-    addToSpendModelBucket(
-        accumulator.modelBuckets,
-        accumulator.modelSessionSets,
-        request.model,
-        request.model,
-        request,
-        sessionId
-    );
-}
-
-function finalizeSpendModels(accumulator: SpendModelAccumulator): SpendModelBucket[] {
-    return sortedSpendModelBuckets(accumulator.modelBuckets);
-}
-
 type SpendScanMode = 'today' | 'full';
 
-function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary {
+function computeSpendSummary(mode: SpendScanMode, refresh = false, cacheFilePath?: string): SpendSummary {
     const cache = mode === 'full' ? fullSpendSummaryCache : todaySpendSummaryCache;
     if (!refresh && cache && cache.expiresAt > Date.now()) {
         return cache.summary;
     }
 
-    const now = Date.now();
-    const todayStart = new Date(now);
-    todayStart.setHours(0, 0, 0, 0);
-    const todayCutoff = todayStart.getTime();
-    const weekCutoff = now - 7 * 24 * 60 * 60 * 1000;
-    const monthCutoff = now - SPEND_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-    const includeHistory = mode === 'full';
-
-    const summary: SpendSummary = {
-        today: createSpendBucket('Today'),
-        week: includeHistory ? createSpendBucket('Last 7 days') : undefined,
-        month: includeHistory ? createSpendBucket('Last 30 days') : undefined,
-        scannedFiles: 0,
-        generatedAt: now,
-    };
-    const todaySessions = new Set<string>();
-    const weekSessions = new Set<string>();
-    const monthSessions = new Set<string>();
-    const todayModels = createSpendModelAccumulator();
-    const weekModels = createSpendModelAccumulator();
-    const monthModels = createSpendModelAccumulator();
-    const fileCutoff = includeHistory ? monthCutoff : todayCutoff;
-
-    for (const dir of findAllChatSessionDirs(refresh)) {
-        let entries: fs.Dirent[];
-        try {
-            entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch {
-            continue;
-        }
-
-        for (const entry of entries) {
-            if (!entry.isFile() || !entry.name.endsWith('.jsonl')) {
-                continue;
-            }
-
-            const filePath = path.join(dir, entry.name);
-            let stat: fs.Stats;
-            try {
-                stat = fs.statSync(filePath);
-            } catch {
-                continue;
-            }
-            if (stat.mtimeMs < fileCutoff) {
-                continue;
-            }
-
-            summary.scannedFiles++;
-            const sessionId = path.basename(entry.name, '.jsonl');
-            const requests = readSpendRequestsFromChatSession(filePath, stat.mtimeMs);
-            for (const request of requests) {
-                const timestamp = request.timestamp ?? stat.mtimeMs;
-                if (timestamp >= todayCutoff) {
-                    addToSpendBucket(summary.today, request, todaySessions, sessionId);
-                    addToSpendModels(todayModels, request, sessionId);
-                }
-                if (includeHistory && summary.week && summary.month) {
-                    if (timestamp >= monthCutoff) {
-                        addToSpendBucket(summary.month, request, monthSessions, sessionId);
-                        addToSpendModels(monthModels, request, sessionId);
-                    }
-                    if (timestamp >= weekCutoff) {
-                        addToSpendBucket(summary.week, request, weekSessions, sessionId);
-                        addToSpendModels(weekModels, request, sessionId);
-                    }
-                }
-            }
-        }
-    }
-
-    summary.today.models = finalizeSpendModels(todayModels);
-    if (includeHistory) {
-        if (summary.week) {
-            summary.week.models = finalizeSpendModels(weekModels);
-        }
-        if (summary.month) {
-            summary.month.models = finalizeSpendModels(monthModels);
-        }
-    }
+    const summary = computeSpendSummaryFromChatSessionDirs(mode, findAllChatSessionDirs(refresh), { cacheFilePath });
 
     const cacheEntry = { summary, expiresAt: Date.now() + SPEND_SCAN_CACHE_MS };
-    if (includeHistory) {
+    if (mode === 'full') {
         fullSpendSummaryCache = cacheEntry;
         todaySpendSummaryCache = {
             summary: {
@@ -692,9 +412,10 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false): SpendSummary
 const titleCache = new Map<string, TitleEntry>();
 const sessionCandidateById = new Map<string, SessionCandidate>();
 let debugLogDirsCache: { expiresAt: number; dirs: string[] } | undefined;
-let chatSessionDirsCache: { expiresAt: number; dirs: string[] } | undefined;
+let chatSessionDirsCache: { expiresAt: number; dirs: ChatSessionDirEntry[] } | undefined;
 let todaySpendSummaryCache: { expiresAt: number; summary: SpendSummary } | undefined;
 let fullSpendSummaryCache: { expiresAt: number; summary: SpendSummary } | undefined;
+const workspaceLabelCache = new Map<string, string>();
 
 function rememberSessionCandidate(candidate: SessionCandidate): void {
     const existing = sessionCandidateById.get(candidate.id);
@@ -736,8 +457,14 @@ function extractCustomTitle(content: string): string | undefined {
             if (obj.kind === 1 && typeof obj.v === 'string' && obj.v.trim()) {
                 return obj.v.trim();
             }
+            if (obj.kind === 0 && typeof obj.v?.customTitle === 'string' && obj.v.customTitle.trim()) {
+                return obj.v.customTitle.trim();
+            }
         } catch {
-            // The line may be partial if it started before the window we read.
+            const title = extractJsonStringProperty(content, 'customTitle', idx);
+            if (title) {
+                return title;
+            }
         }
         searchFrom = idx - 1;
     }
@@ -751,6 +478,22 @@ function readChatSessionTitle(filePath: string): string | undefined {
 
     const head = readFileWindow(filePath, TITLE_DEBUG_HEAD_BYTES);
     return head ? extractCustomTitle(head) : undefined;
+}
+
+function extractJsonStringProperty(content: string, propertyName: string, startIndex: number): string | undefined {
+    const afterIndex = content.slice(startIndex);
+    const escapedName = propertyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = afterIndex.match(new RegExp(`"${escapedName}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`));
+    if (!match) {
+        return undefined;
+    }
+
+    try {
+        const value = JSON.parse(match[1]);
+        return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 function readDebugLogTitle(filePath: string): TitleEntry | undefined {
@@ -953,6 +696,10 @@ function parseSessionCandidate(candidate: SessionCandidate) {
 type TreeItemData =
     | { kind: 'spendSummary'; summary: SpendSummary }
     | { kind: 'spendBucket'; bucket: SpendBucket }
+    | { kind: 'spendWorkspaceSummary'; workspaces: SpendWorkspaceBucket[] | undefined }
+    | { kind: 'spendWorkspaceBucket'; bucket: SpendWorkspaceBucket }
+    | { kind: 'spendWorkspaceEmpty' }
+    | { kind: 'spendModelSummary'; models: SpendModelBucket[] | undefined }
     | { kind: 'spendModelBucket'; bucket: SpendModelBucket }
     | { kind: 'spendModelEmpty' }
     | { kind: 'spendLastRefresh'; timestamp: number }
@@ -1051,6 +798,17 @@ function extractCommandName(displayLabel: string): string | undefined {
     return exe;
 }
 
+function formatMessageCostMeter(nanoAiu: number): string {
+    const aic = nanoAiu / NANO_AIU_PER_AIC;
+    if (aic >= 2000) {
+        const filledStars = Math.min(5, Math.floor((aic - 2000) / 500) + 1);
+        return '★'.repeat(filledStars) + '☆'.repeat(5 - filledStars);
+    }
+
+    const filledSquares = aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
+    return '■'.repeat(filledSquares) + '□'.repeat(5 - filledSquares);
+}
+
 class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private _onDidChangeTreeData = new vscode.EventEmitter<TreeItemData | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -1082,6 +840,14 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         this.requestFullSpendSummary = loader;
     }
 
+    requestSpendHistory(): void {
+        this.spendHistoryRequested = true;
+        if ((!this.spendSummary?.week || !this.spendSummary?.month) && this.spendRefreshMode !== 'full') {
+            this.requestFullSpendSummary?.();
+        }
+        this._onDidChangeTreeData.fire();
+    }
+
     hasSpendHistoryBeenRequested(): boolean {
         return this.spendHistoryRequested;
     }
@@ -1104,14 +870,14 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     ? 'refreshing...'
                     : `today ${formatAic(s.today.nanoAiu)} AIC | ${formatUsdEstimate(s.today.nanoAiu)}`;
                 item.iconPath = new vscode.ThemeIcon('graph-line');
-                item.tooltip = `Estimated from chat-session credit rows only.\nCollapsed view computes today's spend only. Expand to compute 7-day and 30-day spend.`;
+                item.tooltip = `Estimated from chat-session request usage and credit rows.\nCollapsed view computes today's spend only. Expand to compute 7-day and 30-day spend.`;
                 return item;
             }
             case 'spendBucket': {
                 const b = element.bucket;
                 const item = new vscode.TreeItem(
                     b.label,
-                    b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                    b.workspaces || b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
                 );
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
@@ -1122,8 +888,48 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     formatUsdEstimate(b.nanoAiu),
                     `Input tokens: ${formatNumber(b.inputTokens)}`,
                     `Output tokens: ${formatNumber(b.outputTokens)}`,
-                    `${b.requestCount} billed messages across ${b.sessionCount} sessions.`,
+                    `${b.requestCount} parsed requests across ${b.sessionCount} sessions.`,
                 ].join('\n');
+                return item;
+            }
+            case 'spendWorkspaceSummary': {
+                const count = element.workspaces?.length ?? 0;
+                const item = new vscode.TreeItem(
+                    'Workspace Summary',
+                    element.workspaces ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                );
+                item.description = `${count} ${count === 1 ? 'workspace' : 'workspaces'}`;
+                item.iconPath = new vscode.ThemeIcon('root-folder');
+                return item;
+            }
+            case 'spendWorkspaceBucket': {
+                const b = element.bucket;
+                const item = new vscode.TreeItem(b.label, vscode.TreeItemCollapsibleState.None);
+                item.description = `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | ${b.requestCount} req`;
+                item.iconPath = new vscode.ThemeIcon('root-folder');
+                item.tooltip = [
+                    `${formatAic(b.nanoAiu)} AIC`,
+                    formatUsdEstimate(b.nanoAiu),
+                    `Input tokens: ${formatNumber(b.inputTokens)}`,
+                    `Output tokens: ${formatNumber(b.outputTokens)}`,
+                    `${b.requestCount} parsed requests across ${b.sessionCount} sessions.`,
+                ].join('\n');
+                return item;
+            }
+            case 'spendWorkspaceEmpty': {
+                const item = new vscode.TreeItem('No workspace usage', vscode.TreeItemCollapsibleState.None);
+                item.description = 'none found';
+                item.iconPath = new vscode.ThemeIcon('circle-slash');
+                return item;
+            }
+            case 'spendModelSummary': {
+                const count = element.models?.length ?? 0;
+                const item = new vscode.TreeItem(
+                    'Models',
+                    element.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+                );
+                item.description = `${count} ${count === 1 ? 'model' : 'models'}`;
+                item.iconPath = new vscode.ThemeIcon('symbol-method');
                 return item;
             }
             case 'spendModelBucket': {
@@ -1136,19 +942,19 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     formatUsdEstimate(b.nanoAiu),
                     `Input tokens: ${formatNumber(b.inputTokens)}`,
                     `Output tokens: ${formatNumber(b.outputTokens)}`,
-                    `${b.requestCount} billed requests across ${b.sessionCount} sessions.`,
+                    `${b.requestCount} parsed requests across ${b.sessionCount} sessions.`,
                 ].join('\n');
                 return item;
             }
             case 'spendModelEmpty': {
-                const item = new vscode.TreeItem('No billed models', vscode.TreeItemCollapsibleState.None);
+                const item = new vscode.TreeItem('No model usage', vscode.TreeItemCollapsibleState.None);
                 item.description = 'none found';
                 item.iconPath = new vscode.ThemeIcon('circle-slash');
                 return item;
             }
             case 'spendLastRefresh': {
                 const item = new vscode.TreeItem('Last refreshed', vscode.TreeItemCollapsibleState.None);
-                item.description = new Date(element.timestamp).toLocaleString();
+                item.description = formatLocalDateTime(element.timestamp);
                 item.iconPath = new vscode.ThemeIcon('clock');
                 return item;
             }
@@ -1185,11 +991,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const mergedNote = m.mergedMessages.length > 0
                     ? ` (+${m.mergedMessages.length})`
                     : '';
-                const aic = parseFloat(formatAic(m.totalNanoAiu));
-                const filled = aic >= 2000 ? 5 : aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
-                const meter = aic >= 2000
-                    ? '✦✦✦✦✦'
-                    : '■'.repeat(filled) + '□'.repeat(5 - filled);
+                const meter = formatMessageCostMeter(m.totalNanoAiu);
                 // Fixed-width label: pad/truncate to 28 chars so descriptions align
                 const rawPreview = (m.content || '(empty)') + mergedNote;
                 const label = rawPreview.length > 28 ? rawPreview.slice(0, 27) + '…' : rawPreview.padEnd(28);
@@ -1287,6 +1089,18 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 if (c.resultCount !== undefined) {
                     descriptionParts.push(`${formatNumber(c.resultCount)} result${c.resultCount === 1 ? '' : 's'}`);
                 }
+                if (c.isSubagent) {
+                    item.iconPath = new vscode.ThemeIcon('rocket');
+                    if (c.subagentInProgress) {
+                        descriptionParts.push('in progress');
+                    }
+                    if (c.subagentSummary) {
+                        descriptionParts.push(`${formatAic(c.subagentSummary.totalNanoAiu)} AIC`);
+                        descriptionParts.push(`${c.subagentSummary.modelTurnCount} turns`);
+                    }
+                } else {
+                    item.iconPath = new vscode.ThemeIcon('wrench');
+                }
                 item.description = descriptionParts.join(' | ');
                 item.tooltip = [
                     `Tool: ${c.name}`,
@@ -1294,17 +1108,9 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     c.source ? `Source: ${c.source}` : undefined,
                     c.resultCount !== undefined ? `Results: ${formatNumber(c.resultCount)}` : undefined,
                     c.toolCallId ? `Call ID: ${c.toolCallId}` : undefined,
+                    c.subagentInProgress ? 'Subagent: in progress' : undefined,
                     `Label: ${c.displayLabel}`,
                 ].filter(Boolean).join('\n');
-                if (c.isSubagent) {
-                    item.iconPath = new vscode.ThemeIcon('rocket');
-                    if (c.subagentSummary) {
-                        const subagentDescription = `${formatAic(c.subagentSummary.totalNanoAiu)} AIC | ${c.subagentSummary.modelTurnCount} turns`;
-                        item.description = item.description ? `${item.description} | ${subagentDescription}` : subagentDescription;
-                    }
-                } else {
-                    item.iconPath = new vscode.ThemeIcon('wrench');
-                }
                 return item;
             }
             case 'subagentTurn': {
@@ -1333,7 +1139,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const info = element.info;
                 const item = new vscode.TreeItem(info.content, vscode.TreeItemCollapsibleState.None);
                 item.iconPath = new vscode.ThemeIcon('arrow-right');
-                item.tooltip = `SpanId: ${info.spanId}\nTimestamp: ${new Date(info.timestamp).toLocaleTimeString()}`;
+                item.tooltip = `SpanId: ${info.spanId}\nTimestamp: ${formatLocalTime(info.timestamp)}`;
                 return item;
             }
             case 'toolDefinitions': {
@@ -1444,24 +1250,49 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         }
 
         if (element.kind === 'spendSummary') {
-            this.spendHistoryRequested = true;
-            if (!element.summary.week || !element.summary.month) {
-                if (this.spendRefreshMode !== 'full') {
-                    this.requestFullSpendSummary?.();
-                }
-                return [{ kind: 'spendLoading' }];
+            const children: TreeItemData[] = [
+                { kind: 'spendBucket', bucket: element.summary.today },
+            ];
+
+            if (element.summary.week && element.summary.month) {
+                children.push(
+                    { kind: 'spendBucket', bucket: element.summary.week },
+                    { kind: 'spendBucket', bucket: element.summary.month }
+                );
+            } else if (this.spendHistoryRequested) {
+                children.push({ kind: 'spendLoading' });
             }
 
-            return [
-                { kind: 'spendBucket', bucket: element.summary.today },
-                { kind: 'spendBucket', bucket: element.summary.week },
-                { kind: 'spendBucket', bucket: element.summary.month },
-                { kind: 'spendLastRefresh', timestamp: element.summary.generatedAt },
-            ];
+            children.push({ kind: 'spendLastRefresh', timestamp: element.summary.generatedAt });
+            return children;
         }
 
         if (element.kind === 'spendBucket') {
-            const models = element.bucket.models;
+            const children: TreeItemData[] = [];
+            if (element.bucket.workspaces) {
+                children.push({ kind: 'spendWorkspaceSummary', workspaces: element.bucket.workspaces });
+            }
+            if (element.bucket.models) {
+                children.push({ kind: 'spendModelSummary', models: element.bucket.models });
+            }
+            return children;
+        }
+
+        if (element.kind === 'spendWorkspaceSummary') {
+            const workspaces = element.workspaces;
+            if (!workspaces) {
+                return [];
+            }
+            return workspaces.length > 0
+                ? workspaces.map(bucket => ({
+                    kind: 'spendWorkspaceBucket' as const,
+                    bucket,
+                }))
+                : [{ kind: 'spendWorkspaceEmpty' as const }];
+        }
+
+        if (element.kind === 'spendModelSummary') {
+            const models = element.models;
             if (!models) {
                 return [];
             }
@@ -1562,6 +1393,9 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 if (c.subagentSummary) {
                     const s = c.subagentSummary;
                     const children: TreeItemData[] = [
+                        ...(c.subagentInProgress
+                            ? [{ kind: 'stat' as const, label: 'Subagent Status', value: 'in progress' }]
+                            : []),
                         { kind: 'stat', label: 'Subagent Cost', value: `${formatAic(s.totalNanoAiu)} AIC` },
                         { kind: 'stat', label: 'Subagent Tokens', value: `in:${formatNumber(s.totalInputTokens)} out:${formatNumber(s.totalOutputTokens)}` },
                     ];
@@ -1694,8 +1528,7 @@ function createSessionPickItems(
 ): SessionPickItem[] {
     const items: SessionPickItem[] = sessions.map(session => {
         const title = resolveSessionTitle(session.id, session);
-        const date = new Date(session.modifiedTime);
-        const timeStr = date.toLocaleString();
+        const timeStr = formatLocalDateTime(session.modifiedTime);
         const isCurrent = session.id === currentWsSessionId;
         const currentTag = isCurrent ? ' (current session)' : '';
         return {
@@ -1722,12 +1555,21 @@ function createSessionPickItems(
 
 export function activate(context: vscode.ExtensionContext) {
     const treeProvider = new UsageTreeProvider();
+    const spendFileCachePath = getSpendFileCachePath(context.globalStorageUri?.fsPath);
     treeProvider.setDebugLogsEnabled(isDebugLogsSettingEnabled());
 
-    vscode.window.createTreeView('copilotUsageTree', {
+    const treeView = vscode.window.createTreeView('copilotUsageTree', {
         treeDataProvider: treeProvider,
         showCollapseAll: true,
     });
+    context.subscriptions.push(
+        treeView,
+        treeView.onDidExpandElement(event => {
+            if (event.element.kind === 'spendSummary') {
+                treeProvider.requestSpendHistory();
+            }
+        })
+    );
 
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration(DEBUG_LOGS_SETTING)) {
@@ -1751,7 +1593,7 @@ export function activate(context: vscode.ExtensionContext) {
         spendRefreshTimer = setTimeout(() => {
             spendRefreshTimer = undefined;
             try {
-                treeProvider.setSpendSummary(computeSpendSummary(mode, refresh));
+                treeProvider.setSpendSummary(computeSpendSummary(mode, refresh, spendFileCachePath));
             } catch (err) {
                 console.warn('Copilot Usage: failed to compute spend summary', err);
             }
@@ -1833,7 +1675,6 @@ export function activate(context: vscode.ExtensionContext) {
                         applyResolvedTitle(parsed.summary, currentSessionCandidate);
                         treeProvider.setSummary(parsed.summary);
                         setCurrentGraph(parsed.summary);
-                        scheduleSpendSummaryRefresh('today', true, 1000);
                     }
                 }
             }, 500);
@@ -1855,7 +1696,6 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('copilotUsageTracker.analyzeSession', () => {
             autoLoad();
             watchCurrentSession();
-            scheduleVisibleSpendSummaryRefresh(true);
             vscode.window.showInformationMessage('Copilot Usage: Loaded most recent session.');
         })
     );
@@ -1954,7 +1794,6 @@ export function activate(context: vscode.ExtensionContext) {
                         currentSessionCandidate = picked.session;
                         currentSessionFile = parsed.sourceFile;
                         watchCurrentSession();
-                        scheduleVisibleSpendSummaryRefresh(true);
                         const titleDisplay = parsed.summary.title || parsed.summary.sessionId.slice(0, 8) + '...';
                         vscode.window.showInformationMessage(
                             `Loaded "${titleDisplay}" | ${formatAic(parsed.summary.totalNanoAiu)} AIC | ${formatNumber(parsed.summary.totalTokens)} tokens`
