@@ -7,6 +7,8 @@ import {
     MergedMessageInfo,
     UserMessageSummary,
     SessionSummary,
+    DebugSourceRef,
+    FailureInfo,
     ToolDefinitionSize,
     findSiblingChatSessionLog,
     NANO_AIU_PER_AIC,
@@ -961,7 +963,7 @@ type TreeItemData =
     | { kind: 'userMessage'; message: UserMessageSummary; index: number }
     | { kind: 'turnsGroup'; message: UserMessageSummary; msgIndex: number }
     | { kind: 'modelTurn'; turn: ModelTurnSummary; msgIndex: number; turnIndex: number }
-    | { kind: 'turnToolCall'; call: ToolCallSummary }
+    | { kind: 'turnToolCall'; call: ToolCallSummary; turn: ModelTurnSummary }
     | { kind: 'subagentTurn'; turn: ModelTurnSummary; turnIndex: number }
     | { kind: 'mergedInfo'; message: UserMessageSummary; msgIndex: number }
     | { kind: 'mergedItem'; info: MergedMessageInfo }
@@ -1049,6 +1051,186 @@ function extractCommandName(displayLabel: string): string | undefined {
     // Skip remaining inline expressions that aren't real commands
     if (exe.startsWith('$') || exe.startsWith('(') || exe.startsWith('{') || exe === '') { return undefined; }
     return exe;
+}
+
+interface UsageRevealTarget {
+    sessionId: string;
+    sourceFile?: string;
+    sourceLine?: number;
+    timestamp: number;
+    kind: TreeItemData['kind'];
+    spanId?: string;
+    parentSpanId?: string;
+    responseId?: string;
+    toolCallId?: string;
+    messageIndex?: number;
+    turnIndex?: number;
+    label?: string;
+}
+
+function targetFromDebugRef(kind: TreeItemData['kind'], debugRef: DebugSourceRef | undefined, extra?: Partial<UsageRevealTarget>): UsageRevealTarget | undefined {
+    if (!debugRef) { return undefined; }
+    return {
+        sessionId: debugRef.sessionId,
+        sourceFile: debugRef.sourceFile,
+        sourceLine: debugRef.sourceLine,
+        timestamp: debugRef.timestamp,
+        kind,
+        spanId: debugRef.spanId,
+        parentSpanId: debugRef.parentSpanId,
+        responseId: debugRef.responseId,
+        toolCallId: debugRef.toolCallId,
+        ...extra,
+    };
+}
+
+function makeRevealTarget(element: TreeItemData): UsageRevealTarget | undefined {
+    switch (element.kind) {
+        case 'userMessage':
+            return targetFromDebugRef('userMessage', element.message.debugRef, {
+                messageIndex: element.index,
+                label: element.message.content,
+            });
+        case 'modelTurn':
+            return targetFromDebugRef('modelTurn', element.turn.debugRef, {
+                messageIndex: element.msgIndex,
+                turnIndex: element.turnIndex,
+                label: element.turn.debugName,
+            });
+        case 'turnToolCall':
+            return targetFromDebugRef('turnToolCall', element.call.debugRef, {
+                toolCallId: element.call.toolCallId,
+                label: element.call.displayLabel,
+            });
+        case 'mergedItem':
+            return targetFromDebugRef('mergedItem', element.info.debugRef, {
+                label: element.info.content,
+            });
+        default:
+            return undefined;
+    }
+}
+
+function attachRevealCommand(item: vscode.TreeItem, element: TreeItemData): void {
+    const target = makeRevealTarget(element);
+    if (!target) { return; }
+    item.command = {
+        command: 'copilotUsageTracker.revealInAgentDebugLogs',
+        title: 'Reveal in Agent Debug Logs',
+        arguments: [target],
+    };
+}
+
+function collectUsedToolIdentifiers(turn: ModelTurnSummary): string[] {
+    const identifiers: string[] = [];
+    const seen = new Set<string>();
+
+    for (const toolCall of turn.toolCalls) {
+        const identifier = toolCall.name.trim();
+        if (!identifier || seen.has(identifier)) {
+            continue;
+        }
+
+        seen.add(identifier);
+        identifiers.push(identifier);
+    }
+
+    return identifiers;
+}
+
+function formatUsedToolsJsonFragment(toolIdentifiers: string[]): string {
+    if (toolIdentifiers.length === 0) {
+        return '"tools": []';
+    }
+
+    const lines = toolIdentifiers.map(identifier => `  ${JSON.stringify(identifier)},`);
+    return `"tools": [\n${lines.join('\n')}\n],`;
+}
+
+async function copyUsedToolsFromTurn(turn: ModelTurnSummary): Promise<void> {
+    const toolIdentifiers = collectUsedToolIdentifiers(turn);
+    if (toolIdentifiers.length === 0) {
+        vscode.window.showInformationMessage('Copilot Usage: no used tools were found for this turn.');
+        return;
+    }
+
+    await vscode.env.clipboard.writeText(formatUsedToolsJsonFragment(toolIdentifiers));
+    vscode.window.setStatusBarMessage(`Copilot Usage: copied ${toolIdentifiers.length} used tools to clipboard`, 4000);
+}
+
+function parseLineTimestamp(raw: any): number | undefined {
+    const candidates = [raw?.ts, raw?.timestamp, raw?.time, raw?.attrs?.ts, raw?.attrs?.timestamp];
+    for (const value of candidates) {
+        if (typeof value === 'number' && Number.isFinite(value)) { return value; }
+        if (typeof value === 'string') {
+            const numeric = Number(value);
+            if (Number.isFinite(numeric)) { return numeric; }
+            const parsed = Date.parse(value);
+            if (Number.isFinite(parsed)) { return parsed; }
+        }
+    }
+    return undefined;
+}
+
+function lineMatchesRevealTarget(raw: any, target: UsageRevealTarget): boolean {
+    const attrs = raw?.attrs || {};
+    if (target.toolCallId) {
+        if (raw?.toolCallId === target.toolCallId || attrs.toolCallId === target.toolCallId) { return true; }
+        if (Array.isArray(raw?.toolCalls) && raw.toolCalls.some((tc: any) => tc?.toolCallId === target.toolCallId || tc?.id === target.toolCallId)) { return true; }
+        if (Array.isArray(raw?.tools) && raw.tools.some((tc: any) => tc?.toolCallId === target.toolCallId || tc?.id === target.toolCallId)) { return true; }
+    }
+    if (target.responseId && (raw?.responseId === target.responseId || attrs.responseId === target.responseId)) { return true; }
+    if (target.spanId && (raw?.spanId === target.spanId || raw?.spanID === target.spanId || raw?.id === target.spanId || attrs.spanId === target.spanId)) { return true; }
+    if (target.parentSpanId && (raw?.parentSpanId === target.parentSpanId || raw?.parentSpanID === target.parentSpanId || attrs.parentSpanId === target.parentSpanId)) { return true; }
+    return false;
+}
+
+function findBestLineInJsonl(filePath: string, target: UsageRevealTarget): number | undefined {
+    if (target.sourceLine && target.sourceLine > 0) {
+        return target.sourceLine;
+    }
+    if (!fs.existsSync(filePath)) { return undefined; }
+
+    const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
+    let bestTimestampLine: number | undefined;
+    let bestTimestampDelta = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) { continue; }
+        let raw: any;
+        try { raw = JSON.parse(line); } catch { continue; }
+        if (lineMatchesRevealTarget(raw, target)) { return i + 1; }
+        const ts = parseLineTimestamp(raw);
+        if (ts !== undefined && Number.isFinite(target.timestamp)) {
+            const delta = Math.abs(ts - target.timestamp);
+            if (delta < bestTimestampDelta) {
+                bestTimestampDelta = delta;
+                bestTimestampLine = i + 1;
+            }
+        }
+    }
+    return bestTimestampDelta <= 10_000 ? bestTimestampLine : undefined;
+}
+
+async function openSourceAtLine(filePath: string, lineNumber: number | undefined, target: UsageRevealTarget): Promise<void> {
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+    const editor = await vscode.window.showTextDocument(doc, { preview: false });
+    const zeroBasedLine = Math.max(0, (lineNumber || 1) - 1);
+    const range = new vscode.Range(zeroBasedLine, 0, zeroBasedLine, 0);
+    editor.selection = new vscode.Selection(range.start, range.start);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+    const label = target.label ? `: ${target.label}` : '';
+    vscode.window.setStatusBarMessage(`Copilot Usage: revealed debug log line ${zeroBasedLine + 1}${label}`, 5000);
+}
+
+async function revealInAgentDebugLogs(target: UsageRevealTarget): Promise<void> {
+    if (!target.sourceFile || !fs.existsSync(target.sourceFile)) {
+        vscode.window.showWarningMessage('Copilot Usage: no source debug log file found for this Usage item.');
+        return;
+    }
+    const line = findBestLineInJsonl(target.sourceFile, target);
+    await openSourceAtLine(target.sourceFile, line, target);
 }
 
 class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
@@ -1198,7 +1380,13 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     vscode.TreeItemCollapsibleState.Collapsed
                 );
                 item.description = `${formatAic(m.totalNanoAiu)} AIC  ${m.modelTurns.length} turns  ${meter}`;
-                item.iconPath = new vscode.ThemeIcon('comment');
+                if (m.failure?.isFailure) {
+                    item.description = `FAILED | ${item.description}`;
+                    item.iconPath = new vscode.ThemeIcon('error');
+                    item.contextValue = 'failedUserMessage';
+                } else {
+                    item.iconPath = new vscode.ThemeIcon('comment');
+                }
                 item.tooltip = [
                     `User Message ${element.index + 1}`,
                     `"${m.content}"`,
@@ -1213,6 +1401,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `Tool Calls: ${m.toolCalls.length}`,
                     `LLM Time: ${formatDuration(m.totalDurationMs)}`,
                 ].filter(Boolean).join('\n');
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'turnsGroup': {
@@ -1251,7 +1440,13 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     vscode.TreeItemCollapsibleState.Collapsed
                 );
                 item.description = `${formatAic(t.nanoAiu)} AIC | in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)}${cacheNote}`;
-                item.iconPath = turnIcon;
+                if (t.failure?.isFailure) {
+                    item.description = `FAILED | ${item.description}`;
+                    item.iconPath = new vscode.ThemeIcon('error');
+                    item.contextValue = 'failedModelTurn';
+                } else {
+                    item.iconPath = turnIcon;
+                }
                 item.tooltip = [
                     `Model: ${t.model}`,
                     `Request: ${t.debugName}`,
@@ -1265,6 +1460,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `Tool Calls: ${t.toolCalls.length}`,
                     t.toolCalls.length > 0 ? `  ${t.toolCalls.map(tc => tc.name).join(', ')}` : '',
                 ].filter(Boolean).join('\n');
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'turnToolCall': {
@@ -1290,13 +1486,19 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 item.description = descriptionParts.join(' | ');
                 item.tooltip = [
                     `Tool: ${c.name}`,
+                    c.failure?.isFailure ? `Failure: ${c.failure.reason || c.failure.normalizedKey || 'failed tool call'}` : undefined,
+                    c.status ? `Status: ${c.status}` : undefined,
                     c.toolKind ? `Kind: ${c.toolKind}` : undefined,
                     c.source ? `Source: ${c.source}` : undefined,
                     c.resultCount !== undefined ? `Results: ${formatNumber(c.resultCount)}` : undefined,
                     c.toolCallId ? `Call ID: ${c.toolCallId}` : undefined,
                     `Label: ${c.displayLabel}`,
                 ].filter(Boolean).join('\n');
-                if (c.isSubagent) {
+                if (c.failure?.isFailure) {
+                    item.iconPath = new vscode.ThemeIcon('error');
+                    item.description = item.description ? `FAILED | ${item.description}` : 'FAILED';
+                    item.contextValue = 'failedToolCall';
+                } else if (c.isSubagent) {
                     item.iconPath = new vscode.ThemeIcon('rocket');
                     if (c.subagentSummary) {
                         const subagentDescription = `${formatAic(c.subagentSummary.totalNanoAiu)} AIC | ${c.subagentSummary.modelTurnCount} turns`;
@@ -1305,6 +1507,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 } else {
                     item.iconPath = new vscode.ThemeIcon('wrench');
                 }
+                item.contextValue = c.failure?.isFailure ? 'turnToolCall failedToolCall' : 'turnToolCall';
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'subagentTurn': {
@@ -1334,6 +1538,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const item = new vscode.TreeItem(info.content, vscode.TreeItemCollapsibleState.None);
                 item.iconPath = new vscode.ThemeIcon('arrow-right');
                 item.tooltip = `SpanId: ${info.spanId}\nTimestamp: ${new Date(info.timestamp).toLocaleTimeString()}`;
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'toolDefinitions': {
@@ -1552,7 +1757,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 ];
                 // Tool calls for this turn
                 for (const tc of t.toolCalls) {
-                    children.push({ kind: 'turnToolCall', call: tc });
+                    children.push({ kind: 'turnToolCall', call: tc, turn: t });
                 }
                 return children;
             }
@@ -1852,6 +2057,9 @@ export function activate(context: vscode.ExtensionContext) {
     }, resolveSessionTitle);
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('copilotUsageTracker.revealInAgentDebugLogs', async (target: UsageRevealTarget) => {
+            await revealInAgentDebugLogs(target);
+        }),
         vscode.commands.registerCommand('copilotUsageTracker.analyzeSession', () => {
             autoLoad();
             watchCurrentSession();
