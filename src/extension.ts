@@ -20,6 +20,8 @@ import {
     formatDuration,
     estimateTokens,
     formatUsedToolsFragment,
+    normalizeToolAliasKey,
+    ToolAliasResolver,
 } from './parser';
 import { setCurrentGraph, registerChatParticipant } from './participant';
 import {
@@ -71,11 +73,13 @@ function pathExists(candidate: string | undefined): candidate is string {
     return !!candidate && fs.existsSync(candidate);
 }
 
+// Keep only non-empty values when building path and label lists.
 function pushUnique(items: string[], value: string | undefined): void {
     if (!value || items.includes(value)) { return; }
     items.push(value);
 }
 
+// Convert nanoAiu into a compact USD estimate for display.
 function formatUsdEstimate(nanoAiu: number): string {
     if (nanoAiu <= 0) {
         return '$0.00 USD est.';
@@ -86,18 +90,22 @@ function formatUsdEstimate(nanoAiu: number): string {
     return `$${usd < 1 ? usd.toFixed(4) : usd.toFixed(2)} USD est.`;
 }
 
+// Format timestamps for local date display in the UI.
 function formatLocalDateTime(timestamp: number): string {
     return new Date(timestamp).toLocaleString(vscode.env.language || undefined);
 }
 
+// Format timestamps for local time display in the UI.
 function formatLocalTime(timestamp: number): string {
     return new Date(timestamp).toLocaleTimeString(vscode.env.language || undefined);
 }
 
+// Read the setting that controls whether agent debug logs are persisted.
 function isDebugLogsSettingEnabled(): boolean {
     return vscode.workspace.getConfiguration().get<boolean>(DEBUG_LOGS_SETTING) === true;
 }
 
+// Discover known workspace storage roots across supported editors and platforms.
 function getWorkspaceStorageRoots(): string[] {
     const roots: string[] = [];
     const appDataPath = process.env.APPDATA;
@@ -129,6 +137,7 @@ function getWorkspaceStorageRoots(): string[] {
     return roots.filter(pathExists);
 }
 
+// Read extra search roots from user configuration.
 function getConfiguredSearchRoots(): string[] {
     return vscode.workspace
         .getConfiguration('copilotUsageTracker')
@@ -136,6 +145,7 @@ function getConfiguredSearchRoots(): string[] {
         .filter(pathExists);
 }
 
+// Recursively find debug-log directories under a search root.
 function collectDebugLogDirs(root: string, maxDepth: number, results: Set<string>): void {
     if (maxDepth < 0 || !fs.existsSync(root)) { return; }
 
@@ -167,6 +177,7 @@ function collectDebugLogDirs(root: string, maxDepth: number, results: Set<string
     }
 }
 
+// Recursively find chat session directories under a search root.
 function collectChatSessionDirs(root: string, maxDepth: number, results: Set<string>): void {
     if (maxDepth < 0 || !fs.existsSync(root)) { return; }
 
@@ -194,6 +205,7 @@ function collectChatSessionDirs(root: string, maxDepth: number, results: Set<str
     }
 }
 
+// Derive a readable label from a file or folder path.
 function labelFromPath(filePath: string | undefined): string | undefined {
     if (!filePath) { return undefined; }
 
@@ -208,6 +220,7 @@ function labelFromPath(filePath: string | undefined): string | undefined {
         : base;
 }
 
+// Normalize URI strings into filesystem paths when possible.
 function fsPathFromUriString(value: string | undefined): string | undefined {
     if (!value) { return undefined; }
 
@@ -224,6 +237,206 @@ function fsPathFromUriString(value: string | undefined): string | undefined {
     }
 
     return value;
+}
+
+// Return the first non-empty string from a list of candidate values.
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim();
+        }
+    }
+    return undefined;
+}
+
+// Locate the user profile agents directory from VS Code prompts storage.
+function getUserAgentsDir(): string | undefined {
+    const promptsDir = process.env.VSCODE_USER_PROMPTS_FOLDER;
+    if (!promptsDir) {
+        return undefined;
+    }
+
+    return path.join(path.dirname(promptsDir), 'agents');
+}
+
+// Extract tool aliases from an .agent.md file's frontmatter tools list.
+function readAgentToolReferences(agentFilePath: string): string[] {
+    try {
+        const text = fs.readFileSync(agentFilePath, 'utf-8');
+        const frontmatterStart = text.indexOf('---');
+        if (frontmatterStart !== 0) {
+            return [];
+        }
+
+        const frontmatterEnd = text.indexOf('\n---', 3);
+        const frontmatter = frontmatterEnd >= 0 ? text.slice(3, frontmatterEnd) : text.slice(3);
+        const references: string[] = [];
+        const lines = frontmatter.split(/\r?\n/);
+        let inToolsBlock = false;
+        let toolsIndent = 0;
+
+        for (const line of lines) {
+            const toolsMatch = line.match(/^(\s*)tools:\s*(.*)$/);
+            if (toolsMatch) {
+                inToolsBlock = true;
+                toolsIndent = toolsMatch[1].length;
+                const inline = toolsMatch[2].trim();
+                if (inline.startsWith('[') && inline.endsWith(']')) {
+                    for (const entry of inline.slice(1, -1).split(',')) {
+                        const value = entry.trim().replace(/^['"]|['"]$/g, '');
+                        if (value) {
+                            references.push(value);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (!inToolsBlock) {
+                continue;
+            }
+
+            const listMatch = line.match(/^(\s*)-\s*([^#]+?)\s*$/);
+            if (listMatch && listMatch[1].length > toolsIndent) {
+                const value = listMatch[2].trim().replace(/^['"]|['"]$/g, '');
+                if (value) {
+                    references.push(value);
+                }
+                continue;
+            }
+
+            if (line.trim() && !line.startsWith(' '.repeat(toolsIndent + 1))) {
+                inToolsBlock = false;
+            }
+        }
+
+        return references;
+    } catch {
+        return [];
+    }
+}
+
+// Collect all .agent.md files under a directory tree.
+function collectAgentFiles(rootDir: string | undefined, results: string[] = []): string[] {
+    if (!rootDir || !fs.existsSync(rootDir)) {
+        return results;
+    }
+
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(rootDir, { withFileTypes: true });
+    } catch {
+        return results;
+    }
+
+    for (const entry of entries) {
+        const entryPath = path.join(rootDir, entry.name);
+        if (entry.isDirectory()) {
+            collectAgentFiles(entryPath, results);
+            continue;
+        }
+        if (entry.isFile() && entry.name.endsWith('.agent.md')) {
+            results.push(entryPath);
+        }
+    }
+
+    return results;
+}
+
+// Read the toolset reference name from a toolset-like object.
+function getToolSetReferenceName(toolSet: any): string | undefined {
+    return firstNonEmptyString(toolSet?.referenceName, toolSet?.toolSetReferenceName, toolSet?.name);
+}
+
+// Read the tool reference name from a tool-like object.
+function getToolReferenceName(tool: any): string | undefined {
+    return firstNonEmptyString(tool?.toolReferenceName, tool?.referenceName, tool?.name);
+}
+
+// Store a canonical alias lookup for both raw and normalized keys.
+function registerAlias(map: Map<string, string>, alias: string | undefined, canonical: string | undefined): void {
+    if (!alias || !canonical) {
+        return;
+    }
+
+    const trimmedAlias = alias.trim();
+    const trimmedCanonical = canonical.trim();
+    if (!trimmedAlias || !trimmedCanonical) {
+        return;
+    }
+
+    map.set(trimmedAlias, trimmedCanonical);
+    map.set(normalizeToolAliasKey(trimmedAlias), trimmedCanonical);
+}
+
+// Build a runtime alias resolver from installed tools and agent metadata.
+function buildRuntimeToolAliasResolver(): ToolAliasResolver {
+    const aliases = new Map<string, string>();
+
+    for (const extension of vscode.extensions.all) {
+// Lazily cache the runtime tool alias resolver.
+        const contributes = extension.packageJSON?.contributes;
+        const toolSets = Array.isArray(contributes?.languageModelToolSets) ? contributes.languageModelToolSets : [];
+        const tools = Array.isArray(contributes?.languageModelTools) ? contributes.languageModelTools : [];
+        const toolSetByMember = new Map<string, string>();
+
+        for (const toolSet of toolSets) {
+            const toolSetReferenceName = getToolSetReferenceName(toolSet);
+            const members = Array.isArray(toolSet?.tools) ? toolSet.tools : [];
+
+            for (const member of members) {
+                const memberReferenceName = typeof member === 'string' ? member : getToolReferenceName(member);
+                if (toolSetReferenceName && memberReferenceName) {
+                    toolSetByMember.set(normalizeToolAliasKey(memberReferenceName), toolSetReferenceName);
+                }
+            }
+        }
+
+        for (const tool of tools) {
+            const toolReferenceName = getToolReferenceName(tool);
+            if (!toolReferenceName) {
+                continue;
+            }
+
+            const toolSetReferenceName = toolSetByMember.get(normalizeToolAliasKey(toolReferenceName));
+            const canonicalReference = toolSetReferenceName ? `${toolSetReferenceName}/${toolReferenceName}` : toolReferenceName;
+
+            registerAlias(aliases, tool.id, canonicalReference);
+            registerAlias(aliases, toolReferenceName, canonicalReference);
+
+            for (const legacyName of Array.isArray(tool.legacyToolReferenceFullNames) ? tool.legacyToolReferenceFullNames : []) {
+                registerAlias(aliases, typeof legacyName === 'string' ? legacyName : undefined, canonicalReference);
+            }
+        }
+    }
+
+    for (const workspaceFolder of vscode.workspace.workspaceFolders ?? []) {
+        const workspaceAgentsDir = path.join(workspaceFolder.uri.fsPath, '.github', 'agents');
+        for (const agentFilePath of collectAgentFiles(workspaceAgentsDir)) {
+            for (const reference of readAgentToolReferences(agentFilePath)) {
+                registerAlias(aliases, reference, reference);
+            }
+        }
+    }
+
+    for (const agentFilePath of collectAgentFiles(getUserAgentsDir())) {
+        for (const reference of readAgentToolReferences(agentFilePath)) {
+            registerAlias(aliases, reference, reference);
+        }
+    }
+
+    return {
+        resolve(identifier: string): string | undefined {
+            return aliases.get(identifier) || aliases.get(normalizeToolAliasKey(identifier));
+        },
+    };
+}
+
+let runtimeToolAliasResolver: ToolAliasResolver | undefined;
+
+function getRuntimeToolAliasResolver(): ToolAliasResolver {
+    runtimeToolAliasResolver ??= buildRuntimeToolAliasResolver();
+    return runtimeToolAliasResolver;
 }
 
 function labelFromWorkspaceFolder(folder: any, workspaceFilePath: string): string | undefined {
@@ -249,6 +462,7 @@ function labelFromWorkspaceFolder(folder: any, workspaceFilePath: string): strin
     return undefined;
 }
 
+// Read a .code-workspace file and summarize its visible folder label.
 function readWorkspaceFileLabel(workspaceFilePath: string | undefined): string | undefined {
     if (!workspaceFilePath || !fs.existsSync(workspaceFilePath)) {
         return undefined;
@@ -275,6 +489,7 @@ function readWorkspaceFileLabel(workspaceFilePath: string | undefined): string |
     return undefined;
 }
 
+// Cache and resolve the display label for a workspace storage directory.
 function resolveWorkspaceStorageLabel(workspaceStorageDir: string): string {
     const cached = workspaceLabelCache.get(workspaceStorageDir);
     if (cached) {
@@ -307,6 +522,7 @@ function resolveWorkspaceStorageLabel(workspaceStorageDir: string): string {
     return resolved;
 }
 
+// Build a stable chat-session entry from the on-disk directory layout.
 function chatSessionDirEntry(dir: string): ChatSessionDirEntry {
     const resolvedDir = path.resolve(dir);
     const base = path.basename(resolvedDir);
@@ -335,6 +551,7 @@ function chatSessionDirEntry(dir: string): ChatSessionDirEntry {
     };
 }
 
+// Add a session directory to the deduplicated result set.
 function addChatSessionDir(results: Map<string, ChatSessionDirEntry>, dir: string): void {
     const entry = chatSessionDirEntry(dir);
     if (!results.has(entry.dir)) {
@@ -342,6 +559,7 @@ function addChatSessionDir(results: Map<string, ChatSessionDirEntry>, dir: strin
     }
 }
 
+// Find all known chat session roots, honoring cache and user search roots.
 function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
     if (!refresh && chatSessionDirsCache && chatSessionDirsCache.expiresAt > Date.now()) {
         return chatSessionDirsCache.dirs;
@@ -388,6 +606,7 @@ function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
 
 type SpendScanMode = 'today' | 'full';
 
+// Compute spend totals for either the daily or full history view.
 function computeSpendSummary(mode: SpendScanMode, refresh = false, cacheFilePath?: string): SpendSummary {
     const cache = mode === 'full' ? fullSpendSummaryCache : todaySpendSummaryCache;
     if (!refresh && cache && cache.expiresAt > Date.now()) {
@@ -395,6 +614,7 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false, cacheFilePath
     }
 
     const summary = computeSpendSummaryFromChatSessionDirs(mode, findAllChatSessionDirs(refresh), { cacheFilePath });
+// Keep the newest candidate for each session id.
 
     const cacheEntry = { summary, expiresAt: Date.now() + SPEND_SCAN_CACHE_MS };
     if (mode === 'full') {
@@ -428,10 +648,12 @@ function rememberSessionCandidate(candidate: SessionCandidate): void {
     }
 }
 
+// Clear cached session titles after a refresh or data change.
 function invalidateTitleCache(): void {
     titleCache.clear();
 }
 
+// Read a window from the start or end of a file without loading it entirely.
 function readFileWindow(filePath: string, maxBytes: number, fromEnd = false): string | undefined {
     try {
         const stat = fs.statSync(filePath);
@@ -447,6 +669,7 @@ function readFileWindow(filePath: string, maxBytes: number, fromEnd = false): st
     }
 }
 
+// Pull a manually generated custom title from raw chat session JSONL.
 function extractCustomTitle(content: string): string | undefined {
     let searchFrom = content.length;
     while (searchFrom > 0) {
@@ -475,6 +698,7 @@ function extractCustomTitle(content: string): string | undefined {
     return undefined;
 }
 
+// Prefer the title stored in chatSessions metadata, then fall back to debug logs.
 function readChatSessionTitle(filePath: string): string | undefined {
     const tail = readFileWindow(filePath, TITLE_CHAT_TAIL_BYTES, true);
     const fromTail = tail ? extractCustomTitle(tail) : undefined;
@@ -484,6 +708,7 @@ function readChatSessionTitle(filePath: string): string | undefined {
     return head ? extractCustomTitle(head) : undefined;
 }
 
+// Extract a string-valued JSON property near a known occurrence.
 function extractJsonStringProperty(content: string, propertyName: string, startIndex: number): string | undefined {
     const afterIndex = content.slice(startIndex);
     const escapedName = propertyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -500,6 +725,7 @@ function extractJsonStringProperty(content: string, propertyName: string, startI
     }
 }
 
+// Infer a readable title from the early lines of a debug log file.
 function readDebugLogTitle(filePath: string): TitleEntry | undefined {
     const chunk = readFileWindow(filePath, TITLE_DEBUG_HEAD_BYTES);
     if (!chunk) { return undefined; }
@@ -529,6 +755,7 @@ function readDebugLogTitle(filePath: string): TitleEntry | undefined {
     return fallback;
 }
 
+// Resolve the final session title using the strongest available source.
 function resolveSessionTitle(sessionId: string, candidate = sessionCandidateById.get(sessionId)): string | undefined {
     const cached = titleCache.get(sessionId);
     if (cached) { return cached.title; }
@@ -552,6 +779,7 @@ function resolveSessionTitle(sessionId: string, candidate = sessionCandidateById
     return resolved?.title;
 }
 
+// Enumerate all debug-log roots known to the current environment.
 function findAllDebugLogDirs(refresh = false): string[] {
     if (!refresh && debugLogDirsCache && debugLogDirsCache.expiresAt > Date.now()) {
         return debugLogDirsCache.dirs;
@@ -587,6 +815,7 @@ function findAllDebugLogDirs(refresh = false): string[] {
     return dirs;
 }
 
+// Scan one debug-log directory for session candidates.
 function scanSessionsInDir(debugLogsDir: string, options: { modifiedSince?: number } = {}): SessionScanResult {
     const sessions: SessionCandidate[] = [];
     let hasOlder = false;
@@ -634,14 +863,17 @@ function scanSessionsInDir(debugLogsDir: string, options: { modifiedSince?: numb
     return { sessions, hasOlder };
 }
 
+// Convenience wrapper that returns only the sessions from a directory scan.
 function findSessionsInDir(debugLogsDir: string): SessionCandidate[] {
     return scanSessionsInDir(debugLogsDir).sessions;
 }
 
+// Derive a user-facing workspace label from a debug-log directory path.
 function getWorkspaceLabelForDebugDir(debugLogsDir: string): string {
     return path.basename(path.dirname(path.dirname(debugLogsDir)));
 }
 
+// Resolve the current workspace's debug-log directory, if one is active.
 function getCurrentWorkspaceDebugDir(context: vscode.ExtensionContext): string | undefined {
     if (!context.storageUri) { return undefined; }
 
@@ -652,6 +884,7 @@ function getCurrentWorkspaceDebugDir(context: vscode.ExtensionContext): string |
     return fs.existsSync(candidate) ? candidate : undefined;
 }
 
+// Scan every available debug-log root and return sessions newer than a cutoff.
 function findSessionsForDays(daysBack?: number): SessionScanResult<SessionCandidate & { wsDir: string }> {
     const modifiedSince = daysBack === undefined
         ? undefined
@@ -675,6 +908,7 @@ function findSessionsForDays(daysBack?: number): SessionScanResult<SessionCandid
     return { sessions, hasOlder };
 }
 
+// Safely probe whether a file still contains billing metadata.
 function safeQuickPeekHasBillingData(file: string): boolean {
     try {
         return quickPeekHasBillingData(file);
@@ -683,10 +917,12 @@ function safeQuickPeekHasBillingData(file: string): boolean {
     }
 }
 
+// Apply the best resolved title back onto a parsed session summary.
 function applyResolvedTitle(summary: SessionSummary, candidate?: SessionCandidate): void {
     summary.title = resolveSessionTitle(summary.sessionId, candidate) || summary.title;
 }
 
+// Parse a session file and attach a resolved title when available.
 function parseSessionCandidate(candidate: SessionCandidate) {
     const parsed = parseCopilotSessionFile(candidate.mainJsonl);
     if (parsed) {
@@ -726,11 +962,12 @@ type TreeItemData =
     | { kind: 'stat'; label: string; value: string };
 
 /** Count how many times each tool was called in a message (by name) */
+// Aggregate tool call counts for a single message turn tree.
 function getToolUsageCounts(message: UserMessageSummary): Map<string, number> {
     const counts = new Map<string, number>();
     for (const turn of message.modelTurns) {
         for (const tc of turn.toolCalls) {
-            const identifier = canonicalizeToolIdentifier(tc);
+            const identifier = canonicalizeToolIdentifier(tc, getRuntimeToolAliasResolver());
             counts.set(identifier, (counts.get(identifier) || 0) + 1);
         }
     }
@@ -738,12 +975,13 @@ function getToolUsageCounts(message: UserMessageSummary): Map<string, number> {
 }
 
 /** Count tool usage across entire session */
+// Aggregate tool call counts across the whole session tree.
 function getSessionToolUsageCounts(summary: SessionSummary): Map<string, number> {
     const counts = new Map<string, number>();
     for (const msg of summary.userMessages) {
         for (const turn of msg.modelTurns) {
             for (const tc of turn.toolCalls) {
-                const identifier = canonicalizeToolIdentifier(tc);
+                const identifier = canonicalizeToolIdentifier(tc, getRuntimeToolAliasResolver());
                 counts.set(identifier, (counts.get(identifier) || 0) + 1);
             }
         }
@@ -752,6 +990,7 @@ function getSessionToolUsageCounts(summary: SessionSummary): Map<string, number>
 }
 
 /** Extract terminal command names from tool calls (groups "Ran: xxx ..." by the executable) */
+// Group terminal tool calls by executable name for the message view.
 function getCommandGroups(message: UserMessageSummary): { name: string; count: number }[] {
     const counts = new Map<string, number>();
     for (const turn of message.modelTurns) {
@@ -770,6 +1009,7 @@ function getCommandGroups(message: UserMessageSummary): { name: string; count: n
 }
 
 /** Get command groups for entire session */
+// Group terminal tool calls by executable name for the session view.
 function getSessionCommandGroups(summary: SessionSummary): { name: string; count: number }[] {
     const counts = new Map<string, number>();
     for (const msg of summary.userMessages) {
@@ -789,6 +1029,7 @@ function getSessionCommandGroups(summary: SessionSummary): { name: string; count
         .sort((a, b) => b.count - a.count);
 }
 
+// Pull the executable name out of a displayed terminal command label.
 function extractCommandName(displayLabel: string): string | undefined {
     const match = displayLabel.match(/^Ran:\s*(?:cd\s+[^;]+;\s*)?(.+)/);
     if (!match) { return undefined; }
@@ -819,6 +1060,7 @@ interface UsageRevealTarget {
     label?: string;
 }
 
+// Build a source location hint from a parsed debug reference.
 function targetFromDebugRef(kind: TreeItemData['kind'], debugRef: DebugSourceRef | undefined, extra?: Partial<UsageRevealTarget>): UsageRevealTarget | undefined {
     if (!debugRef) { return undefined; }
     return {
@@ -835,6 +1077,7 @@ function targetFromDebugRef(kind: TreeItemData['kind'], debugRef: DebugSourceRef
     };
 }
 
+// Attach a debug-log reveal command to a tree item when possible.
 function makeRevealTarget(element: TreeItemData): UsageRevealTarget | undefined {
     switch (element.kind) {
         case 'userMessage':
@@ -862,6 +1105,7 @@ function makeRevealTarget(element: TreeItemData): UsageRevealTarget | undefined 
     }
 }
 
+// Wire the reveal command onto a tree item.
 function attachRevealCommand(item: vscode.TreeItem, element: TreeItemData): void {
     const target = makeRevealTarget(element);
     if (!target) { return; }
@@ -872,12 +1116,13 @@ function attachRevealCommand(item: vscode.TreeItem, element: TreeItemData): void
     };
 }
 
+// Collect unique tool identifiers from a turn for clipboard output.
 function collectUsedToolIdentifiers(turn: ModelTurnSummary): string[] {
     const identifiers: string[] = [];
     const seen = new Set<string>();
 
     for (const toolCall of turn.toolCalls) {
-        const identifier = canonicalizeToolIdentifier(toolCall);
+        const identifier = canonicalizeToolIdentifier(toolCall, getRuntimeToolAliasResolver());
         if (!identifier || seen.has(identifier)) {
             continue;
         }
@@ -889,6 +1134,7 @@ function collectUsedToolIdentifiers(turn: ModelTurnSummary): string[] {
     return identifiers;
 }
 
+// Read used tool identifiers from whichever tree node the user clicked.
 function getUsedToolIdentifiersFromElement(element: TreeItemData): string[] {
     switch (element.kind) {
         case 'turnToolCall':
@@ -899,15 +1145,16 @@ function getUsedToolIdentifiersFromElement(element: TreeItemData): string[] {
             return collectUsedToolIdentifiers(element.turn);
         case 'toolDefinitions':
             return element.definitions
-                .map(def => canonicalizeToolIdentifier(def.name))
+                .map(def => canonicalizeToolIdentifier(def.name, getRuntimeToolAliasResolver()))
                 .filter(name => (element.usageCounts.get(name) || 0) > 0);
         case 'toolDef':
-            return element.usageCount > 0 ? [canonicalizeToolIdentifier(element.def.name)] : [];
+            return element.usageCount > 0 ? [canonicalizeToolIdentifier(element.def.name, getRuntimeToolAliasResolver())] : [];
         default:
             return [];
     }
 }
 
+// Copy the relevant used-tool fragment for the selected tree node.
 async function copyUsedToolsFromContext(arg: unknown, treeProvider?: UsageTreeProvider): Promise<void> {
     const toolIdentifiers = (() => {
         if (!arg) {
@@ -945,6 +1192,7 @@ async function copyUsedToolsFromContext(arg: unknown, treeProvider?: UsageTreePr
     vscode.window.setStatusBarMessage(`Copilot Usage: copied ${toolIdentifiers.length} used tools to clipboard`, 4000);
 }
 
+// Parse timestamps from a loose JSONL event shape.
 function parseLineTimestamp(raw: any): number | undefined {
     const candidates = [raw?.ts, raw?.timestamp, raw?.time, raw?.attrs?.ts, raw?.attrs?.timestamp];
     for (const value of candidates) {
@@ -959,6 +1207,7 @@ function parseLineTimestamp(raw: any): number | undefined {
     return undefined;
 }
 
+// Match a JSONL line against a selected debug reveal target.
 function lineMatchesRevealTarget(raw: any, target: UsageRevealTarget): boolean {
     const attrs = raw?.attrs || {};
     if (target.toolCallId) {
@@ -972,6 +1221,7 @@ function lineMatchesRevealTarget(raw: any, target: UsageRevealTarget): boolean {
     return false;
 }
 
+// Find the best line number to reveal in a JSONL file.
 function findBestLineInJsonl(filePath: string, target: UsageRevealTarget): number | undefined {
     if (target.sourceLine && target.sourceLine > 0) {
         return target.sourceLine;
@@ -1000,6 +1250,7 @@ function findBestLineInJsonl(filePath: string, target: UsageRevealTarget): numbe
     return bestTimestampDelta <= 10_000 ? bestTimestampLine : undefined;
 }
 
+// Open a debug log at the resolved line and center it in the editor.
 async function openSourceAtLine(filePath: string, lineNumber: number | undefined, target: UsageRevealTarget): Promise<void> {
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
     const editor = await vscode.window.showTextDocument(doc, { preview: false });
@@ -1011,6 +1262,7 @@ async function openSourceAtLine(filePath: string, lineNumber: number | undefined
     vscode.window.setStatusBarMessage(`Copilot Usage: revealed debug log line ${zeroBasedLine + 1}${label}`, 5000);
 }
 
+// Jump from the tree view back to the originating debug log.
 async function revealInAgentDebugLogs(target: UsageRevealTarget): Promise<void> {
     if (!target.sourceFile || !fs.existsSync(target.sourceFile)) {
         vscode.window.showWarningMessage('Copilot Usage: no source debug log file found for this Usage item.');
@@ -1020,6 +1272,7 @@ async function revealInAgentDebugLogs(target: UsageRevealTarget): Promise<void> 
     await openSourceAtLine(target.sourceFile, line, target);
 }
 
+// Render a compact visual meter for message spend.
 function formatMessageCostMeter(nanoAiu: number): string {
     const aic = nanoAiu / NANO_AIU_PER_AIC;
     if (aic >= 2000) {
@@ -1029,9 +1282,10 @@ function formatMessageCostMeter(nanoAiu: number): string {
 
     const filledSquares = aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
     return '■'.repeat(filledSquares) + '□'.repeat(5 - filledSquares);
-}
+    }
 
-class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
+    // Translate parsed session summaries into the tree view structure.
+    class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private _onDidChangeTreeData = new vscode.EventEmitter<TreeItemData | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -1762,6 +2016,7 @@ type SessionPickItem =
     | (vscode.QuickPickItem & { itemType: 'session'; session: SessionCandidate & { wsDir: string } })
     | (vscode.QuickPickItem & { itemType: 'loadMore' });
 
+// Identify the latest session for the active workspace, if one exists.
 function getCurrentWorkspaceLatestSessionId(context: vscode.ExtensionContext): string | undefined {
     const currentWsDebugDir = getCurrentWorkspaceDebugDir(context);
     if (!currentWsDebugDir) { return undefined; }
@@ -1770,6 +2025,7 @@ function getCurrentWorkspaceLatestSessionId(context: vscode.ExtensionContext): s
     return sessions[0]?.id;
 }
 
+// Build the quick-pick entries used for manual session selection.
 function createSessionPickItems(
     sessions: (SessionCandidate & { wsDir: string })[],
     currentWsSessionId: string | undefined,
@@ -1803,6 +2059,7 @@ function createSessionPickItems(
     return items;
 }
 
+// Initialize the tree view, session loading, and command registrations.
 export function activate(context: vscode.ExtensionContext) {
     const treeProvider = new UsageTreeProvider();
     const spendFileCachePath = getSpendFileCachePath(context.globalStorageUri?.fsPath);
@@ -2069,4 +2326,5 @@ export function activate(context: vscode.ExtensionContext) {
     );
 }
 
+// No-op teardown hook for VS Code extension shutdown.
 export function deactivate() {}

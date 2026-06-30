@@ -7,7 +7,6 @@ const {
   parseEntries,
   parseDebugLog,
   parseChatSessionLog,
-  parseDebugLog,
   formatAic,
   formatDuration,
   isSystemContinuation,
@@ -303,6 +302,23 @@ test('canonicalizeToolIdentifier - maps legacy tool names to canonical tool ids'
     canonicalizeToolIdentifier({ toolReferenceName: 'thirdPartyTool', toolId: 'extension-id/thirdPartyTool' }),
     'thirdPartyTool',
     'prefers explicit tool reference names'
+  );
+});
+
+test('canonicalizeToolIdentifier - prefers runtime resolver aliases', () => {
+  const resolver = {
+    resolve(identifier) {
+      if (identifier === 'github_text_search') {
+        return 'web/githubTextSearch';
+      }
+      return undefined;
+    }
+  };
+
+  assertEqual(
+    canonicalizeToolIdentifier('github_text_search', resolver),
+    'web/githubTextSearch',
+    'uses runtime alias resolver'
   );
 });
 

@@ -199,7 +199,11 @@ export interface ToolDefinitionSize {
 // - src/vs/workbench/contrib/chat/browser/tools/toolSetsContribution.ts
 // - src/vs/workbench/contrib/chat/common/tools/languageModelToolsContribution.ts
 // - src/vs/platform/browserView/common/browserChatToolReferenceNames.ts
-const TOOL_IDENTIFIER_ALIASES: Record<string, string> = {
+export interface ToolAliasResolver {
+    resolve(identifier: string): string | undefined;
+}
+
+const DEFAULT_TOOL_IDENTIFIER_ALIASES: Record<string, string> = {
     readfile: 'read/readFile',
     readproblems: 'read/problems',
     filesearch: 'search/fileSearch',
@@ -227,6 +231,14 @@ type ToolIdentifierLike = string | {
     toolKind?: unknown;
 };
 
+export function normalizeToolAliasKey(identifier: string): string {
+    return identifier
+        .trim()
+        .toLowerCase()
+        .replace(/^copilot[_-]/, '')
+        .replace(/[^a-z0-9]+/g, '');
+}
+
 function firstString(...values: unknown[]): string | undefined {
     for (const value of values) {
         if (typeof value === 'string' && value.trim()) {
@@ -236,10 +248,28 @@ function firstString(...values: unknown[]): string | undefined {
     return undefined;
 }
 
-function canonicalizeToolIdentifierString(identifier: string): string {
+function resolveToolAlias(identifier: string, resolver?: ToolAliasResolver): string | undefined {
+    if (!resolver) {
+        return undefined;
+    }
+
+    const trimmed = identifier.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+
+    return resolver.resolve(trimmed) || resolver.resolve(normalizeToolAliasKey(trimmed));
+}
+
+function canonicalizeToolIdentifierString(identifier: string, resolver?: ToolAliasResolver): string {
     const trimmed = identifier.trim();
     if (!trimmed) {
         return trimmed;
+    }
+
+    const resolved = resolveToolAlias(trimmed, resolver);
+    if (resolved) {
+        return resolved.trim().replace(/[\r\n]+/g, ' ');
     }
 
     const directMatch = trimmed.match(/^[^\s]+$/);
@@ -247,17 +277,17 @@ function canonicalizeToolIdentifierString(identifier: string): string {
         return trimmed;
     }
 
-    const normalized = trimmed
-        .toLowerCase()
-        .replace(/^copilot[_-]/, '')
-        .replace(/[^a-z0-9]+/g, '');
+    const normalized = normalizeToolAliasKey(trimmed);
+    if (DEFAULT_TOOL_IDENTIFIER_ALIASES[normalized]) {
+        return DEFAULT_TOOL_IDENTIFIER_ALIASES[normalized];
+    }
 
-    return TOOL_IDENTIFIER_ALIASES[normalized] || (directMatch ? trimmed : trimmed.replace(/[\r\n]+/g, ' ').trim());
+    return directMatch ? trimmed : trimmed.replace(/[\r\n]+/g, ' ').trim();
 }
 
-export function canonicalizeToolIdentifier(identifier: ToolIdentifierLike): string {
+export function canonicalizeToolIdentifier(identifier: ToolIdentifierLike, resolver?: ToolAliasResolver): string {
     if (typeof identifier === 'string') {
-        return canonicalizeToolIdentifierString(identifier);
+        return canonicalizeToolIdentifierString(identifier, resolver);
     }
 
     const structured = firstString(
@@ -272,7 +302,7 @@ export function canonicalizeToolIdentifier(identifier: ToolIdentifierLike): stri
         typeof identifier.toolKind === 'string' ? identifier.toolKind : undefined,
     );
 
-    return structured ? canonicalizeToolIdentifierString(structured) : '';
+    return structured ? canonicalizeToolIdentifierString(structured, resolver) : '';
 }
 
 export function formatUsedToolsFragment(toolIdentifiers: string[]): string {
