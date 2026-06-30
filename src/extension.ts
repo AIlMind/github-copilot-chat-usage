@@ -12,6 +12,7 @@ import {
     ToolDefinitionSize,
     findSiblingChatSessionLog,
     NANO_AIU_PER_AIC,
+    canonicalizeToolIdentifier,
     parseCreditDetailsNanoAiu,
     parseCopilotSessionFile,
     quickPeekHasBillingData,
@@ -19,6 +20,7 @@ import {
     formatAic,
     formatDuration,
     estimateTokens,
+    formatUsedToolsFragment,
 } from './parser';
 import { setCurrentGraph, registerChatParticipant } from './participant';
 
@@ -981,7 +983,8 @@ function getToolUsageCounts(message: UserMessageSummary): Map<string, number> {
     const counts = new Map<string, number>();
     for (const turn of message.modelTurns) {
         for (const tc of turn.toolCalls) {
-            counts.set(tc.name, (counts.get(tc.name) || 0) + 1);
+            const identifier = canonicalizeToolIdentifier(tc);
+            counts.set(identifier, (counts.get(identifier) || 0) + 1);
         }
     }
     return counts;
@@ -993,7 +996,8 @@ function getSessionToolUsageCounts(summary: SessionSummary): Map<string, number>
     for (const msg of summary.userMessages) {
         for (const turn of msg.modelTurns) {
             for (const tc of turn.toolCalls) {
-                counts.set(tc.name, (counts.get(tc.name) || 0) + 1);
+                const identifier = canonicalizeToolIdentifier(tc);
+                counts.set(identifier, (counts.get(identifier) || 0) + 1);
             }
         }
     }
@@ -1126,7 +1130,7 @@ function collectUsedToolIdentifiers(turn: ModelTurnSummary): string[] {
     const seen = new Set<string>();
 
     for (const toolCall of turn.toolCalls) {
-        const identifier = toolCall.name.trim();
+        const identifier = canonicalizeToolIdentifier(toolCall);
         if (!identifier || seen.has(identifier)) {
             continue;
         }
@@ -1138,23 +1142,59 @@ function collectUsedToolIdentifiers(turn: ModelTurnSummary): string[] {
     return identifiers;
 }
 
-function formatUsedToolsJsonFragment(toolIdentifiers: string[]): string {
-    if (toolIdentifiers.length === 0) {
-        return '"tools": []';
+function getUsedToolIdentifiersFromElement(element: TreeItemData): string[] {
+    switch (element.kind) {
+        case 'turnToolCall':
+            return collectUsedToolIdentifiers(element.turn);
+        case 'modelTurn':
+            return collectUsedToolIdentifiers(element.turn);
+        case 'subagentTurn':
+            return collectUsedToolIdentifiers(element.turn);
+        case 'toolDefinitions':
+            return element.definitions
+                .map(def => canonicalizeToolIdentifier(def.name))
+                .filter(name => (element.usageCounts.get(name) || 0) > 0);
+        case 'toolDef':
+            return element.usageCount > 0 ? [canonicalizeToolIdentifier(element.def.name)] : [];
+        default:
+            return [];
     }
-
-    const lines = toolIdentifiers.map(identifier => `  ${JSON.stringify(identifier)},`);
-    return `"tools": [\n${lines.join('\n')}\n],`;
 }
 
-async function copyUsedToolsFromTurn(turn: ModelTurnSummary): Promise<void> {
-    const toolIdentifiers = collectUsedToolIdentifiers(turn);
+async function copyUsedToolsFromContext(arg: unknown, treeProvider?: UsageTreeProvider): Promise<void> {
+    const toolIdentifiers = (() => {
+        if (!arg) {
+            return [];
+        }
+
+        if (arg && typeof arg === 'object') {
+            if ('toolCalls' in arg && Array.isArray((arg as any).toolCalls)) {
+                return collectUsedToolIdentifiers(arg as ModelTurnSummary);
+            }
+            if ('kind' in arg && typeof (arg as any).kind === 'string') {
+                return getUsedToolIdentifiersFromElement(arg as TreeItemData);
+            }
+            if (arg instanceof vscode.TreeItem) {
+                const element = treeProvider?.getDataForTreeItem(arg);
+                return element ? getUsedToolIdentifiersFromElement(element) : [];
+            }
+            if ('contextValue' in arg && typeof (arg as any).contextValue === 'string') {
+                const contextValue = (arg as { contextValue?: string }).contextValue;
+                if (contextValue === 'toolDefinitions' || contextValue === 'toolDef' || contextValue === 'turnToolCall' || contextValue === 'failedToolCall') {
+                    return [];
+                }
+            }
+        }
+
+        return [];
+    })();
+
     if (toolIdentifiers.length === 0) {
-        vscode.window.showInformationMessage('Copilot Usage: no used tools were found for this turn.');
+        vscode.window.showInformationMessage('Copilot Usage: no used tools were found for this item.');
         return;
     }
 
-    await vscode.env.clipboard.writeText(formatUsedToolsJsonFragment(toolIdentifiers));
+    await vscode.env.clipboard.writeText(formatUsedToolsFragment(toolIdentifiers));
     vscode.window.setStatusBarMessage(`Copilot Usage: copied ${toolIdentifiers.length} used tools to clipboard`, 4000);
 }
 
@@ -1243,6 +1283,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private spendHistoryRequested = false;
     private requestFullSpendSummary: (() => void) | undefined;
     private debugLogsEnabled = isDebugLogsSettingEnabled();
+    private treeItemDataById = new Map<string, TreeItemData>();
+    private nextTreeItemId = 0;
 
     setSummary(summary: SessionSummary | undefined) {
         this.summary = summary;
@@ -1277,11 +1319,20 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         this._onDidChangeTreeData.fire();
     }
 
+    getDataForTreeItem(item: vscode.TreeItem): TreeItemData | undefined {
+        return item.id ? this.treeItemDataById.get(item.id) : undefined;
+    }
+
     getTreeItem(element: TreeItemData): vscode.TreeItem {
+        const item = new vscode.TreeItem('');
+        item.id = `${this.nextTreeItemId++}`;
+        this.treeItemDataById.set(item.id, element);
+
         switch (element.kind) {
             case 'spendSummary': {
                 const s = element.summary;
-                const item = new vscode.TreeItem('Spend Summary', vscode.TreeItemCollapsibleState.Collapsed);
+                item.label = 'Spend Summary';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
                     : `today ${formatAic(s.today.nanoAiu)} AIC | ${formatUsdEstimate(s.today.nanoAiu)}`;
@@ -1291,10 +1342,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             }
             case 'spendBucket': {
                 const b = element.bucket;
-                const item = new vscode.TreeItem(
-                    b.label,
-                    b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = b.label;
+                item.collapsibleState = b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
                     : `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | in:${formatNumber(b.inputTokens)} out:${formatNumber(b.outputTokens)}`;
@@ -1310,7 +1359,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             }
             case 'spendModelBucket': {
                 const b = element.bucket;
-                const item = new vscode.TreeItem(b.label, vscode.TreeItemCollapsibleState.None);
+                item.label = b.label;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | ${b.requestCount} req`;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
                 item.tooltip = [
@@ -1323,19 +1373,22 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 return item;
             }
             case 'spendModelEmpty': {
-                const item = new vscode.TreeItem('No billed models', vscode.TreeItemCollapsibleState.None);
+                item.label = 'No billed models';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = 'none found';
                 item.iconPath = new vscode.ThemeIcon('circle-slash');
                 return item;
             }
             case 'spendLastRefresh': {
-                const item = new vscode.TreeItem('Last refreshed', vscode.TreeItemCollapsibleState.None);
+                item.label = 'Last refreshed';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = new Date(element.timestamp).toLocaleString();
                 item.iconPath = new vscode.ThemeIcon('clock');
                 return item;
             }
             case 'spendLoading': {
-                const item = new vscode.TreeItem('Loading spend history...', vscode.TreeItemCollapsibleState.None);
+                item.label = 'Loading spend history...';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = 'refreshing...';
                 item.iconPath = new vscode.ThemeIcon('sync~spin');
                 return item;
@@ -1343,10 +1396,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             case 'session': {
                 const s = element.summary;
                 const titleDisplay = s.title || s.sessionId.slice(0, 8) + '...';
-                const item = new vscode.TreeItem(
-                    titleDisplay,
-                    vscode.TreeItemCollapsibleState.Expanded
-                );
+                item.label = titleDisplay;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
                 item.description = `${formatAic(s.totalNanoAiu)} AIC | ${formatNumber(s.totalTokens)} tokens | ${s.userMessages.length} messages`;
                 item.iconPath = new vscode.ThemeIcon('graph');
                 item.tooltip = [
@@ -1375,10 +1426,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 // Fixed-width label: pad/truncate to 28 chars so descriptions align
                 const rawPreview = (m.content || '(empty)') + mergedNote;
                 const label = rawPreview.length > 28 ? rawPreview.slice(0, 27) + '…' : rawPreview.padEnd(28);
-                const item = new vscode.TreeItem(
-                    `${element.index + 1}: ${label}`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `${element.index + 1}: ${label}`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = `${formatAic(m.totalNanoAiu)} AIC  ${m.modelTurns.length} turns  ${meter}`;
                 if (m.failure?.isFailure) {
                     item.description = `FAILED | ${item.description}`;
@@ -1407,10 +1456,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             case 'turnsGroup': {
                 const m = element.message;
                 const totalTools = m.modelTurns.reduce((s, t) => s + t.toolCalls.length, 0);
-                const item = new vscode.TreeItem(
-                    `${m.modelTurns.length} turns`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `${m.modelTurns.length} turns`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = `${totalTools} tool calls | ${formatDuration(m.totalDurationMs)}`;
                 item.iconPath = new vscode.ThemeIcon('layers');
                 return item;
@@ -1435,10 +1482,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     turnIcon = new vscode.ThemeIcon('layers');
                 }
 
-                const item = new vscode.TreeItem(
-                    turnLabel,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = turnLabel;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = `${formatAic(t.nanoAiu)} AIC | in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)}${cacheNote}`;
                 if (t.failure?.isFailure) {
                     item.description = `FAILED | ${item.description}`;
@@ -1466,10 +1511,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             case 'turnToolCall': {
                 const c = element.call;
                 const hasChildren = c.isSubagent && c.subagentSummary;
-                const item = new vscode.TreeItem(
-                    c.displayLabel,
-                    hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = c.displayLabel;
+                item.collapsibleState = hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 const descriptionParts: string[] = [];
                 if (c.durationMs > 0) {
                     descriptionParts.push(formatDuration(c.durationMs));
@@ -1507,7 +1550,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 } else {
                     item.iconPath = new vscode.ThemeIcon('wrench');
                 }
-                item.contextValue = c.failure?.isFailure ? 'turnToolCall failedToolCall' : 'turnToolCall';
+                item.contextValue = c.failure?.isFailure ? 'failedToolCall' : 'turnToolCall';
                 attachRevealCommand(item, element);
                 return item;
             }
@@ -1515,27 +1558,24 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const t = element.turn;
                 const toolNames = t.toolCalls.map(tc => tc.displayLabel || tc.name).slice(0, 3);
                 const toolPreview = toolNames.length > 0 ? toolNames.join(', ') : 'no tools';
-                const item = new vscode.TreeItem(
-                    `Turn ${element.turnIndex + 1}: ${t.model}`,
-                    t.toolCalls.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = `Turn ${element.turnIndex + 1}: ${t.model}`;
+                item.collapsibleState = t.toolCalls.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 item.description = `${formatAic(t.nanoAiu)} AIC | ${toolPreview}`;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
                 return item;
             }
             case 'mergedInfo': {
                 const m = element.message;
-                const item = new vscode.TreeItem(
-                    `Merged Continuations (${m.mergedMessages.length})`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `Merged Continuations (${m.mergedMessages.length})`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = 'system-triggered follow-ups';
                 item.iconPath = new vscode.ThemeIcon('git-merge');
                 return item;
             }
             case 'mergedItem': {
                 const info = element.info;
-                const item = new vscode.TreeItem(info.content, vscode.TreeItemCollapsibleState.None);
+                item.label = info.content;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.iconPath = new vscode.ThemeIcon('arrow-right');
                 item.tooltip = `SpanId: ${info.spanId}\nTimestamp: ${new Date(info.timestamp).toLocaleTimeString()}`;
                 attachRevealCommand(item, element);
@@ -1545,18 +1585,18 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 const defs = element.definitions;
                 const totalUsed = [...element.usageCounts.values()].reduce((s, c) => s + c, 0);
                 const uniqueUsed = element.usageCounts.size;
-                const item = new vscode.TreeItem(
-                    `Tools (${defs.length} available, ${uniqueUsed} used, ${totalUsed} calls)`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `Tools (${defs.length} available, ${uniqueUsed} used, ${totalUsed} calls)`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = element.label;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
+                item.contextValue = 'toolDefinitions';
                 return item;
             }
             case 'toolDef': {
                 const d = element.def;
                 const count = element.usageCount;
-                const item = new vscode.TreeItem(d.name, vscode.TreeItemCollapsibleState.None);
+                item.label = d.name;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 if (count > 0) {
                     item.description = `×${count} | ~${formatNumber(d.estimatedTokens)} tokens`;
                     item.iconPath = new vscode.ThemeIcon('check');
@@ -1564,14 +1604,13 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     item.description = `unused | ~${formatNumber(d.estimatedTokens)} tokens`;
                     item.iconPath = new vscode.ThemeIcon('circle-slash');
                 }
+                item.contextValue = 'toolDef';
                 return item;
             }
             case 'commandsGroup': {
                 const total = element.commands.reduce((s, c) => s + c.count, 0);
-                const item = new vscode.TreeItem(
-                    `Commands (${element.commands.length} executables, ${total} runs)`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `Commands (${element.commands.length} executables, ${total} runs)`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.iconPath = new vscode.ThemeIcon('terminal');
                 return item;
             }
@@ -1582,19 +1621,15 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 return item;
             }
             case 'insights': {
-                const item = new vscode.TreeItem(
-                    'Insights',
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = 'Insights';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.iconPath = new vscode.ThemeIcon('lightbulb');
                 item.description = 'tool usage analysis & command summary';
                 return item;
             }
             case 'insightGroup': {
-                const item = new vscode.TreeItem(
-                    element.label,
-                    element.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = element.label;
+                item.collapsibleState = element.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 item.description = `${element.tools.length} tools`;
                 item.iconPath = new vscode.ThemeIcon('tag');
                 return item;
@@ -1608,7 +1643,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 return item;
             }
             case 'stat': {
-                const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
+                item.label = element.label;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = element.value;
                 item.iconPath = new vscode.ThemeIcon('info');
                 if (element.label === 'Total Cost') {
@@ -1786,7 +1822,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     { kind: 'stat', label: 'Tokens', value: `in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)} cache:${formatNumber(t.cachedTokens)}` },
                 ];
                 for (const tc of t.toolCalls) {
-                    children.push({ kind: 'turnToolCall', call: tc });
+                    children.push({ kind: 'turnToolCall', call: tc, turn: t });
                 }
                 return children;
             }
@@ -2059,6 +2095,9 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('copilotUsageTracker.revealInAgentDebugLogs', async (target: UsageRevealTarget) => {
             await revealInAgentDebugLogs(target);
+        }),
+        vscode.commands.registerCommand('copilotUsageTracker.copyUsedTools', async (arg: unknown) => {
+            await copyUsedToolsFromContext(arg, treeProvider);
         }),
         vscode.commands.registerCommand('copilotUsageTracker.analyzeSession', () => {
             autoLoad();

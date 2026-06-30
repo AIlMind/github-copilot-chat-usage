@@ -68,6 +68,10 @@ export interface LogEntry {
         childLogFile?: string;
         childSessionId?: string;
         label?: string;
+        toolId?: string;
+        toolReferenceName?: string;
+        toolSetReferenceName?: string;
+        fullReferenceName?: string;
         systemPromptFile?: string;
         toolsFile?: string;
         inputMessages?: string;
@@ -78,6 +82,9 @@ export interface LogEntry {
 
 export interface ToolCallSummary {
     name: string;
+    toolId?: string;
+    toolReferenceName?: string;
+    fullReferenceName?: string;
     displayLabel: string; // e.g. "Ran: git clone...", "Search: chat debug"
     durationMs: number;
     timestamp: number;
@@ -176,6 +183,104 @@ export interface ToolDefinitionSize {
     name: string;
     chars: number;
     estimatedTokens: number;
+}
+
+// Canonical tool names come from VS Code's language model tools service:
+// - `IToolData.toolReferenceName` / `IToolData.legacyToolReferenceFullNames`
+// - `IToolSet.referenceName` / `IToolSet.legacyFullNames`
+// - `LanguageModelToolsService.getFullReferenceName*`, `getDeprecatedFullReferenceNames()`,
+//   `toToolReferences()` and `toFullReferenceNames()`
+// See:
+// - src/vs/workbench/contrib/chat/common/tools/languageModelToolsService.ts
+// - src/vs/workbench/contrib/chat/browser/tools/languageModelToolsService.ts
+// - src/vs/workbench/contrib/chat/browser/tools/toolSetsContribution.ts
+// - src/vs/workbench/contrib/chat/common/tools/languageModelToolsContribution.ts
+// - src/vs/platform/browserView/common/browserChatToolReferenceNames.ts
+const TOOL_IDENTIFIER_ALIASES: Record<string, string> = {
+    readfile: 'read/readFile',
+    readproblems: 'read/problems',
+    filesearch: 'search/fileSearch',
+    findfiles: 'search/fileSearch',
+    searchfiles: 'search/fileSearch',
+    grepsearch: 'search/textSearch',
+    textsearch: 'search/textSearch',
+    findtextinfiles: 'search/codebase',
+    codebasesearch: 'search/codebase',
+    runinterminal: 'execute/runInTerminal',
+    getterminaloutput: 'execute/getTerminalOutput',
+    listdir: 'browser',
+    browser: 'browser',
+};
+
+type ToolIdentifierLike = string | {
+    toolId?: unknown;
+    toolReferenceName?: unknown;
+    fullReferenceName?: unknown;
+    referenceName?: unknown;
+    toolSetReferenceName?: unknown;
+    name?: unknown;
+    displayLabel?: unknown;
+    source?: unknown;
+    toolKind?: unknown;
+};
+
+function firstString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim();
+        }
+    }
+    return undefined;
+}
+
+function canonicalizeToolIdentifierString(identifier: string): string {
+    const trimmed = identifier.trim();
+    if (!trimmed) {
+        return trimmed;
+    }
+
+    const directMatch = trimmed.match(/^[^\s]+$/);
+    if (trimmed.includes('/')) {
+        return trimmed;
+    }
+
+    const normalized = trimmed
+        .toLowerCase()
+        .replace(/^copilot[_-]/, '')
+        .replace(/[^a-z0-9]+/g, '');
+
+    return TOOL_IDENTIFIER_ALIASES[normalized] || (directMatch ? trimmed : trimmed.replace(/[\r\n]+/g, ' ').trim());
+}
+
+export function canonicalizeToolIdentifier(identifier: ToolIdentifierLike): string {
+    if (typeof identifier === 'string') {
+        return canonicalizeToolIdentifierString(identifier);
+    }
+
+    const structured = firstString(
+        identifier.fullReferenceName,
+        identifier.referenceName,
+        identifier.toolReferenceName,
+        identifier.toolSetReferenceName ? `${identifier.toolSetReferenceName}/${firstString(identifier.toolReferenceName, identifier.toolId, identifier.name) ?? ''}`.replace(/\/$/, '') : undefined,
+        identifier.toolId,
+        identifier.name,
+        identifier.displayLabel,
+        typeof identifier.source === 'string' ? identifier.source : undefined,
+        typeof identifier.toolKind === 'string' ? identifier.toolKind : undefined,
+    );
+
+    return structured ? canonicalizeToolIdentifierString(structured) : '';
+}
+
+export function formatUsedToolsFragment(toolIdentifiers: string[]): string {
+    if (toolIdentifiers.length === 0) {
+        return 'tools: []';
+    }
+
+    return [
+        'tools:',
+        ...toolIdentifiers.map(identifier => `  - ${identifier}`),
+    ].join('\n');
 }
 
 export interface PromptComposition {
@@ -394,6 +499,9 @@ function classifyTurnFailure(turn: Pick<ModelTurnSummary, 'status' | 'toolCalls'
 function makeToolCallSummary(entry: LogEntry): ToolCallSummary {
     const summary: ToolCallSummary = {
         name: entry.name,
+        toolId: entry.attrs.toolId || entry.name,
+        toolReferenceName: entry.attrs.toolReferenceName,
+        fullReferenceName: entry.attrs.fullReferenceName,
         displayLabel: getToolDisplayLabel(entry.name, entry.attrs.args, entry.attrs.displayLabel),
         durationMs: entry.dur,
         timestamp: entry.ts,
@@ -533,6 +641,10 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
             toolKind: firstDefined(rawAttrs.toolKind, raw.toolKind),
             resultCount: toNumber(firstDefined(rawAttrs.resultCount, raw.resultCount)),
             toolCallId: firstDefined(rawAttrs.toolCallId, raw.toolCallId),
+            toolId: firstDefined(rawAttrs.toolId, raw.toolId),
+            toolReferenceName: firstDefined(rawAttrs.toolReferenceName, raw.toolReferenceName),
+            toolSetReferenceName: firstDefined(rawAttrs.toolSetReferenceName, raw.toolSetReferenceName),
+            fullReferenceName: firstDefined(rawAttrs.fullReferenceName, raw.fullReferenceName),
         },
     };
 }
@@ -575,6 +687,10 @@ function normalizeParsedEntries(raw: any, index: number): LogEntry[] {
                 toolKind: firstDefined(tool.toolKind, tool.kind),
                 resultCount: toNumber(firstDefined(tool.resultCount, tool.resultDetails?.length)),
                 toolCallId: firstDefined(tool.toolCallId, tool.id),
+                toolId: firstDefined(tool.toolId, tool.toolName, tool.tool_name),
+                toolReferenceName: firstDefined(tool.toolReferenceName, tool.referenceName),
+                toolSetReferenceName: firstDefined(tool.toolSetReferenceName, tool.toolSet?.referenceName),
+                fullReferenceName: firstDefined(tool.fullReferenceName, tool.referenceName),
             },
         });
     });

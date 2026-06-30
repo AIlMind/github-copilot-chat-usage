@@ -9,6 +9,8 @@ const {
   formatAic,
   formatDuration,
   isSystemContinuation,
+  canonicalizeToolIdentifier,
+  formatUsedToolsFragment,
 } = require('../out/parser');
 
 let passed = 0;
@@ -246,6 +248,31 @@ test('parseEntries - content preview truncated at 80 chars', () => {
 
   const result = parseEntries(entries);
   assertEqual(result.userMessages[0].content.length, 80, 'content truncated to 80');
+});
+
+test('canonicalizeToolIdentifier - maps legacy tool names to canonical tool ids', () => {
+  assertEqual(canonicalizeToolIdentifier('read_file'), 'read/readFile', 'read file mapping');
+  assertEqual(canonicalizeToolIdentifier('copilot_findTextInFiles'), 'search/codebase', 'codebase search mapping');
+  assertEqual(canonicalizeToolIdentifier('grep_search'), 'search/textSearch', 'text search mapping');
+  assertEqual(canonicalizeToolIdentifier('run_in_terminal'), 'execute/runInTerminal', 'terminal mapping');
+  assertEqual(
+    canonicalizeToolIdentifier({ toolId: 'my.extension/customTool', name: 'ignored' }),
+    'my.extension/customTool',
+    'preserves already qualified tool ids'
+  );
+  assertEqual(
+    canonicalizeToolIdentifier({ toolReferenceName: 'thirdPartyTool', toolId: 'extension-id/thirdPartyTool' }),
+    'thirdPartyTool',
+    'prefers explicit tool reference names'
+  );
+});
+
+test('formatUsedToolsFragment - emits a pasteable YAML list', () => {
+  assertEqual(
+    formatUsedToolsFragment(['read/readFile', 'search/codebase']),
+    'tools:\n  - read/readFile\n  - search/codebase',
+    'yaml fragment format'
+  );
 });
 
 test('parseDebugLog - classifies missing rg command failures and preserves source refs', () => {
