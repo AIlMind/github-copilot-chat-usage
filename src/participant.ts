@@ -21,6 +21,10 @@ type TitleResolver = (id: string) => string | undefined;
 let sessionFinder: SessionFinder = () => [];
 let titleResolver: TitleResolver = () => undefined;
 
+function formatLocalDateTime(timestamp: number): string {
+    return new Date(timestamp).toLocaleString(vscode.env.language || undefined);
+}
+
 export function setCurrentGraph(summary: SessionSummary): void {
     const graph = new SessionGraph(summary);
     currentGraph = graph;
@@ -74,7 +78,7 @@ class SearchSessionsTool implements vscode.LanguageModelTool<SearchInput> {
 
         const results = merged.slice(0, limit).map(s => {
             const title = titleResolver(s.id);
-            const date = new Date(s.modifiedTime).toLocaleString();
+            const date = formatLocalDateTime(s.modifiedTime);
             const isCurrent = currentGraph?.stats.sessionId === s.id;
             return `${isCurrent ? '→ [LOADED] ' : '  '}${title || s.id.slice(0, 8) + '...'} | ${date} | id:${s.id}`;
         });

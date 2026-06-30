@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0
+
+- Adds a central user-level Spend Summary cache shared across workspaces.
+- Reuses parsed spend data for unchanged chat-session files based on file mtime and size.
+- Parses snake_case chat-session usage token fields.
+- Invalidates stale Spend Summary file-cache entries when parser behavior changes.
+- Counts direct `nanoAiu` usage fields and token-only usage rows in Spend Summary totals.
+- Deduplicates copied fork requests in Spend Summary using stable response IDs.
+- Includes nested subagent messages and turns in the `@usage` session graph tool output.
+- Includes nested subagent tool calls in `@usage` graph tool usage and command counts.
+- Uses the VS Code UI language for displayed datetimes.
+
+## 0.5.0
+
+- Adds workspace breakdowns to Spend Summary.
+- Groups Spend Summary details into Workspace Summary and Models sections.
+- Improves subagent parsing, including nested child sessions and in-progress subagents.
+- Handles appended chat-session request patches more reliably.
+- Avoids counting timestampless spend records as today's spend.
+
 ## 0.4.0
 
 - Adds a Spend Summary section.
