@@ -7,15 +7,21 @@ import {
     MergedMessageInfo,
     UserMessageSummary,
     SessionSummary,
+    DebugSourceRef,
+    FailureInfo,
     ToolDefinitionSize,
     findSiblingChatSessionLog,
     NANO_AIU_PER_AIC,
+    canonicalizeToolIdentifier,
     parseCopilotSessionFile,
     quickPeekHasBillingData,
     formatNumber,
     formatAic,
     formatDuration,
     estimateTokens,
+    formatUsedToolsFragment,
+    normalizeToolAliasKey,
+    ToolAliasResolver,
 } from './parser';
 import { setCurrentGraph, registerChatParticipant } from './participant';
 import {
@@ -67,11 +73,13 @@ function pathExists(candidate: string | undefined): candidate is string {
     return !!candidate && fs.existsSync(candidate);
 }
 
+// Keep only non-empty values when building path and label lists.
 function pushUnique(items: string[], value: string | undefined): void {
     if (!value || items.includes(value)) { return; }
     items.push(value);
 }
 
+// Convert nanoAiu into a compact USD estimate for display.
 function formatUsdEstimate(nanoAiu: number): string {
     if (nanoAiu <= 0) {
         return '$0.00 USD est.';
@@ -82,18 +90,22 @@ function formatUsdEstimate(nanoAiu: number): string {
     return `$${usd < 1 ? usd.toFixed(4) : usd.toFixed(2)} USD est.`;
 }
 
+// Format timestamps for local date display in the UI.
 function formatLocalDateTime(timestamp: number): string {
     return new Date(timestamp).toLocaleString(vscode.env.language || undefined);
 }
 
+// Format timestamps for local time display in the UI.
 function formatLocalTime(timestamp: number): string {
     return new Date(timestamp).toLocaleTimeString(vscode.env.language || undefined);
 }
 
+// Read the setting that controls whether agent debug logs are persisted.
 function isDebugLogsSettingEnabled(): boolean {
     return vscode.workspace.getConfiguration().get<boolean>(DEBUG_LOGS_SETTING) === true;
 }
 
+// Discover known workspace storage roots across supported editors and platforms.
 function getWorkspaceStorageRoots(): string[] {
     const roots: string[] = [];
     const appDataPath = process.env.APPDATA;
@@ -125,6 +137,7 @@ function getWorkspaceStorageRoots(): string[] {
     return roots.filter(pathExists);
 }
 
+// Read extra search roots from user configuration.
 function getConfiguredSearchRoots(): string[] {
     return vscode.workspace
         .getConfiguration('copilotUsageTracker')
@@ -132,6 +145,7 @@ function getConfiguredSearchRoots(): string[] {
         .filter(pathExists);
 }
 
+// Recursively find debug-log directories under a search root.
 function collectDebugLogDirs(root: string, maxDepth: number, results: Set<string>): void {
     if (maxDepth < 0 || !fs.existsSync(root)) { return; }
 
@@ -163,6 +177,7 @@ function collectDebugLogDirs(root: string, maxDepth: number, results: Set<string
     }
 }
 
+// Recursively find chat session directories under a search root.
 function collectChatSessionDirs(root: string, maxDepth: number, results: Set<string>): void {
     if (maxDepth < 0 || !fs.existsSync(root)) { return; }
 
@@ -190,6 +205,7 @@ function collectChatSessionDirs(root: string, maxDepth: number, results: Set<str
     }
 }
 
+// Derive a readable label from a file or folder path.
 function labelFromPath(filePath: string | undefined): string | undefined {
     if (!filePath) { return undefined; }
 
@@ -204,6 +220,7 @@ function labelFromPath(filePath: string | undefined): string | undefined {
         : base;
 }
 
+// Normalize URI strings into filesystem paths when possible.
 function fsPathFromUriString(value: string | undefined): string | undefined {
     if (!value) { return undefined; }
 
@@ -220,6 +237,206 @@ function fsPathFromUriString(value: string | undefined): string | undefined {
     }
 
     return value;
+}
+
+// Return the first non-empty string from a list of candidate values.
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim();
+        }
+    }
+    return undefined;
+}
+
+// Locate the user profile agents directory from VS Code prompts storage.
+function getUserAgentsDir(): string | undefined {
+    const promptsDir = process.env.VSCODE_USER_PROMPTS_FOLDER;
+    if (!promptsDir) {
+        return undefined;
+    }
+
+    return path.join(path.dirname(promptsDir), 'agents');
+}
+
+// Extract tool aliases from an .agent.md file's frontmatter tools list.
+function readAgentToolReferences(agentFilePath: string): string[] {
+    try {
+        const text = fs.readFileSync(agentFilePath, 'utf-8');
+        const frontmatterStart = text.indexOf('---');
+        if (frontmatterStart !== 0) {
+            return [];
+        }
+
+        const frontmatterEnd = text.indexOf('\n---', 3);
+        const frontmatter = frontmatterEnd >= 0 ? text.slice(3, frontmatterEnd) : text.slice(3);
+        const references: string[] = [];
+        const lines = frontmatter.split(/\r?\n/);
+        let inToolsBlock = false;
+        let toolsIndent = 0;
+
+        for (const line of lines) {
+            const toolsMatch = line.match(/^(\s*)tools:\s*(.*)$/);
+            if (toolsMatch) {
+                inToolsBlock = true;
+                toolsIndent = toolsMatch[1].length;
+                const inline = toolsMatch[2].trim();
+                if (inline.startsWith('[') && inline.endsWith(']')) {
+                    for (const entry of inline.slice(1, -1).split(',')) {
+                        const value = entry.trim().replace(/^['"]|['"]$/g, '');
+                        if (value) {
+                            references.push(value);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (!inToolsBlock) {
+                continue;
+            }
+
+            const listMatch = line.match(/^(\s*)-\s*([^#]+?)\s*$/);
+            if (listMatch && listMatch[1].length > toolsIndent) {
+                const value = listMatch[2].trim().replace(/^['"]|['"]$/g, '');
+                if (value) {
+                    references.push(value);
+                }
+                continue;
+            }
+
+            if (line.trim() && !line.startsWith(' '.repeat(toolsIndent + 1))) {
+                inToolsBlock = false;
+            }
+        }
+
+        return references;
+    } catch {
+        return [];
+    }
+}
+
+// Collect all .agent.md files under a directory tree.
+function collectAgentFiles(rootDir: string | undefined, results: string[] = []): string[] {
+    if (!rootDir || !fs.existsSync(rootDir)) {
+        return results;
+    }
+
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(rootDir, { withFileTypes: true });
+    } catch {
+        return results;
+    }
+
+    for (const entry of entries) {
+        const entryPath = path.join(rootDir, entry.name);
+        if (entry.isDirectory()) {
+            collectAgentFiles(entryPath, results);
+            continue;
+        }
+        if (entry.isFile() && entry.name.endsWith('.agent.md')) {
+            results.push(entryPath);
+        }
+    }
+
+    return results;
+}
+
+// Read the toolset reference name from a toolset-like object.
+function getToolSetReferenceName(toolSet: any): string | undefined {
+    return firstNonEmptyString(toolSet?.referenceName, toolSet?.toolSetReferenceName, toolSet?.name);
+}
+
+// Read the tool reference name from a tool-like object.
+function getToolReferenceName(tool: any): string | undefined {
+    return firstNonEmptyString(tool?.toolReferenceName, tool?.referenceName, tool?.name);
+}
+
+// Store a canonical alias lookup for both raw and normalized keys.
+function registerAlias(map: Map<string, string>, alias: string | undefined, canonical: string | undefined): void {
+    if (!alias || !canonical) {
+        return;
+    }
+
+    const trimmedAlias = alias.trim();
+    const trimmedCanonical = canonical.trim();
+    if (!trimmedAlias || !trimmedCanonical) {
+        return;
+    }
+
+    map.set(trimmedAlias, trimmedCanonical);
+    map.set(normalizeToolAliasKey(trimmedAlias), trimmedCanonical);
+}
+
+// Build a runtime alias resolver from installed tools and agent metadata.
+function buildRuntimeToolAliasResolver(): ToolAliasResolver {
+    const aliases = new Map<string, string>();
+
+    for (const extension of vscode.extensions.all) {
+// Lazily cache the runtime tool alias resolver.
+        const contributes = extension.packageJSON?.contributes;
+        const toolSets = Array.isArray(contributes?.languageModelToolSets) ? contributes.languageModelToolSets : [];
+        const tools = Array.isArray(contributes?.languageModelTools) ? contributes.languageModelTools : [];
+        const toolSetByMember = new Map<string, string>();
+
+        for (const toolSet of toolSets) {
+            const toolSetReferenceName = getToolSetReferenceName(toolSet);
+            const members = Array.isArray(toolSet?.tools) ? toolSet.tools : [];
+
+            for (const member of members) {
+                const memberReferenceName = typeof member === 'string' ? member : getToolReferenceName(member);
+                if (toolSetReferenceName && memberReferenceName) {
+                    toolSetByMember.set(normalizeToolAliasKey(memberReferenceName), toolSetReferenceName);
+                }
+            }
+        }
+
+        for (const tool of tools) {
+            const toolReferenceName = getToolReferenceName(tool);
+            if (!toolReferenceName) {
+                continue;
+            }
+
+            const toolSetReferenceName = toolSetByMember.get(normalizeToolAliasKey(toolReferenceName));
+            const canonicalReference = toolSetReferenceName ? `${toolSetReferenceName}/${toolReferenceName}` : toolReferenceName;
+
+            registerAlias(aliases, tool.id, canonicalReference);
+            registerAlias(aliases, toolReferenceName, canonicalReference);
+
+            for (const legacyName of Array.isArray(tool.legacyToolReferenceFullNames) ? tool.legacyToolReferenceFullNames : []) {
+                registerAlias(aliases, typeof legacyName === 'string' ? legacyName : undefined, canonicalReference);
+            }
+        }
+    }
+
+    for (const workspaceFolder of vscode.workspace.workspaceFolders ?? []) {
+        const workspaceAgentsDir = path.join(workspaceFolder.uri.fsPath, '.github', 'agents');
+        for (const agentFilePath of collectAgentFiles(workspaceAgentsDir)) {
+            for (const reference of readAgentToolReferences(agentFilePath)) {
+                registerAlias(aliases, reference, reference);
+            }
+        }
+    }
+
+    for (const agentFilePath of collectAgentFiles(getUserAgentsDir())) {
+        for (const reference of readAgentToolReferences(agentFilePath)) {
+            registerAlias(aliases, reference, reference);
+        }
+    }
+
+    return {
+        resolve(identifier: string): string | undefined {
+            return aliases.get(identifier) || aliases.get(normalizeToolAliasKey(identifier));
+        },
+    };
+}
+
+let runtimeToolAliasResolver: ToolAliasResolver | undefined;
+
+function getRuntimeToolAliasResolver(): ToolAliasResolver {
+    runtimeToolAliasResolver ??= buildRuntimeToolAliasResolver();
+    return runtimeToolAliasResolver;
 }
 
 function labelFromWorkspaceFolder(folder: any, workspaceFilePath: string): string | undefined {
@@ -245,6 +462,7 @@ function labelFromWorkspaceFolder(folder: any, workspaceFilePath: string): strin
     return undefined;
 }
 
+// Read a .code-workspace file and summarize its visible folder label.
 function readWorkspaceFileLabel(workspaceFilePath: string | undefined): string | undefined {
     if (!workspaceFilePath || !fs.existsSync(workspaceFilePath)) {
         return undefined;
@@ -271,6 +489,7 @@ function readWorkspaceFileLabel(workspaceFilePath: string | undefined): string |
     return undefined;
 }
 
+// Cache and resolve the display label for a workspace storage directory.
 function resolveWorkspaceStorageLabel(workspaceStorageDir: string): string {
     const cached = workspaceLabelCache.get(workspaceStorageDir);
     if (cached) {
@@ -303,6 +522,7 @@ function resolveWorkspaceStorageLabel(workspaceStorageDir: string): string {
     return resolved;
 }
 
+// Build a stable chat-session entry from the on-disk directory layout.
 function chatSessionDirEntry(dir: string): ChatSessionDirEntry {
     const resolvedDir = path.resolve(dir);
     const base = path.basename(resolvedDir);
@@ -331,6 +551,7 @@ function chatSessionDirEntry(dir: string): ChatSessionDirEntry {
     };
 }
 
+// Add a session directory to the deduplicated result set.
 function addChatSessionDir(results: Map<string, ChatSessionDirEntry>, dir: string): void {
     const entry = chatSessionDirEntry(dir);
     if (!results.has(entry.dir)) {
@@ -338,6 +559,7 @@ function addChatSessionDir(results: Map<string, ChatSessionDirEntry>, dir: strin
     }
 }
 
+// Find all known chat session roots, honoring cache and user search roots.
 function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
     if (!refresh && chatSessionDirsCache && chatSessionDirsCache.expiresAt > Date.now()) {
         return chatSessionDirsCache.dirs;
@@ -384,6 +606,7 @@ function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
 
 type SpendScanMode = 'today' | 'full';
 
+// Compute spend totals for either the daily or full history view.
 function computeSpendSummary(mode: SpendScanMode, refresh = false, cacheFilePath?: string): SpendSummary {
     const cache = mode === 'full' ? fullSpendSummaryCache : todaySpendSummaryCache;
     if (!refresh && cache && cache.expiresAt > Date.now()) {
@@ -391,6 +614,7 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false, cacheFilePath
     }
 
     const summary = computeSpendSummaryFromChatSessionDirs(mode, findAllChatSessionDirs(refresh), { cacheFilePath });
+// Keep the newest candidate for each session id.
 
     const cacheEntry = { summary, expiresAt: Date.now() + SPEND_SCAN_CACHE_MS };
     if (mode === 'full') {
@@ -424,10 +648,12 @@ function rememberSessionCandidate(candidate: SessionCandidate): void {
     }
 }
 
+// Clear cached session titles after a refresh or data change.
 function invalidateTitleCache(): void {
     titleCache.clear();
 }
 
+// Read a window from the start or end of a file without loading it entirely.
 function readFileWindow(filePath: string, maxBytes: number, fromEnd = false): string | undefined {
     try {
         const stat = fs.statSync(filePath);
@@ -443,6 +669,7 @@ function readFileWindow(filePath: string, maxBytes: number, fromEnd = false): st
     }
 }
 
+// Pull a manually generated custom title from raw chat session JSONL.
 function extractCustomTitle(content: string): string | undefined {
     let searchFrom = content.length;
     while (searchFrom > 0) {
@@ -471,6 +698,7 @@ function extractCustomTitle(content: string): string | undefined {
     return undefined;
 }
 
+// Prefer the title stored in chatSessions metadata, then fall back to debug logs.
 function readChatSessionTitle(filePath: string): string | undefined {
     const tail = readFileWindow(filePath, TITLE_CHAT_TAIL_BYTES, true);
     const fromTail = tail ? extractCustomTitle(tail) : undefined;
@@ -480,6 +708,7 @@ function readChatSessionTitle(filePath: string): string | undefined {
     return head ? extractCustomTitle(head) : undefined;
 }
 
+// Extract a string-valued JSON property near a known occurrence.
 function extractJsonStringProperty(content: string, propertyName: string, startIndex: number): string | undefined {
     const afterIndex = content.slice(startIndex);
     const escapedName = propertyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -496,6 +725,7 @@ function extractJsonStringProperty(content: string, propertyName: string, startI
     }
 }
 
+// Infer a readable title from the early lines of a debug log file.
 function readDebugLogTitle(filePath: string): TitleEntry | undefined {
     const chunk = readFileWindow(filePath, TITLE_DEBUG_HEAD_BYTES);
     if (!chunk) { return undefined; }
@@ -525,6 +755,7 @@ function readDebugLogTitle(filePath: string): TitleEntry | undefined {
     return fallback;
 }
 
+// Resolve the final session title using the strongest available source.
 function resolveSessionTitle(sessionId: string, candidate = sessionCandidateById.get(sessionId)): string | undefined {
     const cached = titleCache.get(sessionId);
     if (cached) { return cached.title; }
@@ -548,6 +779,7 @@ function resolveSessionTitle(sessionId: string, candidate = sessionCandidateById
     return resolved?.title;
 }
 
+// Enumerate all debug-log roots known to the current environment.
 function findAllDebugLogDirs(refresh = false): string[] {
     if (!refresh && debugLogDirsCache && debugLogDirsCache.expiresAt > Date.now()) {
         return debugLogDirsCache.dirs;
@@ -583,6 +815,7 @@ function findAllDebugLogDirs(refresh = false): string[] {
     return dirs;
 }
 
+// Scan one debug-log directory for session candidates.
 function scanSessionsInDir(debugLogsDir: string, options: { modifiedSince?: number } = {}): SessionScanResult {
     const sessions: SessionCandidate[] = [];
     let hasOlder = false;
@@ -630,14 +863,17 @@ function scanSessionsInDir(debugLogsDir: string, options: { modifiedSince?: numb
     return { sessions, hasOlder };
 }
 
+// Convenience wrapper that returns only the sessions from a directory scan.
 function findSessionsInDir(debugLogsDir: string): SessionCandidate[] {
     return scanSessionsInDir(debugLogsDir).sessions;
 }
 
+// Derive a user-facing workspace label from a debug-log directory path.
 function getWorkspaceLabelForDebugDir(debugLogsDir: string): string {
     return path.basename(path.dirname(path.dirname(debugLogsDir)));
 }
 
+// Resolve the current workspace's debug-log directory, if one is active.
 function getCurrentWorkspaceDebugDir(context: vscode.ExtensionContext): string | undefined {
     if (!context.storageUri) { return undefined; }
 
@@ -648,6 +884,7 @@ function getCurrentWorkspaceDebugDir(context: vscode.ExtensionContext): string |
     return fs.existsSync(candidate) ? candidate : undefined;
 }
 
+// Scan every available debug-log root and return sessions newer than a cutoff.
 function findSessionsForDays(daysBack?: number): SessionScanResult<SessionCandidate & { wsDir: string }> {
     const modifiedSince = daysBack === undefined
         ? undefined
@@ -671,6 +908,7 @@ function findSessionsForDays(daysBack?: number): SessionScanResult<SessionCandid
     return { sessions, hasOlder };
 }
 
+// Safely probe whether a file still contains billing metadata.
 function safeQuickPeekHasBillingData(file: string): boolean {
     try {
         return quickPeekHasBillingData(file);
@@ -679,10 +917,12 @@ function safeQuickPeekHasBillingData(file: string): boolean {
     }
 }
 
+// Apply the best resolved title back onto a parsed session summary.
 function applyResolvedTitle(summary: SessionSummary, candidate?: SessionCandidate): void {
     summary.title = resolveSessionTitle(summary.sessionId, candidate) || summary.title;
 }
 
+// Parse a session file and attach a resolved title when available.
 function parseSessionCandidate(candidate: SessionCandidate) {
     const parsed = parseCopilotSessionFile(candidate.mainJsonl);
     if (parsed) {
@@ -708,7 +948,7 @@ type TreeItemData =
     | { kind: 'userMessage'; message: UserMessageSummary; index: number }
     | { kind: 'turnsGroup'; message: UserMessageSummary; msgIndex: number }
     | { kind: 'modelTurn'; turn: ModelTurnSummary; msgIndex: number; turnIndex: number }
-    | { kind: 'turnToolCall'; call: ToolCallSummary }
+    | { kind: 'turnToolCall'; call: ToolCallSummary; turn: ModelTurnSummary }
     | { kind: 'subagentTurn'; turn: ModelTurnSummary; turnIndex: number }
     | { kind: 'mergedInfo'; message: UserMessageSummary; msgIndex: number }
     | { kind: 'mergedItem'; info: MergedMessageInfo }
@@ -722,23 +962,27 @@ type TreeItemData =
     | { kind: 'stat'; label: string; value: string };
 
 /** Count how many times each tool was called in a message (by name) */
+// Aggregate tool call counts for a single message turn tree.
 function getToolUsageCounts(message: UserMessageSummary): Map<string, number> {
     const counts = new Map<string, number>();
     for (const turn of message.modelTurns) {
         for (const tc of turn.toolCalls) {
-            counts.set(tc.name, (counts.get(tc.name) || 0) + 1);
+            const identifier = canonicalizeToolIdentifier(tc, getRuntimeToolAliasResolver());
+            counts.set(identifier, (counts.get(identifier) || 0) + 1);
         }
     }
     return counts;
 }
 
 /** Count tool usage across entire session */
+// Aggregate tool call counts across the whole session tree.
 function getSessionToolUsageCounts(summary: SessionSummary): Map<string, number> {
     const counts = new Map<string, number>();
     for (const msg of summary.userMessages) {
         for (const turn of msg.modelTurns) {
             for (const tc of turn.toolCalls) {
-                counts.set(tc.name, (counts.get(tc.name) || 0) + 1);
+                const identifier = canonicalizeToolIdentifier(tc, getRuntimeToolAliasResolver());
+                counts.set(identifier, (counts.get(identifier) || 0) + 1);
             }
         }
     }
@@ -746,6 +990,7 @@ function getSessionToolUsageCounts(summary: SessionSummary): Map<string, number>
 }
 
 /** Extract terminal command names from tool calls (groups "Ran: xxx ..." by the executable) */
+// Group terminal tool calls by executable name for the message view.
 function getCommandGroups(message: UserMessageSummary): { name: string; count: number }[] {
     const counts = new Map<string, number>();
     for (const turn of message.modelTurns) {
@@ -764,6 +1009,7 @@ function getCommandGroups(message: UserMessageSummary): { name: string; count: n
 }
 
 /** Get command groups for entire session */
+// Group terminal tool calls by executable name for the session view.
 function getSessionCommandGroups(summary: SessionSummary): { name: string; count: number }[] {
     const counts = new Map<string, number>();
     for (const msg of summary.userMessages) {
@@ -783,6 +1029,7 @@ function getSessionCommandGroups(summary: SessionSummary): { name: string; count
         .sort((a, b) => b.count - a.count);
 }
 
+// Pull the executable name out of a displayed terminal command label.
 function extractCommandName(displayLabel: string): string | undefined {
     const match = displayLabel.match(/^Ran:\s*(?:cd\s+[^;]+;\s*)?(.+)/);
     if (!match) { return undefined; }
@@ -798,6 +1045,234 @@ function extractCommandName(displayLabel: string): string | undefined {
     return exe;
 }
 
+interface UsageRevealTarget {
+    sessionId: string;
+    sourceFile?: string;
+    sourceLine?: number;
+    timestamp: number;
+    kind: TreeItemData['kind'];
+    spanId?: string;
+    parentSpanId?: string;
+    responseId?: string;
+    toolCallId?: string;
+    messageIndex?: number;
+    turnIndex?: number;
+    label?: string;
+}
+
+// Build a source location hint from a parsed debug reference.
+function targetFromDebugRef(kind: TreeItemData['kind'], debugRef: DebugSourceRef | undefined, extra?: Partial<UsageRevealTarget>): UsageRevealTarget | undefined {
+    if (!debugRef) { return undefined; }
+    return {
+        sessionId: debugRef.sessionId,
+        sourceFile: debugRef.sourceFile,
+        sourceLine: debugRef.sourceLine,
+        timestamp: debugRef.timestamp,
+        kind,
+        spanId: debugRef.spanId,
+        parentSpanId: debugRef.parentSpanId,
+        responseId: debugRef.responseId,
+        toolCallId: debugRef.toolCallId,
+        ...extra,
+    };
+}
+
+// Attach a debug-log reveal command to a tree item when possible.
+function makeRevealTarget(element: TreeItemData): UsageRevealTarget | undefined {
+    switch (element.kind) {
+        case 'userMessage':
+            return targetFromDebugRef('userMessage', element.message.debugRef, {
+                messageIndex: element.index,
+                label: element.message.content,
+            });
+        case 'modelTurn':
+            return targetFromDebugRef('modelTurn', element.turn.debugRef, {
+                messageIndex: element.msgIndex,
+                turnIndex: element.turnIndex,
+                label: element.turn.debugName,
+            });
+        case 'turnToolCall':
+            return targetFromDebugRef('turnToolCall', element.call.debugRef, {
+                toolCallId: element.call.toolCallId,
+                label: element.call.displayLabel,
+            });
+        case 'mergedItem':
+            return targetFromDebugRef('mergedItem', element.info.debugRef, {
+                label: element.info.content,
+            });
+        default:
+            return undefined;
+    }
+}
+
+// Wire the reveal command onto a tree item.
+function attachRevealCommand(item: vscode.TreeItem, element: TreeItemData): void {
+    const target = makeRevealTarget(element);
+    if (!target) { return; }
+    item.command = {
+        command: 'copilotUsageTracker.revealInAgentDebugLogs',
+        title: 'Reveal in Agent Debug Logs',
+        arguments: [target],
+    };
+}
+
+// Collect unique tool identifiers from a turn for clipboard output.
+function collectUsedToolIdentifiers(turn: ModelTurnSummary): string[] {
+    const identifiers: string[] = [];
+    const seen = new Set<string>();
+
+    for (const toolCall of turn.toolCalls) {
+        const identifier = canonicalizeToolIdentifier(toolCall, getRuntimeToolAliasResolver());
+        if (!identifier || seen.has(identifier)) {
+            continue;
+        }
+
+        seen.add(identifier);
+        identifiers.push(identifier);
+    }
+
+    return identifiers;
+}
+
+// Read used tool identifiers from whichever tree node the user clicked.
+function getUsedToolIdentifiersFromElement(element: TreeItemData): string[] {
+    switch (element.kind) {
+        case 'turnToolCall':
+            return collectUsedToolIdentifiers(element.turn);
+        case 'modelTurn':
+            return collectUsedToolIdentifiers(element.turn);
+        case 'subagentTurn':
+            return collectUsedToolIdentifiers(element.turn);
+        case 'toolDefinitions':
+            return element.definitions
+                .map(def => canonicalizeToolIdentifier(def.name, getRuntimeToolAliasResolver()))
+                .filter(name => (element.usageCounts.get(name) || 0) > 0);
+        case 'toolDef':
+            return element.usageCount > 0 ? [canonicalizeToolIdentifier(element.def.name, getRuntimeToolAliasResolver())] : [];
+        default:
+            return [];
+    }
+}
+
+// Copy the relevant used-tool fragment for the selected tree node.
+async function copyUsedToolsFromContext(arg: unknown, treeProvider?: UsageTreeProvider): Promise<void> {
+    const toolIdentifiers = (() => {
+        if (!arg) {
+            return [];
+        }
+
+        if (arg && typeof arg === 'object') {
+            if ('toolCalls' in arg && Array.isArray((arg as any).toolCalls)) {
+                return collectUsedToolIdentifiers(arg as ModelTurnSummary);
+            }
+            if ('kind' in arg && typeof (arg as any).kind === 'string') {
+                return getUsedToolIdentifiersFromElement(arg as TreeItemData);
+            }
+            if (arg instanceof vscode.TreeItem) {
+                const element = treeProvider?.getDataForTreeItem(arg);
+                return element ? getUsedToolIdentifiersFromElement(element) : [];
+            }
+            if ('contextValue' in arg && typeof (arg as any).contextValue === 'string') {
+                const contextValue = (arg as { contextValue?: string }).contextValue;
+                if (contextValue === 'toolDefinitions' || contextValue === 'toolDef' || contextValue === 'turnToolCall' || contextValue === 'failedToolCall') {
+                    return [];
+                }
+            }
+        }
+
+        return [];
+    })();
+
+    if (toolIdentifiers.length === 0) {
+        vscode.window.showInformationMessage('Copilot Usage: no used tools were found for this item.');
+        return;
+    }
+
+    await vscode.env.clipboard.writeText(formatUsedToolsFragment(toolIdentifiers));
+    vscode.window.setStatusBarMessage(`Copilot Usage: copied ${toolIdentifiers.length} used tools to clipboard`, 4000);
+}
+
+// Parse timestamps from a loose JSONL event shape.
+function parseLineTimestamp(raw: any): number | undefined {
+    const candidates = [raw?.ts, raw?.timestamp, raw?.time, raw?.attrs?.ts, raw?.attrs?.timestamp];
+    for (const value of candidates) {
+        if (typeof value === 'number' && Number.isFinite(value)) { return value; }
+        if (typeof value === 'string') {
+            const numeric = Number(value);
+            if (Number.isFinite(numeric)) { return numeric; }
+            const parsed = Date.parse(value);
+            if (Number.isFinite(parsed)) { return parsed; }
+        }
+    }
+    return undefined;
+}
+
+// Match a JSONL line against a selected debug reveal target.
+function lineMatchesRevealTarget(raw: any, target: UsageRevealTarget): boolean {
+    const attrs = raw?.attrs || {};
+    if (target.toolCallId) {
+        if (raw?.toolCallId === target.toolCallId || attrs.toolCallId === target.toolCallId) { return true; }
+        if (Array.isArray(raw?.toolCalls) && raw.toolCalls.some((tc: any) => tc?.toolCallId === target.toolCallId || tc?.id === target.toolCallId)) { return true; }
+        if (Array.isArray(raw?.tools) && raw.tools.some((tc: any) => tc?.toolCallId === target.toolCallId || tc?.id === target.toolCallId)) { return true; }
+    }
+    if (target.responseId && (raw?.responseId === target.responseId || attrs.responseId === target.responseId)) { return true; }
+    if (target.spanId && (raw?.spanId === target.spanId || raw?.spanID === target.spanId || raw?.id === target.spanId || attrs.spanId === target.spanId)) { return true; }
+    if (target.parentSpanId && (raw?.parentSpanId === target.parentSpanId || raw?.parentSpanID === target.parentSpanId || attrs.parentSpanId === target.parentSpanId)) { return true; }
+    return false;
+}
+
+// Find the best line number to reveal in a JSONL file.
+function findBestLineInJsonl(filePath: string, target: UsageRevealTarget): number | undefined {
+    if (target.sourceLine && target.sourceLine > 0) {
+        return target.sourceLine;
+    }
+    if (!fs.existsSync(filePath)) { return undefined; }
+
+    const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
+    let bestTimestampLine: number | undefined;
+    let bestTimestampDelta = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) { continue; }
+        let raw: any;
+        try { raw = JSON.parse(line); } catch { continue; }
+        if (lineMatchesRevealTarget(raw, target)) { return i + 1; }
+        const ts = parseLineTimestamp(raw);
+        if (ts !== undefined && Number.isFinite(target.timestamp)) {
+            const delta = Math.abs(ts - target.timestamp);
+            if (delta < bestTimestampDelta) {
+                bestTimestampDelta = delta;
+                bestTimestampLine = i + 1;
+            }
+        }
+    }
+    return bestTimestampDelta <= 10_000 ? bestTimestampLine : undefined;
+}
+
+// Open a debug log at the resolved line and center it in the editor.
+async function openSourceAtLine(filePath: string, lineNumber: number | undefined, target: UsageRevealTarget): Promise<void> {
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+    const editor = await vscode.window.showTextDocument(doc, { preview: false });
+    const zeroBasedLine = Math.max(0, (lineNumber || 1) - 1);
+    const range = new vscode.Range(zeroBasedLine, 0, zeroBasedLine, 0);
+    editor.selection = new vscode.Selection(range.start, range.start);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+    const label = target.label ? `: ${target.label}` : '';
+    vscode.window.setStatusBarMessage(`Copilot Usage: revealed debug log line ${zeroBasedLine + 1}${label}`, 5000);
+}
+
+// Jump from the tree view back to the originating debug log.
+async function revealInAgentDebugLogs(target: UsageRevealTarget): Promise<void> {
+    if (!target.sourceFile || !fs.existsSync(target.sourceFile)) {
+        vscode.window.showWarningMessage('Copilot Usage: no source debug log file found for this Usage item.');
+        return;
+    }
+    const line = findBestLineInJsonl(target.sourceFile, target);
+    await openSourceAtLine(target.sourceFile, line, target);
+}
+
+// Render a compact visual meter for message spend.
 function formatMessageCostMeter(nanoAiu: number): string {
     const aic = nanoAiu / NANO_AIU_PER_AIC;
     if (aic >= 2000) {
@@ -807,9 +1282,10 @@ function formatMessageCostMeter(nanoAiu: number): string {
 
     const filledSquares = aic >= 1400 ? 5 : aic >= 800 ? 4 : aic >= 300 ? 3 : aic >= 100 ? 2 : 1;
     return '■'.repeat(filledSquares) + '□'.repeat(5 - filledSquares);
-}
+    }
 
-class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
+    // Translate parsed session summaries into the tree view structure.
+    class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private _onDidChangeTreeData = new vscode.EventEmitter<TreeItemData | undefined | void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -819,6 +1295,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
     private spendHistoryRequested = false;
     private requestFullSpendSummary: (() => void) | undefined;
     private debugLogsEnabled = isDebugLogsSettingEnabled();
+    private treeItemDataById = new Map<string, TreeItemData>();
+    private nextTreeItemId = 0;
 
     setSummary(summary: SessionSummary | undefined) {
         this.summary = summary;
@@ -861,11 +1339,20 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
         this._onDidChangeTreeData.fire();
     }
 
+    getDataForTreeItem(item: vscode.TreeItem): TreeItemData | undefined {
+        return item.id ? this.treeItemDataById.get(item.id) : undefined;
+    }
+
     getTreeItem(element: TreeItemData): vscode.TreeItem {
+        const item = new vscode.TreeItem('');
+        item.id = `${this.nextTreeItemId++}`;
+        this.treeItemDataById.set(item.id, element);
+
         switch (element.kind) {
             case 'spendSummary': {
                 const s = element.summary;
-                const item = new vscode.TreeItem('Spend Summary', vscode.TreeItemCollapsibleState.Collapsed);
+                item.label = 'Spend Summary';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
                     : `today ${formatAic(s.today.nanoAiu)} AIC | ${formatUsdEstimate(s.today.nanoAiu)}`;
@@ -875,10 +1362,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             }
             case 'spendBucket': {
                 const b = element.bucket;
-                const item = new vscode.TreeItem(
-                    b.label,
-                    b.workspaces || b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = b.label;
+                item.collapsibleState = b.workspaces || b.models ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 item.description = this.spendRefreshMode
                     ? 'refreshing...'
                     : `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | in:${formatNumber(b.inputTokens)} out:${formatNumber(b.outputTokens)}`;
@@ -934,7 +1419,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             }
             case 'spendModelBucket': {
                 const b = element.bucket;
-                const item = new vscode.TreeItem(b.label, vscode.TreeItemCollapsibleState.None);
+                item.label = b.label;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = `${formatAic(b.nanoAiu)} AIC | ${formatUsdEstimate(b.nanoAiu)} | ${b.requestCount} req`;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
                 item.tooltip = [
@@ -947,19 +1433,22 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 return item;
             }
             case 'spendModelEmpty': {
-                const item = new vscode.TreeItem('No model usage', vscode.TreeItemCollapsibleState.None);
+                item.label = 'No billed models';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = 'none found';
                 item.iconPath = new vscode.ThemeIcon('circle-slash');
                 return item;
             }
             case 'spendLastRefresh': {
-                const item = new vscode.TreeItem('Last refreshed', vscode.TreeItemCollapsibleState.None);
+                item.label = 'Last refreshed';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = formatLocalDateTime(element.timestamp);
                 item.iconPath = new vscode.ThemeIcon('clock');
                 return item;
             }
             case 'spendLoading': {
-                const item = new vscode.TreeItem('Loading spend history...', vscode.TreeItemCollapsibleState.None);
+                item.label = 'Loading spend history...';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = 'refreshing...';
                 item.iconPath = new vscode.ThemeIcon('sync~spin');
                 return item;
@@ -967,10 +1456,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
             case 'session': {
                 const s = element.summary;
                 const titleDisplay = s.title || s.sessionId.slice(0, 8) + '...';
-                const item = new vscode.TreeItem(
-                    titleDisplay,
-                    vscode.TreeItemCollapsibleState.Expanded
-                );
+                item.label = titleDisplay;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
                 item.description = `${formatAic(s.totalNanoAiu)} AIC | ${formatNumber(s.totalTokens)} tokens | ${s.userMessages.length} messages`;
                 item.iconPath = new vscode.ThemeIcon('graph');
                 item.tooltip = [
@@ -995,12 +1482,16 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 // Fixed-width label: pad/truncate to 28 chars so descriptions align
                 const rawPreview = (m.content || '(empty)') + mergedNote;
                 const label = rawPreview.length > 28 ? rawPreview.slice(0, 27) + '…' : rawPreview.padEnd(28);
-                const item = new vscode.TreeItem(
-                    `${element.index + 1}: ${label}`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `${element.index + 1}: ${label}`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = `${formatAic(m.totalNanoAiu)} AIC  ${m.modelTurns.length} turns  ${meter}`;
-                item.iconPath = new vscode.ThemeIcon('comment');
+                if (m.failure?.isFailure) {
+                    item.description = `FAILED | ${item.description}`;
+                    item.iconPath = new vscode.ThemeIcon('error');
+                    item.contextValue = 'failedUserMessage';
+                } else {
+                    item.iconPath = new vscode.ThemeIcon('comment');
+                }
                 item.tooltip = [
                     `User Message ${element.index + 1}`,
                     `"${m.content}"`,
@@ -1015,15 +1506,14 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `Tool Calls: ${m.toolCalls.length}`,
                     `LLM Time: ${formatDuration(m.totalDurationMs)}`,
                 ].filter(Boolean).join('\n');
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'turnsGroup': {
                 const m = element.message;
                 const totalTools = m.modelTurns.reduce((s, t) => s + t.toolCalls.length, 0);
-                const item = new vscode.TreeItem(
-                    `${m.modelTurns.length} turns`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `${m.modelTurns.length} turns`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = `${totalTools} tool calls | ${formatDuration(m.totalDurationMs)}`;
                 item.iconPath = new vscode.ThemeIcon('layers');
                 return item;
@@ -1048,12 +1538,16 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     turnIcon = new vscode.ThemeIcon('layers');
                 }
 
-                const item = new vscode.TreeItem(
-                    turnLabel,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = turnLabel;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = `${formatAic(t.nanoAiu)} AIC | in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)}${cacheNote}`;
-                item.iconPath = turnIcon;
+                if (t.failure?.isFailure) {
+                    item.description = `FAILED | ${item.description}`;
+                    item.iconPath = new vscode.ThemeIcon('error');
+                    item.contextValue = 'failedModelTurn';
+                } else {
+                    item.iconPath = turnIcon;
+                }
                 item.tooltip = [
                     `Model: ${t.model}`,
                     `Request: ${t.debugName}`,
@@ -1067,15 +1561,14 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     `Tool Calls: ${t.toolCalls.length}`,
                     t.toolCalls.length > 0 ? `  ${t.toolCalls.map(tc => tc.name).join(', ')}` : '',
                 ].filter(Boolean).join('\n');
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'turnToolCall': {
                 const c = element.call;
                 const hasChildren = c.isSubagent && c.subagentSummary;
-                const item = new vscode.TreeItem(
-                    c.displayLabel,
-                    hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = c.displayLabel;
+                item.collapsibleState = hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 const descriptionParts: string[] = [];
                 if (c.durationMs > 0) {
                     descriptionParts.push(formatDuration(c.durationMs));
@@ -1104,6 +1597,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 item.description = descriptionParts.join(' | ');
                 item.tooltip = [
                     `Tool: ${c.name}`,
+                    c.failure?.isFailure ? `Failure: ${c.failure.reason || c.failure.normalizedKey || 'failed tool call'}` : undefined,
+                    c.status ? `Status: ${c.status}` : undefined,
                     c.toolKind ? `Kind: ${c.toolKind}` : undefined,
                     c.source ? `Source: ${c.source}` : undefined,
                     c.resultCount !== undefined ? `Results: ${formatNumber(c.resultCount)}` : undefined,
@@ -1111,53 +1606,66 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     c.subagentInProgress ? 'Subagent: in progress' : undefined,
                     `Label: ${c.displayLabel}`,
                 ].filter(Boolean).join('\n');
+                if (c.failure?.isFailure) {
+                    item.iconPath = new vscode.ThemeIcon('error');
+                    item.description = item.description ? `FAILED | ${item.description}` : 'FAILED';
+                    item.contextValue = 'failedToolCall';
+                } else if (c.isSubagent) {
+                    item.iconPath = new vscode.ThemeIcon('rocket');
+                    if (c.subagentSummary) {
+                        const subagentDescription = `${formatAic(c.subagentSummary.totalNanoAiu)} AIC | ${c.subagentSummary.modelTurnCount} turns`;
+                        item.description = item.description ? `${item.description} | ${subagentDescription}` : subagentDescription;
+                    }
+                } else {
+                    item.iconPath = new vscode.ThemeIcon('wrench');
+                }
+                item.contextValue = c.failure?.isFailure ? 'failedToolCall' : 'turnToolCall';
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'subagentTurn': {
                 const t = element.turn;
                 const toolNames = t.toolCalls.map(tc => tc.displayLabel || tc.name).slice(0, 3);
                 const toolPreview = toolNames.length > 0 ? toolNames.join(', ') : 'no tools';
-                const item = new vscode.TreeItem(
-                    `Turn ${element.turnIndex + 1}: ${t.model}`,
-                    t.toolCalls.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = `Turn ${element.turnIndex + 1}: ${t.model}`;
+                item.collapsibleState = t.toolCalls.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 item.description = `${formatAic(t.nanoAiu)} AIC | ${toolPreview}`;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
                 return item;
             }
             case 'mergedInfo': {
                 const m = element.message;
-                const item = new vscode.TreeItem(
-                    `Merged Continuations (${m.mergedMessages.length})`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `Merged Continuations (${m.mergedMessages.length})`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = 'system-triggered follow-ups';
                 item.iconPath = new vscode.ThemeIcon('git-merge');
                 return item;
             }
             case 'mergedItem': {
                 const info = element.info;
-                const item = new vscode.TreeItem(info.content, vscode.TreeItemCollapsibleState.None);
+                item.label = info.content;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.iconPath = new vscode.ThemeIcon('arrow-right');
                 item.tooltip = `SpanId: ${info.spanId}\nTimestamp: ${formatLocalTime(info.timestamp)}`;
+                attachRevealCommand(item, element);
                 return item;
             }
             case 'toolDefinitions': {
                 const defs = element.definitions;
                 const totalUsed = [...element.usageCounts.values()].reduce((s, c) => s + c, 0);
                 const uniqueUsed = element.usageCounts.size;
-                const item = new vscode.TreeItem(
-                    `Tools (${defs.length} available, ${uniqueUsed} used, ${totalUsed} calls)`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `Tools (${defs.length} available, ${uniqueUsed} used, ${totalUsed} calls)`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.description = element.label;
                 item.iconPath = new vscode.ThemeIcon('symbol-method');
+                item.contextValue = 'toolDefinitions';
                 return item;
             }
             case 'toolDef': {
                 const d = element.def;
                 const count = element.usageCount;
-                const item = new vscode.TreeItem(d.name, vscode.TreeItemCollapsibleState.None);
+                item.label = d.name;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 if (count > 0) {
                     item.description = `×${count} | ~${formatNumber(d.estimatedTokens)} tokens`;
                     item.iconPath = new vscode.ThemeIcon('check');
@@ -1165,14 +1673,13 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     item.description = `unused | ~${formatNumber(d.estimatedTokens)} tokens`;
                     item.iconPath = new vscode.ThemeIcon('circle-slash');
                 }
+                item.contextValue = 'toolDef';
                 return item;
             }
             case 'commandsGroup': {
                 const total = element.commands.reduce((s, c) => s + c.count, 0);
-                const item = new vscode.TreeItem(
-                    `Commands (${element.commands.length} executables, ${total} runs)`,
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = `Commands (${element.commands.length} executables, ${total} runs)`;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.iconPath = new vscode.ThemeIcon('terminal');
                 return item;
             }
@@ -1183,19 +1690,15 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 return item;
             }
             case 'insights': {
-                const item = new vscode.TreeItem(
-                    'Insights',
-                    vscode.TreeItemCollapsibleState.Collapsed
-                );
+                item.label = 'Insights';
+                item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
                 item.iconPath = new vscode.ThemeIcon('lightbulb');
                 item.description = 'tool usage analysis & command summary';
                 return item;
             }
             case 'insightGroup': {
-                const item = new vscode.TreeItem(
-                    element.label,
-                    element.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-                );
+                item.label = element.label;
+                item.collapsibleState = element.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None;
                 item.description = `${element.tools.length} tools`;
                 item.iconPath = new vscode.ThemeIcon('tag');
                 return item;
@@ -1209,7 +1712,8 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                 return item;
             }
             case 'stat': {
-                const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
+                item.label = element.label;
+                item.collapsibleState = vscode.TreeItemCollapsibleState.None;
                 item.description = element.value;
                 item.iconPath = new vscode.ThemeIcon('info');
                 if (element.label === 'Total Cost') {
@@ -1379,10 +1883,11 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     { kind: 'stat', label: 'Tokens', value: `in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)} cache:${formatNumber(t.cachedTokens)}` },
                     { kind: 'stat', label: 'Cache', value: `${cachePercent}% hit (${formatNumber(t.freshTokens)} fresh tokens)` },
                     { kind: 'stat', label: 'Duration / TTFT', value: `${formatDuration(t.durationMs)} / ${formatDuration(t.ttftMs)}` },
+                    { kind: 'stat', label: 'DateTime', value: `${new Date(t.timestamp).toLocaleString()}` },
                 ];
                 // Tool calls for this turn
                 for (const tc of t.toolCalls) {
-                    children.push({ kind: 'turnToolCall', call: tc });
+                    children.push({ kind: 'turnToolCall', call: tc, turn: t });
                 }
                 return children;
             }
@@ -1414,7 +1919,7 @@ class UsageTreeProvider implements vscode.TreeDataProvider<TreeItemData> {
                     { kind: 'stat', label: 'Tokens', value: `in:${formatNumber(t.inputTokens)} out:${formatNumber(t.outputTokens)} cache:${formatNumber(t.cachedTokens)}` },
                 ];
                 for (const tc of t.toolCalls) {
-                    children.push({ kind: 'turnToolCall', call: tc });
+                    children.push({ kind: 'turnToolCall', call: tc, turn: t });
                 }
                 return children;
             }
@@ -1511,6 +2016,7 @@ type SessionPickItem =
     | (vscode.QuickPickItem & { itemType: 'session'; session: SessionCandidate & { wsDir: string } })
     | (vscode.QuickPickItem & { itemType: 'loadMore' });
 
+// Identify the latest session for the active workspace, if one exists.
 function getCurrentWorkspaceLatestSessionId(context: vscode.ExtensionContext): string | undefined {
     const currentWsDebugDir = getCurrentWorkspaceDebugDir(context);
     if (!currentWsDebugDir) { return undefined; }
@@ -1519,6 +2025,7 @@ function getCurrentWorkspaceLatestSessionId(context: vscode.ExtensionContext): s
     return sessions[0]?.id;
 }
 
+// Build the quick-pick entries used for manual session selection.
 function createSessionPickItems(
     sessions: (SessionCandidate & { wsDir: string })[],
     currentWsSessionId: string | undefined,
@@ -1552,6 +2059,7 @@ function createSessionPickItems(
     return items;
 }
 
+// Initialize the tree view, session loading, and command registrations.
 export function activate(context: vscode.ExtensionContext) {
     const treeProvider = new UsageTreeProvider();
     const spendFileCachePath = getSpendFileCachePath(context.globalStorageUri?.fsPath);
@@ -1692,6 +2200,12 @@ export function activate(context: vscode.ExtensionContext) {
     }, resolveSessionTitle);
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('copilotUsageTracker.revealInAgentDebugLogs', async (target: UsageRevealTarget) => {
+            await revealInAgentDebugLogs(target);
+        }),
+        vscode.commands.registerCommand('copilotUsageTracker.copyUsedTools', async (arg: unknown) => {
+            await copyUsedToolsFromContext(arg, treeProvider);
+        }),
         vscode.commands.registerCommand('copilotUsageTracker.analyzeSession', () => {
             autoLoad();
             watchCurrentSession();
@@ -1812,4 +2326,5 @@ export function activate(context: vscode.ExtensionContext) {
     );
 }
 
+// No-op teardown hook for VS Code extension shutdown.
 export function deactivate() {}

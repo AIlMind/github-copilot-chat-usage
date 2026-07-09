@@ -32,6 +32,28 @@ export interface UserMessageAttrs {
     content?: string;
 }
 
+export interface DebugSourceRef {
+    sessionId: string;
+    sourceFile?: string;
+    sourceLine?: number;
+    timestamp: number;
+    type: 'user_message' | 'llm_request' | 'tool_call' | 'merged_message' | 'child_session_ref';
+    spanId?: string;
+    parentSpanId?: string;
+    turnId?: string;
+    responseId?: string;
+    toolCallId?: string;
+}
+
+export type FailureSeverity = 'info' | 'warning' | 'error';
+
+export interface FailureInfo {
+    isFailure: boolean;
+    severity: FailureSeverity;
+    reason?: string;
+    normalizedKey?: string;
+}
+
 export interface LogEntry {
     v?: number;
     ts: number;
@@ -47,14 +69,23 @@ export interface LogEntry {
         childLogFile?: string;
         childSessionId?: string;
         label?: string;
+        toolId?: string;
+        toolReferenceName?: string;
+        toolSetReferenceName?: string;
+        fullReferenceName?: string;
         systemPromptFile?: string;
         toolsFile?: string;
         inputMessages?: string;
     };
+    sourceFile?: string;
+    sourceLine?: number;
 }
 
 export interface ToolCallSummary {
     name: string;
+    toolId?: string;
+    toolReferenceName?: string;
+    fullReferenceName?: string;
     displayLabel: string; // e.g. "Ran: git clone...", "Search: chat debug"
     durationMs: number;
     timestamp: number;
@@ -64,6 +95,12 @@ export interface ToolCallSummary {
     toolKind?: string;
     resultCount?: number;
     toolCallId?: string;
+    parentSpanId?: string;
+    status?: string;
+    args?: string;
+    result?: string;
+    debugRef?: DebugSourceRef;
+    failure?: FailureInfo;
     subagentSummary?: SessionSummary; // populated if subagent log is parsed
     subagentInProgress?: boolean;
 }
@@ -85,12 +122,19 @@ export interface ModelTurnSummary {
     systemPromptFile?: string;
     toolsFile?: string;
     inputMessagesChars: number;
+    spanId?: string;
+    parentSpanId?: string;
+    status?: string;
+    responseId?: string;
+    debugRef?: DebugSourceRef;
+    failure?: FailureInfo;
 }
 
 export interface MergedMessageInfo {
     content: string;
     timestamp: number;
     spanId: string;
+    debugRef?: DebugSourceRef;
 }
 
 export interface UserMessageSummary {
@@ -98,6 +142,8 @@ export interface UserMessageSummary {
     content: string;
     timestamp: number;
     modelTurns: ModelTurnSummary[];
+    debugRef?: DebugSourceRef;
+    failure?: FailureInfo;
     toolCalls: ToolCallSummary[];
     mergedMessages: MergedMessageInfo[];
     totalInputTokens: number;
@@ -116,6 +162,7 @@ export interface SessionSummary {
     sessionId: string;
     title?: string;
     sourceType?: 'debugLog' | 'chatSession';
+    sourceFile?: string;
     inProgress?: boolean;
     userMessages: UserMessageSummary[];
     totalInputTokens: number;
@@ -139,6 +186,134 @@ export interface ToolDefinitionSize {
     name: string;
     chars: number;
     estimatedTokens: number;
+}
+
+// Canonical tool names come from VS Code's language model tools service:
+// - `IToolData.toolReferenceName` / `IToolData.legacyToolReferenceFullNames`
+// - `IToolSet.referenceName` / `IToolSet.legacyFullNames`
+// - `LanguageModelToolsService.getFullReferenceName*`, `getDeprecatedFullReferenceNames()`,
+//   `toToolReferences()` and `toFullReferenceNames()`
+// See:
+// - src/vs/workbench/contrib/chat/common/tools/languageModelToolsService.ts
+// - src/vs/workbench/contrib/chat/browser/tools/languageModelToolsService.ts
+// - src/vs/workbench/contrib/chat/browser/tools/toolSetsContribution.ts
+// - src/vs/workbench/contrib/chat/common/tools/languageModelToolsContribution.ts
+// - src/vs/platform/browserView/common/browserChatToolReferenceNames.ts
+export interface ToolAliasResolver {
+    resolve(identifier: string): string | undefined;
+}
+
+const DEFAULT_TOOL_IDENTIFIER_ALIASES: Record<string, string> = {
+    readfile: 'read/readFile',
+    readproblems: 'read/problems',
+    filesearch: 'search/fileSearch',
+    findfiles: 'search/fileSearch',
+    searchfiles: 'search/fileSearch',
+    grepsearch: 'search/textSearch',
+    textsearch: 'search/textSearch',
+    findtextinfiles: 'search/codebase',
+    codebasesearch: 'search/codebase',
+    runinterminal: 'execute/runInTerminal',
+    getterminaloutput: 'execute/getTerminalOutput',
+    listdir: 'browser',
+    browser: 'browser',
+};
+
+type ToolIdentifierLike = string | {
+    toolId?: unknown;
+    toolReferenceName?: unknown;
+    fullReferenceName?: unknown;
+    referenceName?: unknown;
+    toolSetReferenceName?: unknown;
+    name?: unknown;
+    displayLabel?: unknown;
+    source?: unknown;
+    toolKind?: unknown;
+};
+
+export function normalizeToolAliasKey(identifier: string): string {
+    return identifier
+        .trim()
+        .toLowerCase()
+        .replace(/^copilot[_-]/, '')
+        .replace(/[^a-z0-9]+/g, '');
+}
+
+function firstString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim();
+        }
+    }
+    return undefined;
+}
+
+function resolveToolAlias(identifier: string, resolver?: ToolAliasResolver): string | undefined {
+    if (!resolver) {
+        return undefined;
+    }
+
+    const trimmed = identifier.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+
+    return resolver.resolve(trimmed) || resolver.resolve(normalizeToolAliasKey(trimmed));
+}
+
+function canonicalizeToolIdentifierString(identifier: string, resolver?: ToolAliasResolver): string {
+    const trimmed = identifier.trim();
+    if (!trimmed) {
+        return trimmed;
+    }
+
+    const resolved = resolveToolAlias(trimmed, resolver);
+    if (resolved) {
+        return resolved.trim().replace(/[\r\n]+/g, ' ');
+    }
+
+    const directMatch = trimmed.match(/^[^\s]+$/);
+    if (trimmed.includes('/')) {
+        return trimmed;
+    }
+
+    const normalized = normalizeToolAliasKey(trimmed);
+    if (DEFAULT_TOOL_IDENTIFIER_ALIASES[normalized]) {
+        return DEFAULT_TOOL_IDENTIFIER_ALIASES[normalized];
+    }
+
+    return directMatch ? trimmed : trimmed.replace(/[\r\n]+/g, ' ').trim();
+}
+
+export function canonicalizeToolIdentifier(identifier: ToolIdentifierLike, resolver?: ToolAliasResolver): string {
+    if (typeof identifier === 'string') {
+        return canonicalizeToolIdentifierString(identifier, resolver);
+    }
+
+    const structured = firstString(
+        identifier.fullReferenceName,
+        identifier.referenceName,
+        identifier.toolReferenceName,
+        identifier.toolSetReferenceName ? `${identifier.toolSetReferenceName}/${firstString(identifier.toolReferenceName, identifier.toolId, identifier.name) ?? ''}`.replace(/\/$/, '') : undefined,
+        identifier.toolId,
+        identifier.name,
+        identifier.displayLabel,
+        typeof identifier.source === 'string' ? identifier.source : undefined,
+        typeof identifier.toolKind === 'string' ? identifier.toolKind : undefined,
+    );
+
+    return structured ? canonicalizeToolIdentifierString(structured, resolver) : '';
+}
+
+export function formatUsedToolsFragment(toolIdentifiers: string[]): string {
+    if (toolIdentifiers.length === 0) {
+        return 'tools: []';
+    }
+
+    return [
+        'tools:',
+        ...toolIdentifiers.map(identifier => `  - ${identifier}`),
+    ].join('\n');
 }
 
 export interface PromptComposition {
@@ -211,6 +386,172 @@ function getToolDisplayLabel(name: string, argsStr: string | undefined, fallback
     } catch {
         return fallbackLabel || name;
     }
+}
+
+const FAILURE_OK: FailureInfo = { isFailure: false, severity: 'info' };
+
+const COMMAND_NOT_FOUND_PATTERNS: RegExp[] = [
+    /not recognized as (?:the name of )?(?:a cmdlet|function|script file|operable program)/i,
+    /the term ['"`]?.+?['"`]? is not recognized/i,
+    /command not found/i,
+    /no such file or directory/i,
+    /ENOENT/i,
+    /exit code\s+(?:127|9009)\b/i,
+];
+
+function supportedDebugType(type: string): DebugSourceRef['type'] {
+    const supportedTypes = new Set<DebugSourceRef['type']>(['user_message', 'llm_request', 'tool_call', 'merged_message', 'child_session_ref']);
+    return supportedTypes.has(type as DebugSourceRef['type']) ? type as DebugSourceRef['type'] : 'tool_call';
+}
+
+function makeDebugSourceRef(entry: LogEntry): DebugSourceRef {
+    return {
+        sessionId: entry.sid,
+        sourceFile: entry.sourceFile,
+        sourceLine: entry.sourceLine,
+        timestamp: entry.ts,
+        type: supportedDebugType(entry.type),
+        spanId: entry.spanId,
+        parentSpanId: entry.parentSpanId,
+        turnId: entry.attrs.turnId,
+        responseId: entry.attrs.responseId,
+        toolCallId: entry.attrs.toolCallId,
+    };
+}
+
+function safeJsonParse(value: string | undefined): any | undefined {
+    if (!value) { return undefined; }
+    try { return JSON.parse(value); } catch { return undefined; }
+}
+
+export function extractCommandNameFromToolCall(call: Pick<ToolCallSummary, 'name' | 'args' | 'displayLabel'>): string | undefined {
+    if (call.name !== 'run_in_terminal') { return undefined; }
+
+    const args = safeJsonParse(call.args);
+    let command = typeof args?.command === 'string' ? args.command : undefined;
+
+    if (!command) {
+        const match = call.displayLabel.match(/^Ran:\s*(?:cd\s+[^;]+;\s*)?(.+)/);
+        command = match?.[1];
+    }
+
+    if (!command) { return undefined; }
+
+    let cmd = command.trim();
+    cmd = cmd.replace(/^cmd\s+\/c\s+/i, '');
+    cmd = cmd.replace(/^powershell(?:\.exe)?\s+-[^\s]+\s+/i, '');
+    cmd = cmd.replace(/^pwsh(?:\.exe)?\s+-[^\s]+\s+/i, '');
+
+    const assignMatch = cmd.match(/^\$\w+\s*=\s*(.+)/);
+    if (assignMatch) { cmd = assignMatch[1].trim(); }
+
+    const exe = cmd.split(/\s+/)[0]?.replace(/["'`]/g, '').trim();
+    if (!exe || exe.startsWith('$') || exe.startsWith('(') || exe.startsWith('{')) {
+        return undefined;
+    }
+
+    return exe;
+}
+
+export function classifyToolCallFailure(call: Pick<ToolCallSummary, 'name' | 'displayLabel' | 'status' | 'args' | 'result'>): FailureInfo {
+    const status = call.status || 'ok';
+    const result = call.result || '';
+    const displayLabel = call.displayLabel || '';
+    const args = call.args || '';
+    const haystack = `${status}\n${displayLabel}\n${args}\n${result}`;
+
+    if (call.name === 'run_in_terminal') {
+        const exe = extractCommandNameFromToolCall(call as ToolCallSummary);
+        const commandMissing = COMMAND_NOT_FOUND_PATTERNS.some(pattern => pattern.test(haystack));
+
+        if (commandMissing && exe) {
+            return {
+                isFailure: true,
+                severity: 'error',
+                reason: `Terminal command unavailable: ${exe}`,
+                normalizedKey: `missing-command:${exe.toLowerCase()}`,
+            };
+        }
+
+        if (exe?.toLowerCase() === 'rg' && /rg/i.test(haystack) && /not recognized|not found|ENOENT|127|9009/i.test(haystack)) {
+            return {
+                isFailure: true,
+                severity: 'error',
+                reason: 'Terminal command unavailable: rg',
+                normalizedKey: 'missing-command:rg',
+            };
+        }
+
+        if (/exit code\s+[1-9]\d*\b/i.test(haystack)) {
+            return {
+                isFailure: true,
+                severity: 'warning',
+                reason: exe ? `Terminal command exited non-zero: ${exe}` : 'Terminal command exited non-zero',
+                normalizedKey: exe ? `nonzero-command:${exe.toLowerCase()}` : 'nonzero-command',
+            };
+        }
+    }
+
+    if (status && !/^ok$/i.test(status)) {
+        return {
+            isFailure: true,
+            severity: /^pending$/i.test(status) ? 'warning' : 'error',
+            reason: `Tool status: ${status}`,
+            normalizedKey: `tool-status:${status.toLowerCase()}`,
+        };
+    }
+
+    return FAILURE_OK;
+}
+
+function classifyTurnFailure(turn: Pick<ModelTurnSummary, 'status' | 'toolCalls'>): FailureInfo {
+    if (turn.status && !/^ok$/i.test(turn.status)) {
+        return {
+            isFailure: true,
+            severity: /^pending$/i.test(turn.status) ? 'warning' : 'error',
+            reason: `Model turn status: ${turn.status}`,
+            normalizedKey: `turn-status:${turn.status.toLowerCase()}`,
+        };
+    }
+
+    const failedToolCalls = turn.toolCalls.filter(tc => tc.failure?.isFailure);
+    if (failedToolCalls.length === 0) {
+        return FAILURE_OK;
+    }
+
+    const firstFailure = failedToolCalls[0]?.failure;
+    const hasError = failedToolCalls.some(tc => tc.failure?.severity === 'error');
+    return {
+        isFailure: true,
+        severity: hasError ? 'error' : 'warning',
+        reason: failedToolCalls.length === 1 ? firstFailure?.reason || 'Failed tool call' : `${failedToolCalls.length} failed tool calls`,
+        normalizedKey: firstFailure?.normalizedKey,
+    };
+}
+
+function makeToolCallSummary(entry: LogEntry): ToolCallSummary {
+    const summary: ToolCallSummary = {
+        name: entry.name,
+        toolId: entry.attrs.toolId || entry.name,
+        toolReferenceName: entry.attrs.toolReferenceName,
+        fullReferenceName: entry.attrs.fullReferenceName,
+        displayLabel: getToolDisplayLabel(entry.name, entry.attrs.args, entry.attrs.displayLabel),
+        durationMs: entry.dur,
+        timestamp: entry.ts,
+        isSubagent: entry.name === 'runSubagent',
+        source: entry.attrs.source,
+        toolKind: entry.attrs.toolKind,
+        resultCount: entry.attrs.resultCount,
+        toolCallId: entry.attrs.toolCallId,
+        spanId: entry.spanId,
+        parentSpanId: entry.parentSpanId,
+        status: entry.status,
+        args: entry.attrs.args,
+        result: entry.attrs.result,
+        debugRef: makeDebugSourceRef(entry),
+    };
+    summary.failure = classifyToolCallFailure(summary);
+    return summary;
 }
 
 /** Patterns that indicate a system-generated continuation, not a real user message */
@@ -333,6 +674,10 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
             toolKind: firstDefined(rawAttrs.toolKind, raw.toolKind),
             resultCount: toNumber(firstDefined(rawAttrs.resultCount, raw.resultCount)),
             toolCallId: firstDefined(rawAttrs.toolCallId, raw.toolCallId),
+            toolId: firstDefined(rawAttrs.toolId, raw.toolId),
+            toolReferenceName: firstDefined(rawAttrs.toolReferenceName, raw.toolReferenceName),
+            toolSetReferenceName: firstDefined(rawAttrs.toolSetReferenceName, raw.toolSetReferenceName),
+            fullReferenceName: firstDefined(rawAttrs.fullReferenceName, raw.fullReferenceName),
         },
     };
 }
@@ -375,6 +720,10 @@ function normalizeParsedEntries(raw: any, index: number): LogEntry[] {
                 toolKind: firstDefined(tool.toolKind, tool.kind),
                 resultCount: toNumber(firstDefined(tool.resultCount, tool.resultDetails?.length)),
                 toolCallId: firstDefined(tool.toolCallId, tool.id),
+                toolId: firstDefined(tool.toolId, tool.toolName, tool.tool_name),
+                toolReferenceName: firstDefined(tool.toolReferenceName, tool.referenceName),
+                toolSetReferenceName: firstDefined(tool.toolSetReferenceName, tool.toolSet?.referenceName),
+                fullReferenceName: firstDefined(tool.fullReferenceName, tool.referenceName),
             },
         });
     });
@@ -440,6 +789,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
                 content: msgContent.slice(0, 80).replace(/[\r\n]+/g, ' '),
                 timestamp: group.msg.ts,
                 spanId: group.msg.spanId,
+                debugRef: makeDebugSourceRef(group.msg),
             });
         } else {
             mergedGroups.push({
@@ -474,8 +824,8 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
 
             const inputTk = r.attrs.inputTokens || 0;
             const cachedTk = r.attrs.cachedTokens || 0;
-
-            modelTurns.push({
+            const turnToolSummaries = allTurnTools.map(makeToolCallSummary);
+            const turnSummary: ModelTurnSummary = {
                 model: r.attrs.model || 'unknown',
                 inputTokens: inputTk,
                 outputTokens: r.attrs.outputTokens || 0,
@@ -491,33 +841,18 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
                 systemPromptFile: r.attrs.systemPromptFile,
                 toolsFile: r.attrs.toolsFile,
                 inputMessagesChars: (r.attrs.inputMessages || '').length,
-                toolCalls: allTurnTools.map(t => ({
-                    name: t.name,
-                    displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
-                    durationMs: t.dur,
-                    timestamp: t.ts,
-                    spanId: t.spanId,
-                    isSubagent: t.name === 'runSubagent',
-                    source: t.attrs.source,
-                    toolKind: t.attrs.toolKind,
-                    resultCount: t.attrs.resultCount,
-                    toolCallId: t.attrs.toolCallId,
-                })),
-            });
+                spanId: r.spanId,
+                parentSpanId: r.parentSpanId,
+                status: r.status,
+                responseId: r.attrs.responseId,
+                debugRef: makeDebugSourceRef(r),
+                toolCalls: turnToolSummaries,
+            };
+            turnSummary.failure = classifyTurnFailure(turnSummary);
+            modelTurns.push(turnSummary);
         }
 
-        const allToolCallSummaries: ToolCallSummary[] = group.allToolCalls.map(t => ({
-            name: t.name,
-            displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
-            durationMs: t.dur,
-            timestamp: t.ts,
-            spanId: t.spanId,
-            isSubagent: t.name === 'runSubagent',
-            source: t.attrs.source,
-            toolKind: t.attrs.toolKind,
-            resultCount: t.attrs.resultCount,
-            toolCallId: t.attrs.toolCallId,
-        }));
+        const allToolCallSummaries: ToolCallSummary[] = group.allToolCalls.map(makeToolCallSummary);
 
         const totalInput = modelTurns.reduce((s, t) => s + t.inputTokens, 0);
         const totalOutput = modelTurns.reduce((s, t) => s + t.outputTokens, 0);
@@ -527,6 +862,15 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         const totalDur = modelTurns.reduce((s, t) => s + t.durationMs, 0);
 
         const contentPreview = (group.primaryMsg.attrs.content || '').slice(0, 80).replace(/[\r\n]+/g, ' ');
+        const failedTurns = modelTurns.filter(t => t.failure?.isFailure);
+        const messageFailure: FailureInfo = failedTurns.length === 0
+            ? FAILURE_OK
+            : {
+                isFailure: true,
+                severity: failedTurns.some(t => t.failure?.severity === 'error') ? 'error' : 'warning',
+                reason: `${failedTurns.length} failed turn${failedTurns.length === 1 ? '' : 's'}`,
+                normalizedKey: failedTurns[0]?.failure?.normalizedKey,
+            };
 
         const firstTurn = modelTurns[0];
         messageSummaries.push({
@@ -534,6 +878,8 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             content: contentPreview,
             timestamp: group.primaryMsg.ts,
             modelTurns,
+            debugRef: makeDebugSourceRef(group.primaryMsg),
+            failure: messageFailure,
             toolCalls: allToolCallSummaries,
             mergedMessages: group.mergedMessages,
             totalInputTokens: totalInput,
@@ -991,6 +1337,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
     if (!summary) {
         return undefined;
     }
+    summary.sourceFile = filePath;
 
     summary.title = title || (typeof state.customTitle === 'string' ? state.customTitle : undefined);
     summary.sourceType = 'chatSession';
@@ -1214,16 +1561,21 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     }
 
     const content = fs.readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n').filter(l => l.trim());
+    const lines = content.split('\n');
     const entries: LogEntry[] = [];
 
-    for (const line of lines) {
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+        const line = lines[lineIndex];
+        if (!line.trim()) { continue; }
+
         try {
             const raw = JSON.parse(line);
             const normalizedEntries = normalizeParsedEntries(raw, entries.length);
 
             for (const entry of normalizedEntries) {
-                // Filter out title-generation LLM requests (internal Copilot calls)
+                entry.sourceFile = filePath;
+                entry.sourceLine = lineIndex + 1;
+
                 if (entry.type === 'llm_request' && isTitleGenerationRequest(entry)) {
                     continue;
                 }
@@ -1292,6 +1644,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     // Parse prompt composition from system_prompt and tools files
     summary.promptComposition = parsePromptComposition(sessionDir, entries);
     summary.sourceType = 'debugLog';
+    summary.sourceFile = filePath;
 
     return summary;
 }
@@ -1362,7 +1715,7 @@ export function readEntriesIncremental(filePath: string, fromOffset: number): { 
     fs.closeSync(fd);
 
     const chunk = buf.toString('utf-8');
-    const lines = chunk.split('\n').filter(l => l.trim());
+    const lines = chunk.split('\n');
     const entries: LogEntry[] = [];
 
     for (const line of lines) {
@@ -1371,6 +1724,7 @@ export function readEntriesIncremental(filePath: string, fromOffset: number): { 
             const normalizedEntries = normalizeParsedEntries(raw, entries.length);
 
             for (const entry of normalizedEntries) {
+                entry.sourceFile = filePath;
                 if (entry.type === 'llm_request' && isTitleGenerationRequest(entry)) {
                     continue;
                 }

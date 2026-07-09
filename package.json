@@ -31,6 +31,7 @@
   ],
   "activationEvents": [
     "onCommand:copilotUsageTracker.analyzeSession",
+    "onCommand:copilotUsageTracker.copyUsedTools",
     "onCommand:copilotUsageTracker.pickSession",
     "onCommand:copilotUsageTracker.refresh",
     "onView:copilotUsageTree",
@@ -44,6 +45,11 @@
       {
         "command": "copilotUsageTracker.analyzeSession",
         "title": "Copilot Usage: Analyze Current Session"
+      },
+      {
+        "command": "copilotUsageTracker.copyUsedTools",
+        "title": "Copy Used Tools",
+        "icon": "$(copy)"
       },
       {
         "command": "copilotUsageTracker.pickSession",
@@ -74,7 +80,7 @@
       "copilot-usage": [
         {
           "id": "copilotUsageTree",
-          "name": "Token Usage"
+          "name": "Token Usage (AZA)"
         }
       ]
     },
@@ -94,6 +100,18 @@
           "command": "copilotUsageTracker.refresh",
           "when": "view == copilotUsageTree",
           "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "copilotUsageTracker.copyUsedTools",
+          "when": "view == copilotUsageTree && viewItem =~ /^(toolDefinitions|toolDef|turnToolCall|failedToolCall)$/",
+          "group": "clipboard@1"
+        },
+        {
+          "command": "copilotUsageTracker.revealInAgentDebugLogs",
+          "when": "view == copilotUsageTree && viewItem =~ /^(turnToolCall|failedToolCall)$/",
+          "group": "navigation@1"
         }
       ]
     },
@@ -164,7 +182,7 @@
       }
     ],
     "configuration": {
-      "title": "Copilot Usage Tracker",
+      "title": "Copilot Usage Tracker (Aza)",
       "properties": {
         "copilotUsageTracker.searchRoots": {
           "type": "array",

@@ -43,6 +43,7 @@ export interface GraphTurn {
     index: number;
     model: string;
     debugName: string;
+    failure?: { isFailure: boolean; severity: 'info' | 'warning' | 'error'; reason?: string; normalizedKey?: string; };
     costAic: number;
     inputTokens: number;
     outputTokens: number;
@@ -73,6 +74,7 @@ export interface GraphSubagent {
 export interface GraphToolCall {
     name: string;
     displayLabel: string;
+    failure?: { isFailure: boolean; severity: 'info' | 'warning' | 'error'; reason?: string; normalizedKey?: string; };
     durationMs: number;
     isSubagent: boolean;
     source?: string;
@@ -397,6 +399,7 @@ export class SessionGraph {
             index,
             model: t.model,
             debugName: t.debugName,
+            failure: t.failure,
             costAic: t.nanoAiu / 1_000_000_000,
             inputTokens: t.inputTokens,
             outputTokens: t.outputTokens,
@@ -552,6 +555,7 @@ export class SessionGraph {
 
     private computeRisks(): RiskFlag[] {
         const risks: RiskFlag[] = [];
+        const repeatedFailures = new Map<string, { count: number; reason?: string; messageIndex: number; turnIndex: number; toolCall: string }>();
         const riskyPatterns: { pattern: RegExp; reason: string; severity: RiskFlag['severity'] }[] = [
             { pattern: /--force|--hard|--no-verify/i, reason: 'Force/unsafe flag used', severity: 'high' },
             { pattern: /rm\s+-rf|Remove-Item.*-Recurse/i, reason: 'Recursive delete', severity: 'high' },
@@ -566,6 +570,17 @@ export class SessionGraph {
             for (const turn of msg.turns) {
                 for (const tc of turn.toolCalls) {
                     if (tc.name === 'run_in_terminal') {
+                        const exe = extractExe(tc.displayLabel) || tc.name;
+                        if (tc.failure?.isFailure) {
+                            const existing = repeatedFailures.get(exe) || { count: 0, reason: tc.failure.reason || tc.failure.normalizedKey, messageIndex: msg.index, turnIndex: turn.index, toolCall: tc.displayLabel };
+                            repeatedFailures.set(exe, {
+                                count: existing.count + 1,
+                                reason: existing.reason || tc.failure.reason || tc.failure.normalizedKey,
+                                messageIndex: existing.messageIndex,
+                                turnIndex: existing.turnIndex,
+                                toolCall: existing.toolCall,
+                            });
+                        }
                         for (const { pattern, reason, severity } of riskyPatterns) {
                             if (pattern.test(tc.displayLabel)) {
                                 risks.push({
@@ -581,6 +596,19 @@ export class SessionGraph {
                 }
             }
         }
+
+        for (const [executable, entry] of repeatedFailures) {
+            if (entry.count >= 2) {
+                risks.push({
+                    messageIndex: entry.messageIndex,
+                    turnIndex: entry.turnIndex,
+                    toolCall: entry.toolCall,
+                    reason: `Repeated failed command attempts (${entry.count}x${entry.reason ? `: ${entry.reason}` : ''})`,
+                    severity: 'high',
+                });
+            }
+        }
+
         return risks;
     }
 }

@@ -10,6 +10,8 @@ const {
   formatAic,
   formatDuration,
   isSystemContinuation,
+  canonicalizeToolIdentifier,
+  formatUsedToolsFragment,
 } = require('../out/parser');
 const {
   computeSpendSummaryFromChatSessionDirs,
@@ -284,6 +286,141 @@ test('parseEntries - content preview truncated at 80 chars', () => {
 
   const result = parseEntries(entries);
   assertEqual(result.userMessages[0].content.length, 80, 'content truncated to 80');
+});
+
+test('canonicalizeToolIdentifier - maps legacy tool names to canonical tool ids', () => {
+  assertEqual(canonicalizeToolIdentifier('read_file'), 'read/readFile', 'read file mapping');
+  assertEqual(canonicalizeToolIdentifier('copilot_findTextInFiles'), 'search/codebase', 'codebase search mapping');
+  assertEqual(canonicalizeToolIdentifier('grep_search'), 'search/textSearch', 'text search mapping');
+  assertEqual(canonicalizeToolIdentifier('run_in_terminal'), 'execute/runInTerminal', 'terminal mapping');
+  assertEqual(
+    canonicalizeToolIdentifier({ toolId: 'my.extension/customTool', name: 'ignored' }),
+    'my.extension/customTool',
+    'preserves already qualified tool ids'
+  );
+  assertEqual(
+    canonicalizeToolIdentifier({ toolReferenceName: 'thirdPartyTool', toolId: 'extension-id/thirdPartyTool' }),
+    'thirdPartyTool',
+    'prefers explicit tool reference names'
+  );
+});
+
+test('canonicalizeToolIdentifier - prefers runtime resolver aliases', () => {
+  const resolver = {
+    resolve(identifier) {
+      if (identifier === 'github_text_search') {
+        return 'web/githubTextSearch';
+      }
+      return undefined;
+    }
+  };
+
+  assertEqual(
+    canonicalizeToolIdentifier('github_text_search', resolver),
+    'web/githubTextSearch',
+    'uses runtime alias resolver'
+  );
+});
+
+test('formatUsedToolsFragment - emits a pasteable YAML list', () => {
+  assertEqual(
+    formatUsedToolsFragment(['read/readFile', 'search/codebase']),
+    'tools:\n  - read/readFile\n  - search/codebase',
+    'yaml fragment format'
+  );
+});
+
+test('parseDebugLog - classifies missing rg command failures and preserves source refs', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-failure-'));
+  const fixture = path.join(tmpDir, 'main.jsonl');
+  const lines = [
+    JSON.stringify({
+      ts: 1000,
+      dur: 0,
+      sid: 'test-session',
+      type: 'user_message',
+      name: 'user_message',
+      spanId: 'msg-1',
+      status: 'ok',
+      attrs: { content: 'Run rg' },
+    }),
+    JSON.stringify({
+      ts: 1100,
+      dur: 300,
+      sid: 'test-session',
+      type: 'llm_request',
+      name: 'chat',
+      spanId: 'llm-1',
+      parentSpanId: 'msg-1',
+      status: 'ok',
+      attrs: {
+        model: 'gpt-4o',
+        debugName: 'chat',
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedTokens: 0,
+        copilotUsageNanoAiu: 100000000,
+        responseId: 'resp-1',
+      },
+    }),
+    JSON.stringify({
+      ts: 1200,
+      dur: 50,
+      sid: 'test-session',
+      type: 'tool_call',
+      name: 'run_in_terminal',
+      spanId: 'tool-1',
+      parentSpanId: 'llm-1',
+      status: 'error',
+      attrs: {
+        args: JSON.stringify({ command: 'rg foo' }),
+        result: 'The term \'rg\' is not recognized as the name of a cmdlet',
+        displayLabel: 'Ran: rg foo',
+        toolCallId: 'call-1',
+      },
+    }),
+  ].join('\n');
+
+  fs.writeFileSync(fixture, lines, 'utf8');
+
+  try {
+    const result = parseDebugLog(fixture);
+    assert(result !== undefined, 'summary should parse');
+    const msg = result.userMessages[0];
+    const turn = msg.modelTurns[0];
+    const tool = turn.toolCalls[0];
+
+    assert.strictEqual(tool.failure.isFailure, true, 'tool failure should be flagged');
+    assert.strictEqual(tool.failure.normalizedKey, 'missing-command:rg', 'tool failure key');
+    assert.strictEqual(turn.failure.isFailure, true, 'turn failure should propagate');
+    assert.strictEqual(msg.failure.isFailure, true, 'message failure should propagate');
+    assert.strictEqual(tool.debugRef.sourceFile, fixture, 'tool debugRef should preserve source file');
+    assert.strictEqual(tool.debugRef.sourceLine, 3, 'tool debugRef should preserve source line');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('parseDebugLog - leaves normal terminal output unflagged', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-usage-success-'));
+  const fixture = path.join(tmpDir, 'main.jsonl');
+  const lines = [
+    JSON.stringify({ ts: 1000, dur: 0, sid: 's', type: 'user_message', name: 'user_message', spanId: 'msg-1', attrs: { content: 'List files' } }),
+    JSON.stringify({ ts: 1100, dur: 100, sid: 's', type: 'llm_request', name: 'chat', spanId: 'llm-1', parentSpanId: 'msg-1', attrs: { model: 'gpt-4o', debugName: 'chat', inputTokens: 10, outputTokens: 5, copilotUsageNanoAiu: 100000000, responseId: 'resp-1' } }),
+    JSON.stringify({ ts: 1200, dur: 50, sid: 's', type: 'tool_call', name: 'run_in_terminal', spanId: 'tool-1', parentSpanId: 'llm-1', status: 'ok', attrs: { args: JSON.stringify({ command: 'dir' }), result: 'Volume in drive C is', displayLabel: 'Ran: dir', toolCallId: 'call-1' } }),
+  ].join('\n');
+
+  fs.writeFileSync(fixture, lines, 'utf8');
+
+  try {
+    const result = parseDebugLog(fixture);
+    const tool = result.userMessages[0].modelTurns[0].toolCalls[0];
+    assert.strictEqual(tool.failure.isFailure, false, 'tool should not fail');
+    assert.strictEqual(result.userMessages[0].modelTurns[0].failure.isFailure, false, 'turn should not fail');
+    assert.strictEqual(result.userMessages[0].failure.isFailure, false, 'message should not fail');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test('formatAic - converts nanoAiu to AIC string', () => {
