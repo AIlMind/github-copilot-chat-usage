@@ -73,12 +73,25 @@ let indexRoots = '';
 let indexExpiresAt = 0;
 let sdkIndex = new Map<string, string>();
 
+/** Metadata-only freshness check, before opening any database. */
+export function backgroundModifiedTime(file: string): number {
+    return Math.max(0, ...[file, `${file}-wal`, `${file}-journal`].map(f => {
+        try { return fs.statSync(f).mtimeMs; } catch { return 0; }
+    }));
+}
+
 /** One O(N) pass, including negative identities, instead of N full folder scans. */
-export function prepareBackgroundIndex(agentRoots: string[], force = true): void {
+export function prepareBackgroundIndex(agentRoots: string[], force = true, modifiedSince = 0): void {
     if (deferIndex) { return; }
     const roots = JSON.stringify(agentRoots.map(r => filePathKey(r)));
     if (!force && indexRoots === roots && indexExpiresAt > Date.now()) { return; }
-    const next = new Map<string, string>();
+    const previousExpiry = indexRoots === roots ? indexExpiresAt : 0;
+    const next = modifiedSince && indexRoots === roots ? new Map(sdkIndex) : new Map<string, string>();
+    const previousIds = new Map<string, string[]>();
+    for (const [id, file] of next) {
+        const key = filePathKey(file);
+        previousIds.set(key, [...(previousIds.get(key) ?? []), id]);
+    }
     const present = new Set<string>();
     for (const root of agentRoots) {
         let entries: fs.Dirent[];
@@ -88,15 +101,19 @@ export function prepareBackgroundIndex(agentRoots: string[], force = true): void
             const file = path.join(root, entry.name, 'session.db');
             if (!fs.existsSync(file)) { continue; }
             present.add(filePathKey(file));
+            if (modifiedSince && backgroundModifiedTime(file) < modifiedSince) { continue; }
+            for (const id of previousIds.get(filePathKey(file)) ?? []) { next.delete(id); }
             const id = agentIdentity(file).sdkSessionId;
             if (id && !next.has(id)) { next.set(id, file); }
         }
     }
     // Prune removed stores, not the first 1,024 identities in a larger live history.
     for (const file of identityCache.keys()) { if (!present.has(file)) { identityCache.delete(file); } }
+    for (const [id, file] of next) { if (!present.has(filePathKey(file))) { next.delete(id); } }
     sdkIndex = next;
     indexRoots = roots;
-    indexExpiresAt = Date.now() + 30_000;
+    // A partial index must never satisfy a later full-history request.
+    indexExpiresAt = modifiedSince ? previousExpiry : Date.now() + 30_000;
 }
 
 export interface BackgroundFiles {

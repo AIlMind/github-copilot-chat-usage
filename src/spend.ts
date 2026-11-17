@@ -8,7 +8,7 @@ import { parseCreditDetailsNanoAiu, parseDebugLog } from './parser';
 import { backgroundDependencies, hasRecordedTokenTotals, readBackgroundSession } from './background';
 
 const SPEND_LOOKBACK_DAYS = 30;
-const SPEND_FILE_CACHE_VERSION = 11;
+const SPEND_FILE_CACHE_VERSION = 12;
 const SPEND_FILE_CACHE_MAX_AGE_MS = (SPEND_LOOKBACK_DAYS + 14) * 24 * 60 * 60 * 1000;
 const SPEND_FILE_CACHE_NAME = 'spend-file-cache.json';
 
@@ -813,7 +813,7 @@ export function computeSpendSummaryFromChatSessionDirs(
                     timestamp: u.timestamp, intervalStart: u.intervalStart, nanoAiu: u.nanoAiu,
                     modelDisplayName: u.detail?.modelDisplayName, tokensKnown: u.tokensKnown === true, inputTokens: u.inputTokens, outputTokens: u.outputTokens, cachedTokens: u.cachedTokens, model: u.model,
                     sourcePriority,
-                    dedupeKey: `background:${data.sessionId}:${crypto.createHash('sha256').update(u.eventId ?? u.id).digest('hex')}`,
+                    dedupeKey: `background:${data.sessionId}:${crypto.createHash('sha256').update(u.kind === 'saved' ? `saved:${u.id}` : u.eventId ?? u.id).digest('hex')}`,
                 }));
             } else { requests = debugSpendRequests(real); }
             if (sourceNotes.some(n => /unavailable or unreadable/.test(n)) && cached?.parserVersion === SPEND_FILE_CACHE_VERSION) {

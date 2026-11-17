@@ -13,6 +13,7 @@ export interface BackgroundUsage {
     tokensKnown?: boolean;
     intervalStart?: number;
     intervalEnd?: number;
+    savedSessionTotal?: number;
     kind?: 'call' | 'saved' | 'adjustment';
     owner?: string;
     callKey?: string;
@@ -363,6 +364,15 @@ export function readBackgroundSession(file: string, cliRoots: string[] = [], age
     for (const row of rows) {
         const u = row.usage;
         const meta = u?._meta ?? {};
+        const total = optionalNumber(meta.copilotUsage?.sessionTotalNanoAiu);
+        // INSERT OR REPLACE preserves write order in rowid. A strictly older
+        // cumulative balance identifies replayed saved credit; an equal balance
+        // can be a delayed metrics refresh and must retain its turn's charge.
+        // Zero with partial status is an unavailable baseline, not a replay.
+        const replayed = total !== undefined && !(total === 0 && meta.copilotUsage?.sessionAiCreditsStatus === 'partial')
+            && savedSessionTotal !== undefined && total < savedSessionTotal;
+        if (total !== undefined) { savedSessionTotal = Math.max(savedSessionTotal ?? 0, total); }
+        if (replayed) { notes.add('Saved turns with a regressed cumulative balance repeat earlier usage; their saved aggregate is excluded. Recorded calls are retained.'); continue; }
         const id = row.eventId ?? row.id;
         const known = usage.filter(c => c.owner === id);
         const persistedRoute = meta.autoModeResolved;
@@ -375,6 +385,7 @@ export function readBackgroundSession(file: string, cliRoots: string[] = [], age
         const modelNames = [...new Set<string>(totals?.map((t: any) => t.model).filter(Boolean) ?? [u.model ?? selectedModel])];
         const remainder: BackgroundUsage = {
             id: row.id, eventId: row.eventId, owner: id, kind: 'saved', tokensKnown: !!totals,
+            savedSessionTotal: total === 0 && meta.copilotUsage?.sessionAiCreditsStatus === 'partial' ? undefined : total,
             timestamp: users.get(id)?.ts ?? timestamp(u.timestamp),
             intervalEnd: Math.max(0, ...known.map(c => c.timestamp ?? 0)) || users.get(id)?.ts || timestamp(u.timestamp),
             nanoAiu: number(meta.copilotUsage?.totalNanoAiu),
@@ -422,8 +433,6 @@ export function readBackgroundSession(file: string, cliRoots: string[] = [], age
             remainder.modelUsage = models;
         }
         if (!known.length || remainder.nanoAiu || remainder.inputTokens || remainder.outputTokens || remainder.cachedTokens) { usage.push(remainder); }
-        const total = meta.copilotUsage?.sessionTotalNanoAiu;
-        if (typeof total === 'number' && Number.isFinite(total) && total >= 0) { savedSessionTotal = Math.max(savedSessionTotal ?? 0, total); }
         if (['partial', 'unavailable'].includes(meta.copilotUsage?.sessionAiCreditsStatus)) { notes.add('The backend marks session credits as incomplete.'); }
         if (!totals) { notes.add('Cumulative tokens were not saved; context-window counts are excluded.'); }
         if (meta.copilotUsage?.totalNanoAiu === undefined) { notes.add('Some saved turns have no measured credits; session cost is incomplete.'); }
@@ -438,6 +447,22 @@ export function readBackgroundSession(file: string, cliRoots: string[] = [], age
     // Checkpoints are cumulative, not extra charges. Reconcile only their uncovered remainder.
     // A saved turn crossing a checkpoint cannot be split reliably; defer to a later checkpoint.
     snapshots.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+    // A missing prompt link does not make a saved turn an extra charge. Its own
+    // cumulative balance locates it within the checkpoint history, even without
+    // a user-message timestamp. Keep the whole possible interval for date filters.
+    const orphans = usage.filter(u => u.kind === 'saved' && u.timestamp === undefined);
+    for (const u of orphans) {
+        const balance = u.savedSessionTotal;
+        const checkpoint = balance === undefined ? snapshots.at(-1) : snapshots.find(s => s.total >= balance);
+        if (!checkpoint) { continue; } // A newer saved balance can follow a stale shutdown.
+        u.intervalEnd = checkpoint.ts;
+        if (balance !== undefined) {
+            const startBalance = Math.max(0, balance - u.nanoAiu);
+            const previous = snapshots.filter(s => s.ts! < checkpoint.ts! && s.total <= startBalance).at(-1);
+            u.intervalStart = previous?.ts ?? sessionStart;
+            if (u.intervalStart !== undefined) { u.timestamp = checkpoint.ts; }
+        }
+    }
     let previousTime = sessionStart;
     let previousTotal = 0;
     for (const snapshot of snapshots) {

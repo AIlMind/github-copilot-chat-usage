@@ -1110,14 +1110,22 @@ export function activate(context: vscode.ExtensionContext) {
             const summary = await client.request('spend', mode, refresh, spendFileCachePath);
             if (!disposed) {
                 treeProvider.setSpendSummary(summary);
-                // The fast first paint can use SDK calls before the reverse identity index
-                // is ready. Reconcile once after spend builds that index, even while idle.
-                if (!initialSessionReconciled) {
-                    initialSessionReconciled = true;
-                    try { await refreshCurrentSession(); } catch (error) { report(error); }
-                }
             }
         } finally { if (!disposed) { treeProvider.finishSpendRefresh(); } }
+        // Paint Today before opening historical databases. The worker then completes
+        // reverse lookup and reconciles any SDK-only first paint, even while idle.
+        if (!disposed && !initialSessionReconciled) {
+            initialSessionReconciled = true;
+            try {
+                await client.request('indexHistory');
+                if (disposed) { return; }
+                await refreshCurrentSession();
+                if (mode === 'today') {
+                    const summary = await client.request('spend', 'today', true, spendFileCachePath);
+                    if (!disposed) { treeProvider.setSpendSummary(summary); }
+                }
+            } catch (error) { initialSessionReconciled = false; report(error); }
+        }
     }
     async function refreshCurrentSession() {
         const candidate = currentSessionCandidate;

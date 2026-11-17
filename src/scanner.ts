@@ -4,7 +4,8 @@ import { randomUUID } from 'crypto';
 import { WorkspaceIndex, readWorkspaceIdentity, readEventWorkspace, workspacePathLabel } from './workspaces';
 import { discoverUsageDirectories, DiscoveryOptions, UsageDirectories } from './discovery';
 import { backgroundDependencies, backgroundHasUsage } from './background';
-import { configureIdentityCache, prepareBackgroundIndex, resolveBackgroundFiles, withoutFullBackgroundIndex } from './backgroundIdentity';
+import { backgroundModifiedTime, configureIdentityCache, prepareBackgroundIndex, resolveBackgroundFiles, withoutFullBackgroundIndex } from './backgroundIdentity';
+import { filePathKey } from './sqliteSnapshot';
 import { findSiblingChatSessionLog, SessionSummary, parseCopilotSessionFile, setBackgroundCliRoots } from './parser';
 import { ChatSessionDirEntry, SpendSummary, UsageFile, computeSpendSummaryFromChatSessionDirs } from './spend';
 
@@ -83,34 +84,37 @@ function findAllChatSessionDirs(refresh = false): ChatSessionDirEntry[] {
     return usageDirectories(refresh).chat.map(chatSessionDirEntry);
 }
 
-function findUsageFiles(refresh = false): UsageFile[] {
+function findUsageFiles(refresh = false, modifiedSince = 0): UsageFile[] {
     const dirs = usageDirectories(refresh);
-    prepareBackgroundIndex(dirs.agent);
-    const workspaces = new WorkspaceIndex([...dirs.chat.filter(d => path.basename(d) === 'chatSessions').map(path.dirname), ...dirs.debug.map(d => path.dirname(path.dirname(d))).filter(d => path.basename(d) !== 'globalStorage')]);
-    const files: UsageFile[] = [];
-    const seen = new Set<string>();
-    const add = (root: string, filename: string, kind: UsageFile['kind']) => {
-        let entries: fs.Dirent[];
-        try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
-        for (const entry of entries) {
-            if (!entry.isDirectory()) { continue; }
-            const dir = path.join(root, entry.name);
-            const file = path.join(dir, filename);
-            if (!fs.existsSync(file)) { continue; }
-            const resolved = kind === 'background' ? resolveBackgroundFiles(file, dirs.cli, dirs.agent) : undefined;
-            const workspace = kind === 'debug'
-                ? chatSessionDirEntry(path.join(path.dirname(path.dirname(root)), path.basename(path.dirname(path.dirname(root))) === 'globalStorage' ? 'emptyWindowChatSessions' : 'chatSessions'))
-                : workspaces.resolve(resolved?.workspace ?? readEventWorkspace(resolved?.eventsFile), resolved?.workspaces, resolved?.workspaceless);
-            const canonicalFile = resolved?.dbFile ?? file;
-            if (seen.has(canonicalFile)) { continue; }
-            seen.add(canonicalFile);
-            files.push({ ...workspace, dir: path.dirname(canonicalFile), file: canonicalFile, sessionId: resolved?.sessionId ?? entry.name, kind });
-        }
-    };
-    dirs.debug.forEach(root => add(root, 'main.jsonl', 'debug'));
-    dirs.cli.forEach(root => add(root, 'events.jsonl', 'background'));
-    dirs.agent.forEach(root => add(root, 'session.db', 'background'));
-    return files;
+    prepareBackgroundIndex(dirs.agent, true, modifiedSince);
+    return withoutFullBackgroundIndex(() => {
+        const workspaces = new WorkspaceIndex([...dirs.chat.filter(d => path.basename(d) === 'chatSessions').map(path.dirname), ...dirs.debug.map(d => path.dirname(path.dirname(d))).filter(d => path.basename(d) !== 'globalStorage')]);
+        const files: UsageFile[] = [];
+        const seen = new Set<string>();
+        const add = (root: string, filename: string, kind: UsageFile['kind']) => {
+            let entries: fs.Dirent[];
+            try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                if (!entry.isDirectory()) { continue; }
+                const dir = path.join(root, entry.name);
+                const file = path.join(dir, filename);
+                if (!fs.existsSync(file)) { continue; }
+                if (kind === 'background' && modifiedSince && backgroundModifiedTime(file) < modifiedSince) { continue; }
+                const resolved = kind === 'background' ? resolveBackgroundFiles(file, dirs.cli, dirs.agent) : undefined;
+                const workspace = kind === 'debug'
+                    ? chatSessionDirEntry(path.join(path.dirname(path.dirname(root)), path.basename(path.dirname(path.dirname(root))) === 'globalStorage' ? 'emptyWindowChatSessions' : 'chatSessions'))
+                    : workspaces.resolve(resolved?.workspace ?? readEventWorkspace(resolved?.eventsFile), resolved?.workspaces, resolved?.workspaceless);
+                const canonicalFile = resolved?.dbFile ?? file;
+                if (seen.has(filePathKey(canonicalFile))) { continue; }
+                seen.add(filePathKey(canonicalFile));
+                files.push({ ...workspace, dir: path.dirname(canonicalFile), file: canonicalFile, sessionId: resolved?.sessionId ?? entry.name, kind });
+            }
+        };
+        dirs.debug.forEach(root => add(root, 'main.jsonl', 'debug'));
+        dirs.cli.forEach(root => add(root, 'events.jsonl', 'background'));
+        dirs.agent.forEach(root => add(root, 'session.db', 'background'));
+        return files;
+    });
 }
 
 type SpendScanMode = 'today' | 'full';
@@ -121,10 +125,14 @@ function computeSpendSummary(mode: SpendScanMode, refresh = false, cacheFilePath
         return cache.summary;
     }
 
-    const summary = computeSpendSummaryFromChatSessionDirs(mode, findAllChatSessionDirs(refresh), { cacheFilePath, usageFiles: findUsageFiles(), cliRoots: usageDirectories().cli, agentRoots: usageDirectories().agent });
+    const chatDirs = findAllChatSessionDirs(refresh);
+    const usageFiles = findUsageFiles(false, mode === 'today' ? new Date().setHours(0, 0, 0, 0) : 0);
+    // Discovery prepared either the recent or full identity map. Parsing must not
+    // silently turn a recent scan into a full database scan through reverse lookup.
+    const summary = withoutFullBackgroundIndex(() => computeSpendSummaryFromChatSessionDirs(mode, chatDirs, { cacheFilePath, usageFiles, cliRoots: usageDirectories().cli, agentRoots: usageDirectories().agent }));
 
     if (cacheFilePath) {
-        const file = cacheFilePath + '.summary-v11', temp = file + '.' + randomUUID() + '.tmp';
+        const file = cacheFilePath + '.summary-v12', temp = file + '.' + randomUUID() + '.tmp';
         try { fs.mkdirSync(path.dirname(file), {recursive:true}); fs.writeFileSync(temp, JSON.stringify(summary), {mode:0o600}); fs.renameSync(temp,file); }
         catch { /* Optional first-paint cache. */ }
         finally { try { fs.rmSync(temp,{force:true}); } catch {} }
@@ -446,7 +454,7 @@ export const scanner = {
     cachedSpend: (file?: string): SpendSummary | undefined => {
         if (!file) { return; }
         try {
-            const s = JSON.parse(fs.readFileSync(file + '.summary-v11','utf8'));
+            const s = JSON.parse(fs.readFileSync(file + '.summary-v12','utf8'));
             if (s.today && typeof s.today.nanoAiu === 'number' && new Date(s.generatedAt).toDateString() === new Date().toDateString()) {
                 return { today: s.today, generatedAt: s.generatedAt, scannedFiles: s.scannedFiles, notes: s.notes };
             }
@@ -454,6 +462,7 @@ export const scanner = {
         return undefined;
     },
     spend: computeSpendSummary,
+    indexHistory: () => { prepareBackgroundIndex(usageDirectories().agent, false); },
     autoLoad: () => {
         let sessions = currentWorkspaceSessions();
         if (!sessions.length) {

@@ -3,7 +3,7 @@
   "publisher": "ailmind",
   "displayName": "GitHub Copilot Chat Usage",
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "license": "MIT",
   "icon": "images/ailmind-icon-128.png",
   "homepage": "https://ailmind.com",
@@ -197,7 +197,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc --watch -p ./",
     "audit:coverage": "npm run compile && node scripts/audit-coverage.cjs",
-    "test": "npm run compile && node test/parser.test.js && node --test test/sources.test.js test/performance.test.js test/refresh.test.js test/background-detail.test.js test/workspace-model.test.js",
+    "test": "npm run compile && node test/parser.test.js && node --test test/sources.test.js test/performance.test.js test/refresh.test.js test/background-detail.test.js test/workspace-model.test.js test/reconciliation-startup.test.js",
     "package": "vsce package"
   },
   "devDependencies": {

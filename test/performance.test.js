@@ -91,7 +91,7 @@ test('WAL content is included without changing live DB/WAL/SHM; ctime-only chang
 });
 
 test('snapshot retries a write during copy and reads the new committed WAL', t => {
- const root=temporary(t), file=path.join(root,'owner/session.db'), writer=create(file,'before');writer.exec('PRAGMA journal_mode=WAL');
+ const root=temporary(t), file=path.join(root,'owner/session.db'), writer=create(file,'before');writer.exec('PRAGMA journal_mode=WAL');writer.prepare('INSERT INTO session_metadata VALUES (?,?)').run('forceWal','true');
  const copy=fs.copyFileSync;let changed=false;
  fs.copyFileSync=(...args)=>{const result=copy(...args);if(args[0]===file&&!changed){changed=true;writer.prepare('UPDATE session_metadata SET value=?').run(JSON.stringify({sdkSessionId:'after'}));}return result;};
  try {assert.equal(withDatabaseSnapshot(file,db=>JSON.parse(db.prepare('SELECT value FROM session_metadata').get().value).sdkSessionId),'after');}
@@ -100,11 +100,11 @@ test('snapshot retries a write during copy and reads the new committed WAL', t =
 
 test('failed snapshots are retried rather than cached as zero usage', t => {
  const root=temporary(t), file=path.join(root,'owner/session.db'), db=create(file);db.prepare('INSERT INTO turn_usage VALUES (?,?)').run('t',JSON.stringify({timestamp:Date.now()-1000,_meta:{turnTokenTotals:[{model:'m',inputTokens:10,outputTokens:1}],copilotUsage:{totalNanoAiu:100}}}));db.close();
- const walMode=new DatabaseSync(file);walMode.exec('PRAGMA journal_mode=WAL');walMode.close();
+ const walMode=new DatabaseSync(file);walMode.exec('PRAGMA journal_mode=WAL');walMode.exec("UPDATE turn_usage SET usage=usage || ' '");
  const options={usageFiles:[source(file,'owner')],cacheFilePath:path.join(root,'cache.json')};
  const copy=fs.copyFileSync;fs.copyFileSync=()=>{throw new Error('temporary read failure');};
  try {assert.equal(computeSpendSummaryFromChatSessionDirs('full',[],options).today.inputTokens,0);}finally{fs.copyFileSync=copy;}
- assert.equal(computeSpendSummaryFromChatSessionDirs('full',[],options).today.inputTokens,10);
+ try { assert.equal(computeSpendSummaryFromChatSessionDirs('full',[],options).today.inputTokens,10); } finally {walMode.close();}
 });
 
 test('disposing during a scan rejects pending requests and never leaves a busy promise', async t => {
@@ -146,9 +146,9 @@ test('Windows cache path identity ignores drive and directory case',()=>{
 test('saved first paint is read without source access and does not leak yesterday into today',t=>{
  const root=temporary(t),file=path.join(root,'spend.json'),{scanner}=require('../out/scanner');
  const summary={today:{label:'Today',nanoAiu:123},generatedAt:Date.now(),scannedFiles:8};
- fs.writeFileSync(file+'.summary-v11',JSON.stringify(summary));const stat=fs.statSync;fs.statSync=()=>{throw Error('source access before paint');};
+ fs.writeFileSync(file+'.summary-v12',JSON.stringify(summary));const stat=fs.statSync;fs.statSync=()=>{throw Error('source access before paint');};
  try{assert.deepEqual(scanner.cachedSpend(file).today,summary.today);}finally{fs.statSync=stat;}
- summary.generatedAt=new Date(new Date().setHours(-1,0,0,0)).getTime();fs.writeFileSync(file+'.summary-v11',JSON.stringify(summary));assert.equal(scanner.cachedSpend(file),undefined);
+ summary.generatedAt=new Date(new Date().setHours(-1,0,0,0)).getTime();fs.writeFileSync(file+'.summary-v12',JSON.stringify(summary));assert.equal(scanner.cachedSpend(file),undefined);
 });
 
 test('today checks linked SDK and WAL changes even if the main DB is old',t=>{
@@ -160,5 +160,5 @@ test('fast SDK first paint reconciles saved inclusive totals after the first spe
  const root=temporary(t),agents=path.join(root,'agentSessionData'),file=path.join(agents,'owner','session.db'),db=create(file,'sdk');
  db.exec('CREATE TABLE turns(id TEXT,event_id TEXT)');db.prepare('INSERT INTO turns VALUES (?,?)').run('turn','user');db.prepare('INSERT INTO turn_usage VALUES (?,?)').run('turn',JSON.stringify({_meta:{copilotUsage:{totalNanoAiu:200},turnTokenTotals:[{model:'m',inputTokens:200,outputTokens:20,cachedTokens:0}]}}));db.close();const old=new Date(Date.now()-86400000);fs.utimesSync(file,old,old);
  const events=path.join(root,'session-state/sdk/events.jsonl');fs.mkdirSync(path.dirname(events),{recursive:true});fs.writeFileSync(events,[{type:'user.message',id:'user',timestamp:new Date().toISOString(),data:{content:'test'}},{type:'session.usage_record',id:'call',timestamp:new Date().toISOString(),parentId:'user',data:{usage:{model:'m',inputTokens:100,outputTokens:10,copilotUsage:{totalNanoAiu:100}}}}].map(JSON.stringify).join('\n')+'\n');
- const {scanner}=require('../out/scanner');scanner.configure({defaults:false,searchRoots:[root]});const first=scanner.autoLoad();assert.equal(first.parsed.summary.totalNanoAiu,100);scanner.spend('today',true);assert.equal(scanner.parse(first.candidate).summary.totalNanoAiu,200);
+ const {scanner}=require('../out/scanner');scanner.configure({defaults:false,searchRoots:[root]});const first=scanner.autoLoad();assert.equal(first.parsed.summary.totalNanoAiu,100);assert.equal(scanner.spend('today',true).today.nanoAiu,100);scanner.indexHistory();assert.equal(scanner.parse(first.candidate).summary.totalNanoAiu,200);assert.equal(scanner.spend('today',true).today.nanoAiu,200);
 });

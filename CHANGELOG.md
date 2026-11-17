@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.6
+
+- Reconcile saved turns without prompt links against their cumulative checkpoint balances so they are not added twice. Exclude regressed saved aggregates while preserving equal balances, partial totals and newer recorded calls. Keep multiple saved remainders for the same prompt distinct in spend totals.
+- Show Today after indexing only recently modified agent stores, including WAL changes. Build the historical identity index afterwards and reconcile the displayed session and totals.
+- Read inactive WAL databases through checked immutable connections without creating sidecars or temporary copies; retry concurrent changes and keep snapshots for active WAL data.
+- Invalidate older spend caches so previously inflated totals are recalculated.
+
 ## 0.8.5
 
 - Fix checkpoint double counting during long-running prompts and attribute queued-message calls through their event ancestry.
