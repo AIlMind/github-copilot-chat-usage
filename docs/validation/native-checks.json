@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "node": "24.21.0",
+  "credits": 1.5,
+  "input": 1200,
+  "toolPassed": true,
+  "autoLoadPassed": true,
+  "freshGraphPassed": true,
+  "walRefresh": {
+    "status": "passed",
+    "creditsBefore": 1.5,
+    "creditsAfter": 2,
+    "inputBefore": 1200,
+    "inputAfter": 1500,
+    "walOnly": true
+  }
+}

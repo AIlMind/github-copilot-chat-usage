@@ -1,11 +1,14 @@
 import * as crypto from 'crypto';
+import { ModelNames } from './modelNames';
+import { filePathKey } from './sqliteSnapshot';
 import * as fs from 'fs';
 import * as path from 'path';
 import { StringDecoder } from 'string_decoder';
-import { parseCreditDetailsNanoAiu } from './parser';
+import { parseCreditDetailsNanoAiu, parseDebugLog } from './parser';
+import { backgroundDependencies, hasRecordedTokenTotals, readBackgroundSession } from './background';
 
 const SPEND_LOOKBACK_DAYS = 30;
-const SPEND_FILE_CACHE_VERSION = 4;
+const SPEND_FILE_CACHE_VERSION = 11;
 const SPEND_FILE_CACHE_MAX_AGE_MS = (SPEND_LOOKBACK_DAYS + 14) * 24 * 60 * 60 * 1000;
 const SPEND_FILE_CACHE_NAME = 'spend-file-cache.json';
 
@@ -16,15 +19,19 @@ export interface ChatSessionDirEntry {
 }
 
 export interface SpendBucketBase {
+    estimated?: boolean;
+    tokensKnown?: boolean;
     label: string;
     nanoAiu: number;
     inputTokens: number;
     outputTokens: number;
+    cachedTokens: number;
     requestCount: number;
     sessionCount: number;
 }
 
 export interface SpendBucket extends SpendBucketBase {
+    unattributed?: SpendModelBucket;
     models?: SpendModelBucket[];
     workspaces?: SpendWorkspaceBucket[];
 }
@@ -38,6 +45,8 @@ export interface SpendWorkspaceBucket extends SpendBucketBase {
 }
 
 export interface SpendSummary {
+    notes?: string[];
+    undatedRequests?: number;
     today: SpendBucket;
     week?: SpendBucket;
     month?: SpendBucket;
@@ -46,10 +55,19 @@ export interface SpendSummary {
 }
 
 export interface SpendRequest {
+    estimated?: boolean;
+    modelDisplayName?: string;
+    modelKey?: string;
+    tokensKnown?: boolean;
+    intervalStart?: number;
+    sourcePriority?: number;
+    inputIsContext?: boolean;
     timestamp?: number;
     nanoAiu: number;
     inputTokens: number;
     outputTokens: number;
+    cachedTokens?: number;
+    modelUsage?: SpendRequest[];
     model: string;
     dedupeKey?: string;
 }
@@ -67,6 +85,9 @@ interface SpendWorkspaceAccumulator {
 }
 
 interface SpendFileCacheEntry {
+    sessionId?: string;
+    signature?: string;
+    notes?: string[];
     parserVersion: number;
     path: string;
     mtimeMs: number;
@@ -84,6 +105,15 @@ interface SpendFileCacheStore {
 interface ComputeSpendSummaryOptions {
     cacheFilePath?: string;
     now?: number;
+    usageFiles?: UsageFile[];
+    cliRoots?: string[];
+    agentRoots?: string[];
+}
+
+export interface UsageFile extends ChatSessionDirEntry {
+    file: string;
+    sessionId: string;
+    kind: 'debug' | 'background';
 }
 
 interface SpendRequestCandidate {
@@ -101,14 +131,6 @@ function toFiniteNumber(value: unknown): number | undefined {
         return Number.isFinite(parsed) ? parsed : undefined;
     }
     return undefined;
-}
-
-function requestIndexFromPath(pathParts: unknown[]): string | undefined {
-    if (pathParts[0] !== 'requests' || pathParts.length < 2) {
-        return undefined;
-    }
-    const index = pathParts[1];
-    return typeof index === 'number' || typeof index === 'string' ? String(index) : undefined;
 }
 
 function parseCreditDetailsModel(detailsValue: unknown): string | undefined {
@@ -169,22 +191,6 @@ function firstFiniteNumber(...values: unknown[]): number | undefined {
     return undefined;
 }
 
-function isInputTokenKey(key: unknown): boolean {
-    return key === 'promptTokens' || key === 'inputTokens' || key === 'prompt_tokens' || key === 'input_tokens';
-}
-
-function isOutputTokenKey(key: unknown): boolean {
-    return key === 'completionTokens' || key === 'outputTokens' || key === 'completion_tokens' || key === 'output_tokens';
-}
-
-function isNanoAiuKey(key: unknown): boolean {
-    return key === 'copilotUsageNanoAiu' || key === 'nanoAiu' || key === 'nanoAiU';
-}
-
-function isResponseIdKey(key: unknown): boolean {
-    return key === 'responseId' || key === 'response_id';
-}
-
 function applySpendRequestTokens(request: SpendRequest, value: any): void {
     if (!value || typeof value !== 'object') {
         return;
@@ -193,6 +199,8 @@ function applySpendRequestTokens(request: SpendRequest, value: any): void {
     const metadata = value.result?.metadata ?? value.metadata;
     const usage = metadata?.usage ?? value.usage;
     const inputTokens = firstFiniteNumber(
+        usage?.inputTokens,
+        usage?.input_tokens,
         value.promptTokens,
         value.inputTokens,
         value.prompt_tokens,
@@ -223,6 +231,8 @@ function applySpendRequestTokens(request: SpendRequest, value: any): void {
 
     if (inputTokens !== undefined) {
         request.inputTokens = inputTokens;
+        request.inputIsContext = usage?.inputTokens === undefined && usage?.input_tokens === undefined &&
+            (value.promptTokens !== undefined || metadata?.promptTokens !== undefined);
     }
     if (outputTokens !== undefined) {
         request.outputTokens = outputTokens;
@@ -314,118 +324,6 @@ function updateSpendRequestFromValue(requests: Map<string, SpendRequest>, index:
     applySpendRequestTokens(request, value);
 }
 
-function updateSpendRequestFromPatch(request: SpendRequest, pathParts: unknown[], value: any): void {
-    if (pathParts[2] === 'timestamp') {
-        const timestamp = toFiniteNumber(value);
-        if (timestamp !== undefined) {
-            request.timestamp = timestamp;
-        }
-        return;
-    }
-
-    if (isInputTokenKey(pathParts[2])) {
-        const inputTokens = toFiniteNumber(value);
-        if (inputTokens !== undefined) {
-            request.inputTokens = inputTokens;
-        }
-        return;
-    }
-
-    if (isOutputTokenKey(pathParts[2])) {
-        const outputTokens = toFiniteNumber(value);
-        if (outputTokens !== undefined) {
-            request.outputTokens = outputTokens;
-        }
-        return;
-    }
-
-    if (isNanoAiuKey(pathParts[2])) {
-        const nanoAiu = toFiniteNumber(value);
-        if (nanoAiu !== undefined) {
-            request.nanoAiu = nanoAiu;
-        }
-        return;
-    }
-
-    if (isResponseIdKey(pathParts[2])) {
-        applySpendRequestDedupeKey(request, { responseId: value });
-        return;
-    }
-
-    if (pathParts[2] === 'modelId' || pathParts[2] === 'model') {
-        applySpendRequestModel(request, value);
-        return;
-    }
-
-    if (pathParts[2] !== 'result') {
-        return;
-    }
-
-    if (pathParts.length === 3) {
-        applySpendRequestDedupeKey(request, { result: value }, true);
-        applySpendRequestNanoAiu(request, { result: value });
-        applySpendRequestModel(request, parseCreditDetailsModel(value?.details));
-        applySpendRequestTokens(request, { result: value });
-        return;
-    }
-
-    if (pathParts[3] === 'details') {
-        applySpendRequestNanoAiu(request, { details: value });
-        applySpendRequestModel(request, parseCreditDetailsModel(value));
-        return;
-    }
-
-    if (pathParts[3] === 'metadata') {
-        if (pathParts.length === 4) {
-            applySpendRequestDedupeKey(request, { metadata: value }, true);
-            applySpendRequestNanoAiu(request, { metadata: value });
-            applySpendRequestTokens(request, { metadata: value });
-        } else if (pathParts[4] === 'usage' && pathParts.length === 5) {
-            applySpendRequestDedupeKey(request, { usage: value }, true);
-            applySpendRequestNanoAiu(request, { usage: value });
-            applySpendRequestTokens(request, { usage: value });
-        } else if (isResponseIdKey(pathParts[4])) {
-            applySpendRequestDedupeKey(request, { metadata: { responseId: value } }, true);
-        } else if (pathParts[4] === 'usage' && isInputTokenKey(pathParts[5])) {
-            const inputTokens = toFiniteNumber(value);
-            if (inputTokens !== undefined) {
-                request.inputTokens = inputTokens;
-            }
-        } else if (pathParts[4] === 'usage' && isOutputTokenKey(pathParts[5])) {
-            const outputTokens = toFiniteNumber(value);
-            if (outputTokens !== undefined) {
-                request.outputTokens = outputTokens;
-            }
-        } else if (pathParts[4] === 'usage' && isNanoAiuKey(pathParts[5])) {
-            const nanoAiu = toFiniteNumber(value);
-            if (nanoAiu !== undefined) {
-                request.nanoAiu = nanoAiu;
-            }
-        } else if (pathParts[4] === 'usage' && isResponseIdKey(pathParts[5])) {
-            applySpendRequestDedupeKey(request, { usage: { responseId: value } }, true);
-        } else if (isInputTokenKey(pathParts[4])) {
-            const inputTokens = toFiniteNumber(value);
-            if (inputTokens !== undefined) {
-                request.inputTokens = inputTokens;
-            }
-        } else if (isOutputTokenKey(pathParts[4])) {
-            const outputTokens = toFiniteNumber(value);
-            if (outputTokens !== undefined) {
-                request.outputTokens = outputTokens;
-            }
-        } else if (isNanoAiuKey(pathParts[4])) {
-            const nanoAiu = toFiniteNumber(value);
-            if (nanoAiu !== undefined) {
-                request.nanoAiu = nanoAiu;
-            }
-        }
-    } else {
-        applySpendRequestDedupeKey(request, { result: value }, true);
-        applySpendRequestNanoAiu(request, { result: value });
-        applySpendRequestTokens(request, { result: value });
-    }
-}
-
 function readSpendLines(filePath: string, onLine: (line: string) => void): void {
     let fd: number | undefined;
     try {
@@ -461,74 +359,67 @@ function readSpendLines(filePath: string, onLine: (line: string) => void): void 
 }
 
 export function readSpendRequestsFromChatSession(filePath: string): SpendRequest[] {
-    const requests = new Map<string, SpendRequest>();
-    let nextAppendIndex = 0;
-
+    // Keep billing fields only. Hydrating entire responses would retain prompts, images and tool output.
+    const projected = new Map<number, any>();
+    let nextIndex = 0;
+    const keys = new Set(['timestamp', 'requestId', 'modelId', 'model', 'promptTokens', 'inputTokens', 'prompt_tokens', 'input_tokens', 'completionTokens', 'outputTokens', 'completion_tokens', 'output_tokens', 'copilotUsageNanoAiu', 'nanoAiu', 'nanoAiU', 'responseId', 'response_id', 'usage', 'metadata', 'result']);
+    const project = (request: any) => {
+        const value: any = {};
+        if (!request || typeof request !== 'object') { return value; }
+        for (const key of keys) {
+            if (key === 'result') {
+                if (request.result) { value.result = { details: request.result.details, metadata: request.result.metadata }; }
+            } else if (request[key] !== undefined) { value[key] = request[key]; }
+        }
+        return value;
+    };
+    const replace = (values: any[], from = 0) => {
+        for (const key of projected.keys()) { if (key >= from) { projected.delete(key); } }
+        values.forEach((r, i) => projected.set(from + i, project(r)));
+        nextIndex = from + values.length;
+    };
     try {
         readSpendLines(filePath, line => {
-            if (!line.trim() || !line.includes('requests')) {
-                return;
-            }
-
+            if (!line.includes('requests')) { return; }
             let raw: any;
-            try {
-                raw = JSON.parse(line);
-            } catch {
+            try { raw = JSON.parse(line); } catch { return; }
+            if (raw.kind === 0) { replace(Array.isArray(raw.v?.requests) ? raw.v.requests : []); return; }
+            if (!Array.isArray(raw.k) || raw.k[0] !== 'requests') { return; }
+            if (raw.k.length === 1) {
+                if (raw.kind === 2 && Array.isArray(raw.v)) { replace(raw.v, toFiniteNumber(raw.i) ?? nextIndex); }
+                else { replace(Array.isArray(raw.v) ? raw.v : []); }
                 return;
             }
-
-            if (raw.kind === 0 && Array.isArray(raw.v?.requests)) {
-                raw.v.requests.forEach((request: any, index: number) => {
-                    updateSpendRequestFromValue(requests, String(index), request);
-                });
-                nextAppendIndex = raw.v.requests.length;
-                return;
-            }
-
-            if (!Array.isArray(raw.k) || raw.k[0] !== 'requests') {
-                return;
-            }
-
-            if (raw.kind === 2 && raw.k.length === 1 && Array.isArray(raw.v)) {
-                const startIndex = toFiniteNumber(raw.i) ?? nextAppendIndex;
-                raw.v.forEach((request: any, offset: number) => {
-                    updateSpendRequestFromValue(requests, String(startIndex + offset), request);
-                });
-                nextAppendIndex = Math.max(nextAppendIndex, startIndex + raw.v.length);
-                return;
-            }
-
-            const index = requestIndexFromPath(raw.k);
-            if (index === undefined) {
-                return;
-            }
-            const numericIndex = toFiniteNumber(index);
-            if (numericIndex !== undefined) {
-                nextAppendIndex = Math.max(nextAppendIndex, numericIndex + 1);
-            }
-
-            if (raw.kind === 3) {
-                requests.delete(index);
-                return;
-            }
-
+            const index = toFiniteNumber(raw.k[1]);
+            if (index === undefined || index < 0) { return; }
+            nextIndex = Math.max(nextIndex, index + 1);
             if (raw.k.length === 2) {
-                updateSpendRequestFromValue(requests, index, raw.v);
+                if (raw.kind === 3) { projected.delete(index); }
+                else { projected.set(index, project(raw.v)); }
                 return;
             }
-
-            updateSpendRequestFromPatch(ensureSpendRequest(requests, index), raw.k, raw.v);
+            if (!keys.has(raw.k[2])) { return; }
+            if (raw.k[2] === 'result' && raw.k.length > 3 && !['details', 'metadata'].includes(raw.k[3])) { return; }
+            const request = projected.get(index) ?? {};
+            let cursor = request;
+            const parts = raw.k.slice(2);
+            for (const key of parts.slice(0, -1)) {
+                if (!cursor[key] || typeof cursor[key] !== 'object') { cursor[key] = {}; }
+                cursor = cursor[key];
+            }
+            const last = parts[parts.length - 1];
+            if (raw.kind === 3) { delete cursor[last]; }
+            else { cursor[last] = raw.v; }
+            projected.set(index, project(request));
         });
-    } catch {
-        return [];
-    }
-
-    return [...requests.values()]
-        .filter(request => request.nanoAiu > 0 || request.inputTokens > 0 || request.outputTokens > 0);
+    } catch { return []; }
+    const requests = new Map<string, SpendRequest>();
+    for (const [index, raw] of projected) { updateSpendRequestFromValue(requests, String(index), raw); }
+    return [...requests.values()].filter(r => r.nanoAiu > 0 || r.inputTokens > 0 || r.outputTokens > 0);
 }
 
 function createSpendBucket(label: string): SpendBucket {
-    return { label, nanoAiu: 0, inputTokens: 0, outputTokens: 0, requestCount: 0, sessionCount: 0 };
+    return { label, tokensKnown: true, nanoAiu: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, requestCount: 0, sessionCount: 0 };
 }
 
 function createSpendModelBucket(key: string, label: string): SpendModelBucket {
@@ -554,9 +445,12 @@ function createSpendWorkspaceAccumulator(): SpendWorkspaceAccumulator {
 }
 
 function addToSpendBucket(bucket: SpendBucketBase, request: SpendRequest, sessionSet: Set<string>, sessionId: string): void {
+    bucket.estimated ||= request.estimated;
+    bucket.tokensKnown = bucket.tokensKnown !== false && request.tokensKnown !== false;
     bucket.nanoAiu += request.nanoAiu;
     bucket.inputTokens += request.inputTokens;
     bucket.outputTokens += request.outputTokens;
+    bucket.cachedTokens += request.cachedTokens ?? 0;
     bucket.requestCount++;
     sessionSet.add(sessionId);
     bucket.sessionCount = sessionSet.size;
@@ -604,10 +498,14 @@ function sortedSpendWorkspaceBuckets(buckets: Map<string, SpendWorkspaceBucket>)
 }
 
 function addToSpendModels(accumulator: SpendModelAccumulator, request: SpendRequest, sessionId: string): void {
+    if (request.modelUsage?.length) {
+        request.modelUsage.forEach(usage => addToSpendModels(accumulator, usage, sessionId));
+        return;
+    }
     addToSpendModelBucket(
         accumulator.modelBuckets,
         accumulator.modelSessionSets,
-        request.model,
+        request.modelKey ?? request.model,
         request.model,
         request,
         sessionId
@@ -636,11 +534,73 @@ function addToSpendWorkspaces(
 }
 
 function shouldReplaceSpendCandidate(existing: SpendRequestCandidate, candidate: SpendRequestCandidate): boolean {
+    if ((candidate.request.sourcePriority ?? 0) !== (existing.request.sourcePriority ?? 0)) {
+        return (candidate.request.sourcePriority ?? 0) > (existing.request.sourcePriority ?? 0);
+    }
     if (candidate.request.timestamp !== existing.request.timestamp) {
         return candidate.request.timestamp < existing.request.timestamp;
     }
 
     return candidate.sessionKey.localeCompare(existing.sessionKey) < 0;
+}
+
+function debugSpendRequests(file: string): SpendRequest[] {
+    const summary = parseDebugLog(file);
+    if (!summary) { return []; }
+    return summary.userMessages.flatMap(message => {
+        // Continuations can be merged into one visible message while retaining separate
+        // response ids in chatSessions. Reconcile those billing identities individually.
+        const groups = new Map<string, { request: SpendRequest; models: Map<string, SpendRequest> }>();
+        for (const turn of message.modelTurns) {
+            const key = turn.responseId ? `response:${turn.responseId}` : `session:${summary.sessionId}:${message.timestamp}`;
+            let group = groups.get(key);
+            if (!group) {
+                const continuation = [...message.mergedMessages].reverse().find(m => m.timestamp <= turn.timestamp);
+                group = {
+                    request: { timestamp: continuation?.timestamp ?? message.timestamp, nanoAiu: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, model: 'Unknown model', sourcePriority: 2, dedupeKey: key },
+                    models: new Map(),
+                };
+                groups.set(key, group);
+            }
+            const collect = (turns: typeof message.modelTurns) => {
+                for (const t of turns) {
+                    const model = group!.models.get(t.model) ?? { model: t.model, modelDisplayName:t.modelDisplayName, nanoAiu: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+                    for (const target of [group!.request, model]) {
+                        target.nanoAiu += t.nanoAiu;
+                        target.inputTokens += t.inputTokens;
+                        target.outputTokens += t.outputTokens;
+                        target.cachedTokens! += t.cachedTokens;
+                    }
+                    group!.models.set(t.model, model);
+                    for (const tool of t.toolCalls) {
+                        for (const child of tool.subagentSummary?.userMessages ?? []) { collect(child.modelTurns); }
+                    }
+                }
+            };
+            collect([turn]);
+        }
+        return [...groups.values()].map(({ request, models }) => ({ ...request, model: models.size === 1 ? [...models.keys()][0] : 'Mixed models', modelUsage: [...models.values()] }));
+    });
+}
+
+/** Include WAL and child logs: their bytes can change while the parent file stays untouched. */
+function usageFileState(file: UsageFile, cliRoots: string[] = [], agentRoots: string[] = []): {signature:string; modifiedTime:number} {
+    let dependencies: string[];
+    if (file.kind === 'background') { dependencies = backgroundDependencies(file.file, cliRoots, agentRoots); }
+    else {
+        try { dependencies = fs.readdirSync(path.dirname(file.file)).filter(n => n.endsWith('.jsonl')).map(n => path.join(path.dirname(file.file), n)); }
+        catch { dependencies = [file.file]; }
+    }
+    const files = new Map(dependencies.map(f=>[filePathKey(f),f]));
+    let modifiedTime = 0;
+    const signature = [...files].sort(([a],[b])=>a.localeCompare(b)).map(([key,f]) => {
+        try { const stat=fs.statSync(f,{bigint:true}); modifiedTime=Math.max(modifiedTime,Number(stat.mtimeMs)); return `${key}:${stat.ino}:${stat.size}:${stat.mtimeNs}`; }
+        catch (error) { if (error.code !== 'ENOENT') { throw error; } return `${key}:missing`; }
+    }).join('|');
+    return {signature,modifiedTime};
+}
+export function usageFileSignature(file: UsageFile, cliRoots: string[] = [], agentRoots: string[] = []): string {
+    return usageFileState(file,cliRoots,agentRoots).signature;
 }
 
 function collectSpendCandidate(
@@ -660,7 +620,7 @@ function collectSpendCandidate(
 }
 
 function finalizeSpendModels(accumulator: SpendModelAccumulator): SpendModelBucket[] {
-    return sortedSpendModelBuckets(accumulator.modelBuckets);
+    return sortedSpendModelBuckets(accumulator.modelBuckets).filter(b => b.key !== 'unattributed-usage');
 }
 
 function finalizeSpendWorkspaces(accumulator: SpendWorkspaceAccumulator): SpendWorkspaceBucket[] {
@@ -677,7 +637,7 @@ export function getSpendFileCachePath(globalStoragePath: string | undefined): st
 
 function normalizedCachePath(filePath: string): string {
     const resolved = path.resolve(filePath);
-    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    return filePathKey(resolved);
 }
 
 function spendFileCacheKey(filePath: string): string {
@@ -705,13 +665,29 @@ function writeSpendFileCache(cacheFilePath: string | undefined, store: SpendFile
         return;
     }
 
+    const lock = `${cacheFilePath}.lock`;
+    let acquired = false;
+    let tempFile: string | undefined;
     try {
         fs.mkdirSync(path.dirname(cacheFilePath), { recursive: true });
-        const tempFile = `${cacheFilePath}.${process.pid}.${Date.now()}.tmp`;
-        fs.writeFileSync(tempFile, JSON.stringify(store));
+        try { fs.closeSync(fs.openSync(lock, 'wx', 0o600)); acquired = true; }
+        catch (error) {
+            // Leave a live writer alone; recover only locks left by a crashed process.
+            if (error.code === 'EEXIST' && Date.now() - fs.statSync(lock).mtimeMs > 120_000) { fs.rmSync(lock, { force: true }); }
+            return;
+        }
+        const merged = readSpendFileCache(cacheFilePath);
+        for (const [key, entry] of Object.entries(store.entries)) {
+            if (!merged.entries[key] || entry.parsedAt >= merged.entries[key].parsedAt) { merged.entries[key] = entry; }
+        }
+        tempFile = `${cacheFilePath}.${crypto.randomUUID()}.tmp`;
+        fs.writeFileSync(tempFile, JSON.stringify(merged), { mode: 0o600 });
         fs.renameSync(tempFile, cacheFilePath);
     } catch {
         // The cache is only an optimization; spend summaries can still be recomputed.
+    } finally {
+        if (tempFile) { try { fs.rmSync(tempFile, { force: true }); } catch {} }
+        if (acquired) { try { fs.rmSync(lock, { force: true }); } catch {} }
     }
 }
 
@@ -801,6 +777,72 @@ export function computeSpendSummaryFromChatSessionDirs(
     const dedupedCandidates = new Map<string, SpendRequestCandidate>();
     const undedupedCandidates: SpendRequestCandidate[] = [];
     let fileCacheChanged = false;
+    const notes = new Set<string>();
+    const preferredSessions = new Map<string, number>();
+    const seenFiles = new Set<string>();
+    const selectedSources = new Map<string, { source: UsageFile; requests: SpendRequest[]; priority: number }>();
+    // Background rows already include child usage. Select one representation per session
+    // before considering debug/transcript fallbacks; never add an inclusive parent twice.
+    const usageFiles = [...(options.usageFiles ?? [])].sort((a, b) => (a.kind === 'background' ? 0 : 1) - (b.kind === 'background' ? 0 : 1));
+    for (const source of usageFiles) {
+        let real: string;
+        let stat: fs.Stats;
+        try { real = fs.realpathSync(source.file); stat = fs.statSync(real); } catch { continue; }
+        if (seenFiles.has(real)) { continue; }
+        seenFiles.add(real);
+        const state = usageFileState(source, options.cliRoots, options.agentRoots);
+        if (Math.max(stat.mtimeMs,state.modifiedTime) < fileCutoff) { continue; }
+        const signature = state.signature;
+        const key = spendFileCacheKey(real);
+        const cached = fileCache.entries[key];
+        let requests: SpendRequest[];
+        let canonicalSessionId = source.sessionId;
+        if (cached?.signature === signature && cached.parserVersion === SPEND_FILE_CACHE_VERSION) {
+            requests = cached.requests;
+            canonicalSessionId = cached.sessionId ?? canonicalSessionId;
+            for (const note of cached.notes ?? []) { notes.add(note); }
+        } else {
+            let sourceNotes: string[] = [];
+            if (source.kind === 'background') {
+                const data = readBackgroundSession(real, options.cliRoots, options.agentRoots);
+                sourceNotes = data.notes;
+                canonicalSessionId = data.sessionId;
+                const sourcePriority = hasRecordedTokenTotals(data) ? 3 : 1;
+                requests = data.usage.map(u => ({
+                    modelUsage: u.modelUsage,
+                    timestamp: u.timestamp, intervalStart: u.intervalStart, nanoAiu: u.nanoAiu,
+                    modelDisplayName: u.detail?.modelDisplayName, tokensKnown: u.tokensKnown === true, inputTokens: u.inputTokens, outputTokens: u.outputTokens, cachedTokens: u.cachedTokens, model: u.model,
+                    sourcePriority,
+                    dedupeKey: `background:${data.sessionId}:${crypto.createHash('sha256').update(u.eventId ?? u.id).digest('hex')}`,
+                }));
+            } else { requests = debugSpendRequests(real); }
+            if (sourceNotes.some(n => /unavailable or unreadable/.test(n)) && cached?.parserVersion === SPEND_FILE_CACHE_VERSION) {
+                requests = cached.requests;
+                sourceNotes.push('Using the last readable saved usage while the agent database is busy.');
+            }
+            updateSpendFileCache(fileCache, real, stat, requests, now);
+            // A changing or unreadable source must be retried, never frozen in the cache.
+            fileCache.entries[key].signature = sourceNotes.some(n => /unavailable or unreadable/.test(n)) || usageFileSignature(source, options.cliRoots, options.agentRoots) !== signature ? undefined : signature;
+            fileCache.entries[key].sessionId = canonicalSessionId;
+            fileCache.entries[key].notes = sourceNotes;
+            sourceNotes.forEach(n => notes.add(n));
+            fileCacheChanged = true;
+        }
+        summary.scannedFiles++;
+        if (!requests.length) { continue; }
+        const priority = requests[0].sourcePriority ?? 0;
+        const selected = selectedSources.get(canonicalSessionId);
+        if (!selected || priority > selected.priority) { selectedSources.set(canonicalSessionId, { source: { ...source, sessionId: canonicalSessionId }, requests: [...requests], priority }); }
+        else if (priority === selected.priority) { selected.requests.push(...requests); }
+    }
+    for (const { source, requests, priority } of selectedSources.values()) {
+        if (source.kind === 'background' || requests.some(r => !r.dedupeKey?.startsWith('response:'))) { preferredSessions.set(source.sessionId, priority); }
+        const unique = new Map(requests.map((request, i) => [request.dedupeKey ?? `index:${i}`, request]));
+        for (const request of unique.values()) {
+            if (request.timestamp === undefined) { summary.undatedRequests = (summary.undatedRequests ?? 0) + 1; continue; }
+            collectSpendCandidate(dedupedCandidates, undedupedCandidates, { request: request as SpendRequest & { timestamp: number }, sessionKey: source.sessionId, workspace: source });
+        }
+    }
 
     for (const chatDir of chatSessionDirs) {
         let entries: fs.Dirent[];
@@ -816,8 +858,13 @@ export function computeSpendSummaryFromChatSessionDirs(
             }
 
             const filePath = path.join(chatDir.dir, entry.name);
+            const sessionId = path.basename(entry.name, '.jsonl');
+            if (preferredSessions.has(sessionId)) { continue; }
             let stat: fs.Stats;
             try {
+                const real = fs.realpathSync(filePath);
+                if (seenFiles.has(real)) { continue; }
+                seenFiles.add(real);
                 stat = fs.statSync(filePath);
             } catch {
                 continue;
@@ -827,8 +874,7 @@ export function computeSpendSummaryFromChatSessionDirs(
             }
 
             summary.scannedFiles++;
-            const sessionId = path.basename(entry.name, '.jsonl');
-            const sessionKey = `${chatDir.workspaceKey}:${sessionId}`;
+            const sessionKey = sessionId;
             let requests = getCachedSpendRequests(fileCache, filePath, stat);
             if (!requests) {
                 requests = readSpendRequestsFromChatSession(filePath);
@@ -841,8 +887,9 @@ export function computeSpendSummaryFromChatSessionDirs(
                     continue;
                 }
 
+                if (request.inputIsContext) { notes.add('Transcript context-window input counts are excluded from cumulative tokens.'); }
                 collectSpendCandidate(dedupedCandidates, undedupedCandidates, {
-                    request: request as SpendRequest & { timestamp: number },
+                    request: { ...request, inputTokens: request.inputIsContext ? 0 : request.inputTokens } as SpendRequest & { timestamp: number },
                     sessionKey,
                     workspace: chatDir,
                 });
@@ -851,20 +898,31 @@ export function computeSpendSummaryFromChatSessionDirs(
     }
 
     const candidates = [...dedupedCandidates.values(), ...undedupedCandidates];
-    for (const { request, sessionKey, workspace } of candidates) {
+    const modelNames = new ModelNames();
+    const learnModels = (request: SpendRequest) => { modelNames.learn(request.model, request.modelDisplayName); request.modelUsage?.forEach(learnModels); };
+    const resolveModels = (request: SpendRequest): SpendRequest => {
+        const model = modelNames.resolve(request.model);
+        if (request.nanoAiu === 0 && /^gpt-4o-mini(?:-\d{4}-\d{2}-\d{2})?$/.test(model.key)) { model.key = 'utility-no-charge'; model.label = 'Utility (no recorded charge)'; }
+        return { ...request, model: model.label, modelKey: model.key, modelUsage: request.modelUsage?.map(resolveModels) };
+    };
+    candidates.forEach(c => learnModels(c.request));
+    for (const candidate of candidates) {
+        const { sessionKey, workspace } = candidate;
+        const request = resolveModels(candidate.request) as SpendRequest & { timestamp: number };
         const timestamp = request.timestamp;
-        if (timestamp >= todayCutoff) {
+        if (timestamp > now) { continue; }
+        if ((request.intervalStart ?? timestamp) >= todayCutoff) {
             addToSpendBucket(summary.today, request, todaySessions, sessionKey);
             addToSpendWorkspaces(todayWorkspaces, request, sessionKey, workspace);
             addToSpendModels(todayModels, request, sessionKey);
         }
         if (includeHistory && summary.week && summary.month) {
-            if (timestamp >= monthCutoff) {
+            if ((request.intervalStart ?? timestamp) >= monthCutoff) {
                 addToSpendBucket(summary.month, request, monthSessions, sessionKey);
                 addToSpendWorkspaces(monthWorkspaces, request, sessionKey, workspace);
                 addToSpendModels(monthModels, request, sessionKey);
             }
-            if (timestamp >= weekCutoff) {
+            if ((request.intervalStart ?? timestamp) >= weekCutoff) {
                 addToSpendBucket(summary.week, request, weekSessions, sessionKey);
                 addToSpendWorkspaces(weekWorkspaces, request, sessionKey, workspace);
                 addToSpendModels(weekModels, request, sessionKey);
@@ -872,16 +930,20 @@ export function computeSpendSummaryFromChatSessionDirs(
         }
     }
 
+    summary.notes = [...notes];
     summary.today.workspaces = finalizeSpendWorkspaces(todayWorkspaces);
     summary.today.models = finalizeSpendModels(todayModels);
+    summary.today.unattributed = todayModels.modelBuckets.get('unattributed-usage');
     if (includeHistory) {
         if (summary.week) {
             summary.week.workspaces = finalizeSpendWorkspaces(weekWorkspaces);
             summary.week.models = finalizeSpendModels(weekModels);
+            summary.week.unattributed = weekModels.modelBuckets.get('unattributed-usage');
         }
         if (summary.month) {
             summary.month.workspaces = finalizeSpendWorkspaces(monthWorkspaces);
             summary.month.models = finalizeSpendModels(monthModels);
+            summary.month.unattributed = monthModels.modelBuckets.get('unattributed-usage');
         }
     }
 

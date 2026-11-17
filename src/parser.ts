@@ -1,10 +1,41 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { AgentDetails, RoutingDecision, PermissionCheck, ModelSelection, applyPricingDiagnostics } from './backgroundDiagnostics';
+import { BackgroundData, hasRecordedTokenTotals, readBackgroundSession } from './background';
 
 export const NANO_AIU_PER_AIC = 1_000_000_000;
 const IN_PROGRESS_SUBAGENT_STALE_MS = 5 * 60 * 1000;
 
-export interface LlmRequestAttrs {
+export interface CallDiagnostics {
+    modelDisplayName?: string;
+    responseModel?: string;
+    contextTier?: string;
+    isByok?: boolean;
+    initiator?: string;
+    tokensKnown?: boolean;
+    isAuto?: boolean;
+    provider?: string;
+    cachePreviouslyExpired?: boolean;
+    usageKind?: 'call' | 'saved' | 'adjustment';
+    durationKnown?: boolean;
+    contextKnown?: boolean;
+    cacheWriteTokens?: number;
+    tokenDetails?: { model?: string; tokenType: string; tokenCount: number; batchSize?: number; costPerBatch?: number }[];
+    cacheExpiresAt?: string;
+    reasoningTokens?: number;
+    reasoningEffort?: string;
+    finishReason?: string;
+    interTokenLatencyMs?: number;
+    maxPromptTokens?: number;
+    toolTokenCount?: number;
+    availableToolCount?: number;
+    premiumRequests?: number;
+    agentId?: string;
+}
+
+export interface LlmRequestAttrs extends CallDiagnostics {
+    userMessageId?: string;
+    modelCallId?: string;
     model?: string;
     debugName?: string;
     inputTokens?: number;
@@ -16,6 +47,7 @@ export interface LlmRequestAttrs {
     systemPromptFile?: string;
     toolsFile?: string;
     inputMessages?: string;
+    inputMessagesChars?: number;
 }
 
 export interface ToolCallAttrs {
@@ -34,6 +66,7 @@ export interface UserMessageAttrs {
 
 export interface LogEntry {
     v?: number;
+    rIdx?: number;
     ts: number;
     dur: number;
     sid: string;
@@ -54,6 +87,7 @@ export interface LogEntry {
 }
 
 export interface ToolCallSummary {
+    status?: string;
     name: string;
     displayLabel: string; // e.g. "Ran: git clone...", "Search: chat debug"
     durationMs: number;
@@ -68,7 +102,9 @@ export interface ToolCallSummary {
     subagentInProgress?: boolean;
 }
 
-export interface ModelTurnSummary {
+export interface ModelTurnSummary extends CallDiagnostics {
+    ttftKnown?: boolean;
+    responseId?: string;
     model: string;
     inputTokens: number;
     outputTokens: number;
@@ -94,6 +130,9 @@ export interface MergedMessageInfo {
 }
 
 export interface UserMessageSummary {
+    tokensKnown?: boolean;
+    durationKnown?: boolean;
+    contextKnown?: boolean;
     spanId: string;
     content: string;
     timestamp: number;
@@ -113,9 +152,19 @@ export interface UserMessageSummary {
 }
 
 export interface SessionSummary {
+    modelSelections?: ModelSelection[];
+    tokensKnown?: boolean;
+    routing?: RoutingDecision[];
+    agents?: AgentDetails[];
+    permissionChecks?: PermissionCheck[];
+    durationKnown?: boolean;
+    hookDurationMs?: number;
+    compactionCount?: number;
+    codeChanges?: { linesAdded?: number; linesRemoved?: number; filesChanged?: number };
     sessionId: string;
     title?: string;
-    sourceType?: 'debugLog' | 'chatSession';
+    sourceType?: 'debugLog' | 'chatSession' | 'background';
+    usageNotes?: string[];
     inProgress?: boolean;
     userMessages: UserMessageSummary[];
     totalInputTokens: number;
@@ -132,7 +181,7 @@ export interface SessionSummary {
 export interface ParsedSessionFile {
     summary: SessionSummary;
     sourceFile: string;
-    sourceType: 'debugLog' | 'chatSession';
+    sourceType: 'debugLog' | 'chatSession' | 'background';
 }
 
 export interface ToolDefinitionSize {
@@ -300,6 +349,7 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
 
     return {
         v: raw.v,
+        rIdx: raw.rIdx,
         ts,
         dur: toNumber(firstDefined(raw.dur, raw.durationMs, raw.duration_ms, rawAttrs.dur, rawAttrs.durationMs)) || 0,
         sid: sessionId,
@@ -309,7 +359,6 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
         parentSpanId: asString(firstDefined(raw.parentSpanId, raw.parentSpanID, rawAttrs.parentSpanId), undefined as any),
         status: asString(firstDefined(raw.status, rawAttrs.status), 'ok'),
         attrs: {
-            ...rawAttrs,
             turnId: firstDefined(rawAttrs.turnId, raw.turnId),
             childLogFile: firstDefined(rawAttrs.childLogFile, raw.childLogFile),
             childSessionId: firstDefined(rawAttrs.childSessionId, raw.childSessionId),
@@ -325,7 +374,7 @@ function normalizeEntry(raw: any, index: number): LogEntry | undefined {
             responseId: firstDefined(rawAttrs.responseId, raw.responseId),
             systemPromptFile: firstDefined(rawAttrs.systemPromptFile, raw.systemPromptFile),
             toolsFile: firstDefined(rawAttrs.toolsFile, raw.toolsFile),
-            inputMessages: firstDefined(rawAttrs.inputMessages, raw.inputMessages),
+            inputMessagesChars: asString(firstDefined(rawAttrs.inputMessages, raw.inputMessages)).length,
             args: stringifyValue(firstDefined(rawAttrs.args, raw.args)),
             result: stringifyValue(firstDefined(rawAttrs.result, raw.result)),
             displayLabel: firstDefined(rawAttrs.displayLabel, raw.displayLabel),
@@ -409,11 +458,11 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         // Group by timestamp boundaries only. SpanIds get recycled across messages
         // so parentSpanId matching is unreliable.
         const msgLlmRequests = llmRequests.filter(r =>
-            r.ts >= msg.ts && (nextMsg ? r.ts < nextMsg.ts : true)
+            r.attrs.userMessageId ? r.attrs.userMessageId === msg.spanId : r.ts >= msg.ts && (nextMsg ? r.ts < nextMsg.ts : true)
         );
 
         const msgToolCalls = toolCalls.filter(t =>
-            t.ts >= msg.ts && (nextMsg ? t.ts < nextMsg.ts : true)
+            t.attrs.userMessageId ? t.attrs.userMessageId === msg.spanId : t.ts >= msg.ts && (nextMsg ? t.ts < nextMsg.ts : true)
         );
 
         rawGroups.push({ msg, llmRequests: msgLlmRequests, toolCalls: msgToolCalls });
@@ -459,23 +508,40 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         group.allToolCalls.sort((a, b) => a.ts - b.ts);
 
         const modelTurns: ModelTurnSummary[] = [];
-        for (let j = 0; j < group.allLlmRequests.length; j++) {
-            const r = group.allLlmRequests[j];
-            const nextR = group.allLlmRequests[j + 1];
-
-            const turnToolCalls = group.allToolCalls.filter(t =>
-                t.ts >= r.ts && (nextR ? t.ts < nextR.ts : true)
-            );
-            const preTools = j === 0
-                ? group.allToolCalls.filter(t => t.ts < r.ts)
-                : [];
-
-            const allTurnTools = [...preTools, ...turnToolCalls];
+        const callsById = new Map<string, LogEntry[]>();
+        const toolsByCall = new Map<LogEntry, LogEntry[]>();
+        for (const call of group.allLlmRequests) {
+            if (call.attrs.modelCallId) {
+                const same = callsById.get(call.attrs.modelCallId) ?? [];
+                same.push(call); callsById.set(call.attrs.modelCallId, same);
+            }
+        }
+        for (const tool of group.allToolCalls) {
+            const candidates = (tool.attrs.modelCallId && callsById.get(tool.attrs.modelCallId)) || group.allLlmRequests;
+            if (!candidates.length) { continue; }
+            // Latest preceding call, with pre-call tools attached to the first call.
+            let lo = 0, hi = candidates.length;
+            while (lo < hi) { const mid = (lo + hi) >>> 1; if (candidates[mid].ts <= tool.ts) { lo = mid + 1; } else { hi = mid; } }
+            const call = candidates[Math.max(0, lo - 1)];
+            const tools = toolsByCall.get(call) ?? [];
+            tools.push(tool); toolsByCall.set(call, tools);
+        }
+        for (const r of group.allLlmRequests) {
+            const allTurnTools = toolsByCall.get(r) ?? [];
 
             const inputTk = r.attrs.inputTokens || 0;
             const cachedTk = r.attrs.cachedTokens || 0;
 
             modelTurns.push({
+                modelDisplayName: r.attrs.modelDisplayName, responseModel: r.attrs.responseModel, contextTier: r.attrs.contextTier, isByok: r.attrs.isByok, initiator: r.attrs.initiator,
+                tokensKnown: r.attrs.tokensKnown, isAuto: r.attrs.isAuto, provider: r.attrs.provider,
+                usageKind: r.attrs.usageKind, durationKnown: r.attrs.durationKnown,
+                ttftKnown: r.attrs.ttft !== undefined, contextKnown: r.attrs.contextKnown,
+                cacheWriteTokens: r.attrs.cacheWriteTokens, tokenDetails: r.attrs.tokenDetails,
+                cacheExpiresAt: r.attrs.cacheExpiresAt, reasoningTokens: r.attrs.reasoningTokens, reasoningEffort: r.attrs.reasoningEffort,
+                finishReason: r.attrs.finishReason, interTokenLatencyMs: r.attrs.interTokenLatencyMs, maxPromptTokens: r.attrs.maxPromptTokens,
+                toolTokenCount: r.attrs.toolTokenCount, availableToolCount: r.attrs.availableToolCount, premiumRequests: r.attrs.premiumRequests, agentId: r.attrs.agentId,
+                responseId: r.attrs.responseId,
                 model: r.attrs.model || 'unknown',
                 inputTokens: inputTk,
                 outputTokens: r.attrs.outputTokens || 0,
@@ -487,14 +553,15 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
                 timestamp: r.ts,
                 debugName: r.attrs.debugName || r.name || '',
                 cacheHitRatio: inputTk > 0 ? cachedTk / inputTk : 0,
-                freshTokens: inputTk - cachedTk,
+                freshTokens: Math.max(0, inputTk - cachedTk - (r.attrs.cacheWriteTokens ?? 0)),
                 systemPromptFile: r.attrs.systemPromptFile,
                 toolsFile: r.attrs.toolsFile,
-                inputMessagesChars: (r.attrs.inputMessages || '').length,
+                inputMessagesChars: r.attrs.inputMessagesChars ?? (r.attrs.inputMessages || '').length,
                 toolCalls: allTurnTools.map(t => ({
                     name: t.name,
                     displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
                     durationMs: t.dur,
+                    status: t.status,
                     timestamp: t.ts,
                     spanId: t.spanId,
                     isSubagent: t.name === 'runSubagent',
@@ -510,6 +577,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             name: t.name,
             displayLabel: getToolDisplayLabel(t.name, t.attrs.args, t.attrs.displayLabel),
             durationMs: t.dur,
+                    status: t.status,
             timestamp: t.ts,
             spanId: t.spanId,
             isSubagent: t.name === 'runSubagent',
@@ -543,6 +611,9 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
             totalNanoAiu: totalNano,
             totalDurationMs: totalDur,
             contextCharsAtStart: firstTurn ? firstTurn.inputMessagesChars : 0,
+            contextKnown: firstTurn?.contextKnown,
+            tokensKnown: modelTurns.length > 0 && modelTurns.every(t => t.tokensKnown !== false),
+            durationKnown: modelTurns.length > 0 && modelTurns.every(t => t.durationKnown !== false),
             systemPromptFile: firstTurn?.systemPromptFile,
             toolsFile: firstTurn?.toolsFile,
         });
@@ -554,7 +625,7 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
     const totalTokens = messageSummaries.reduce((s, m) => s + m.totalTokens, 0);
     const totalNano = messageSummaries.reduce((s, m) => s + m.totalNanoAiu, 0);
     const totalDur = messageSummaries.reduce((s, m) => s + m.totalDurationMs, 0);
-    const modelTurnCount = messageSummaries.reduce((s, m) => s + m.modelTurns.length, 0);
+    const modelTurnCount = messageSummaries.reduce((s, m) => s + m.modelTurns.filter(t => !t.usageKind || t.usageKind === 'call').length, 0);
     const toolCallCount = messageSummaries.reduce((s, m) => s + m.toolCalls.length, 0);
 
     return {
@@ -566,6 +637,8 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
         totalTokens,
         totalNanoAiu: totalNano,
         totalDurationMs: totalDur,
+        tokensKnown: messageSummaries.every(m => m.tokensKnown !== false),
+        durationKnown: messageSummaries.every(m => m.durationKnown !== false),
         modelTurnCount,
         toolCallCount,
     };
@@ -574,6 +647,9 @@ export function parseEntries(entries: LogEntry[]): SessionSummary | undefined {
 /** Quick-peek: check if a JSONL file contains billing data in first 4KB */
 export function quickPeekHasBillingData(filePath: string): boolean {
     try {
+        if (['session.db', 'events.jsonl'].includes(path.basename(filePath))) {
+            return readBackgroundSession(filePath, backgroundCliRoots, backgroundAgentRoots).usage.some(u => u.nanoAiu > 0 || u.inputTokens > 0 || u.outputTokens > 0);
+        }
         const fd = fs.openSync(filePath, 'r');
         const buf = Buffer.alloc(4096);
         const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
@@ -806,6 +882,8 @@ function getChatRequestOutputTokens(request: any): number {
 
 function getChatRequestInputTokens(request: any): number {
     return toNumber(firstDefined(
+        request.result?.metadata?.usage?.inputTokens,
+        request.result?.metadata?.usage?.input_tokens,
         request.promptTokens,
         request.inputTokens,
         request.prompt_tokens,
@@ -896,6 +974,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
 
     const requests = Array.isArray(state.requests) ? state.requests : [];
     const entries: LogEntry[] = [];
+    let contextOnlyInput = false;
 
     for (let i = 0; i < requests.length; i++) {
         const request = requests[i];
@@ -935,7 +1014,11 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
         }
 
         const turnTimestamp = timestamp + 1;
-        const inputTokens = getChatRequestInputTokens(request);
+        const usage = request.result?.metadata?.usage;
+        const inputIsContext = usage?.inputTokens === undefined && usage?.input_tokens === undefined &&
+            (request.promptTokens !== undefined || request.result?.metadata?.promptTokens !== undefined);
+        contextOnlyInput ||= inputIsContext;
+        const inputTokens = inputIsContext ? 0 : getChatRequestInputTokens(request);
         const outputTokens = getChatRequestOutputTokens(request);
         const nanoAiu = getChatRequestNanoAiu(request);
 
@@ -994,6 +1077,7 @@ export function parseChatSessionLog(filePath: string): SessionSummary | undefine
 
     summary.title = title || (typeof state.customTitle === 'string' ? state.customTitle : undefined);
     summary.sourceType = 'chatSession';
+    if (contextOnlyInput) { summary.usageNotes = ['Transcript input is a context-window gauge; cumulative input tokens are unavailable.']; }
     return summary;
 }
 
@@ -1015,8 +1099,46 @@ export function findSiblingChatSessionLog(debugLogFilePath: string): string | un
     return fs.existsSync(candidate) ? candidate : undefined;
 }
 
+function backgroundSummary(filePath: string, data: BackgroundData): ParsedSessionFile | undefined {
+    const summary = parseEntries(data.entries);
+    if (!summary) { return undefined; }
+    summary.sourceType = 'background';
+    summary.modelSelections = data.modelSelections;
+    summary.routing = data.routing;
+    summary.agents = data.agents;
+    summary.permissionChecks = data.permissionChecks;
+    applyPricingDiagnostics(summary.userMessages.flatMap(m => m.modelTurns), data.catalog);
+    summary.title = data.title;
+    summary.usageNotes = data.notes;
+    summary.hookDurationMs = data.hookDurationMs;
+    summary.compactionCount = data.compactionCount;
+    summary.codeChanges = data.codeChanges;
+    return { summary, sourceFile: filePath, sourceType: 'background' };
+}
+
 export function parseCopilotSessionFile(filePath: string): ParsedSessionFile | undefined {
-    if (path.basename(path.dirname(filePath)) === 'chatSessions') {
+    const background = ['events.jsonl', 'session.db'].includes(path.basename(filePath));
+    const sessionId = path.basename(path.dirname(filePath));
+    const debugFile = background
+        ? backgroundDebugRoots.map(root => path.join(root, sessionId, 'main.jsonl')).find(fs.existsSync)
+        : filePath;
+    const savedFile = background ? filePath : [
+        ...backgroundAgentRoots.map(root => path.join(root, sessionId, 'session.db')),
+        ...backgroundCliRoots.map(root => path.join(root, sessionId, 'events.jsonl')),
+    ].find(fs.existsSync);
+    if (savedFile) {
+        const data = readBackgroundSession(savedFile, backgroundCliRoots, backgroundAgentRoots);
+        // Use the same source precedence as the cumulative scan: whole-turn persisted usage,
+        // then model-call debug logs, then credit-only sidecars or incomplete saved usage.
+        if (!debugFile || hasRecordedTokenTotals(data)) {
+            return backgroundSummary(savedFile, data);
+        }
+    }
+    if (background && debugFile) { filePath = debugFile; }
+    if (background && !debugFile) {
+        return backgroundSummary(filePath, readBackgroundSession(filePath, backgroundCliRoots, backgroundAgentRoots));
+    }
+    if (['chatSessions', 'emptyWindowChatSessions'].includes(path.basename(path.dirname(filePath)))) {
         const summary = parseChatSessionLog(filePath);
         return summary ? { summary, sourceFile: filePath, sourceType: 'chatSession' } : undefined;
     }
@@ -1039,6 +1161,13 @@ export function parseCopilotSessionFile(filePath: string): ParsedSessionFile | u
     return chatSummary && chatSessionLog
         ? { summary: chatSummary, sourceFile: chatSessionLog, sourceType: 'chatSession' }
         : undefined;
+}
+
+let backgroundCliRoots: string[] = [];
+let backgroundAgentRoots: string[] = [];
+let backgroundDebugRoots: string[] = [];
+export function setBackgroundCliRoots(roots: string[], agentRoots: string[] = [], debugRoots: string[] = []): void {
+    backgroundCliRoots = roots; backgroundAgentRoots = agentRoots; backgroundDebugRoots = debugRoots;
 }
 
 export function parseCopilotSessionLog(filePath: string): SessionSummary | undefined {
@@ -1136,7 +1265,7 @@ function createSyntheticSubagentCall(orphanFile: string, timestamp: number, chil
     };
 }
 
-function attachInProgressSubagents(summary: SessionSummary, sessionDir: string, childRefs: LogEntry[]): void {
+function attachInProgressSubagents(summary: SessionSummary, sessionDir: string, childRefs: LogEntry[], ancestors: Set<string>): void {
     const referencedChildFiles = new Set(
         childRefs
             .map(ref => typeof ref.attrs.childLogFile === 'string' ? path.basename(ref.attrs.childLogFile) : undefined)
@@ -1172,7 +1301,7 @@ function attachInProgressSubagents(summary: SessionSummary, sessionDir: string, 
             continue;
         }
 
-        const childSummary = parseDebugLog(childFile);
+        const childSummary = parseDebugLog(childFile, ancestors);
         if (!childSummary) { continue; }
         childSummary.inProgress = true;
 
@@ -1208,31 +1337,41 @@ function attachInProgressSubagents(summary: SessionSummary, sessionDir: string, 
 }
 
 /** Parse a debug log file from disk */
-export function parseDebugLog(filePath: string): SessionSummary | undefined {
+interface DebugEntryCache { ino: number; mtime: number; size: number; offset: number; edge: string; entries: LogEntry[]; }
+const debugEntryCache = new Map<string, DebugEntryCache>();
+
+function debugEdge(file: string, size: number): string {
+    const fd = fs.openSync(file, 'r');
+    const buffer = Buffer.alloc(Math.min(128, size));
+    try {
+        const head = fs.readSync(fd, buffer, 0, buffer.length, 0);
+        const first = buffer.subarray(0, head).toString('base64');
+        const tail = fs.readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length));
+        return `${first}:${buffer.subarray(0, tail).toString('base64')}`;
+    } finally { fs.closeSync(fd); }
+}
+
+function cachedDebugEntries(file: string): LogEntry[] {
+    const stat = fs.statSync(file);
+    let previous = debugEntryCache.get(file);
+    if (previous?.ino === stat.ino && previous.size === stat.size && previous.mtime === stat.mtimeMs) { return previous.entries; }
+    if (previous && (previous.ino !== stat.ino || stat.size <= previous.size || debugEdge(file, previous.size) !== previous.edge)) { previous = undefined; }
+    const read = readEntriesIncremental(file, previous?.offset ?? 0);
+    const entries = previous ? [...previous.entries, ...read.entries] : read.entries;
+    debugEntryCache.delete(file);
+    debugEntryCache.set(file, { ino: stat.ino, size: stat.size, mtime: stat.mtimeMs, offset: read.newOffset, edge: debugEdge(file, stat.size), entries });
+    if (debugEntryCache.size > 16) { debugEntryCache.delete(debugEntryCache.keys().next().value!); }
+    return entries;
+}
+
+export function parseDebugLog(filePath: string, ancestors = new Set<string>()): SessionSummary | undefined {
     if (!fs.existsSync(filePath)) {
         return undefined;
     }
-
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n').filter(l => l.trim());
-    const entries: LogEntry[] = [];
-
-    for (const line of lines) {
-        try {
-            const raw = JSON.parse(line);
-            const normalizedEntries = normalizeParsedEntries(raw, entries.length);
-
-            for (const entry of normalizedEntries) {
-                // Filter out title-generation LLM requests (internal Copilot calls)
-                if (entry.type === 'llm_request' && isTitleGenerationRequest(entry)) {
-                    continue;
-                }
-                entries.push(entry);
-            }
-        } catch {
-            // skip malformed lines
-        }
-    }
+    const real = fs.realpathSync(filePath);
+    if (ancestors.has(real)) { return undefined; }
+    const visited = new Set([...ancestors, real]);
+    const entries = [...cachedDebugEntries(real)].sort((a, b) => a.ts - b.ts);
 
     const summary = parseEntries(entries);
     if (!summary) { return undefined; }
@@ -1242,9 +1381,12 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     const childRefs = entries.filter(e => e.type === 'child_session_ref' && e.attrs.childLogFile);
 
     for (const ref of childRefs) {
-        const childFile = path.join(sessionDir, ref.attrs.childLogFile as string);
+        const childFile = path.resolve(sessionDir, ref.attrs.childLogFile as string);
+        if (path.dirname(childFile) !== path.resolve(sessionDir)) { continue; }
         if (!fs.existsSync(childFile)) { continue; }
-        const childSummary = parseDebugLog(childFile);
+        if (visited.has(fs.realpathSync(childFile))) { continue; }
+        visited.add(fs.realpathSync(childFile));
+        const childSummary = parseDebugLog(childFile, new Set([...ancestors, real]));
         if (!childSummary) { continue; }
 
         const parentSpanId = ref.parentSpanId;
@@ -1258,7 +1400,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     }
 
     if (path.basename(filePath) === 'main.jsonl') {
-        attachInProgressSubagents(summary, sessionDir, childRefs);
+        attachInProgressSubagents(summary, sessionDir, childRefs, new Set([...ancestors, real]));
     }
 
     // Roll up subagent costs into parent message and session totals
@@ -1271,6 +1413,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
                     msg.totalOutputTokens += sub.totalOutputTokens;
                     msg.totalCachedTokens += sub.totalCachedTokens;
                     msg.totalTokens += sub.totalTokens;
+                    msg.tokensKnown = msg.tokensKnown !== false && sub.tokensKnown !== false;
                     msg.totalNanoAiu += sub.totalNanoAiu;
                     msg.totalDurationMs += sub.totalDurationMs;
                 }
@@ -1281,6 +1424,7 @@ export function parseDebugLog(filePath: string): SessionSummary | undefined {
     summary.totalInputTokens = summary.userMessages.reduce((s, m) => s + m.totalInputTokens, 0);
     summary.totalOutputTokens = summary.userMessages.reduce((s, m) => s + m.totalOutputTokens, 0);
     summary.totalCachedTokens = summary.userMessages.reduce((s, m) => s + m.totalCachedTokens, 0);
+    summary.tokensKnown = summary.userMessages.every(m => m.tokensKnown !== false);
     summary.totalTokens = summary.userMessages.reduce((s, m) => s + m.totalTokens, 0);
     summary.totalNanoAiu = summary.userMessages.reduce((s, m) => s + m.totalNanoAiu, 0);
     summary.totalDurationMs = summary.userMessages.reduce((s, m) => s + m.totalDurationMs, 0);
@@ -1351,18 +1495,25 @@ function parsePromptComposition(sessionDir: string, entries: LogEntry[]): Prompt
  */
 export function readEntriesIncremental(filePath: string, fromOffset: number): { entries: LogEntry[]; newOffset: number } {
     const stat = fs.statSync(filePath);
-    if (stat.size <= fromOffset) {
+    if (stat.size < fromOffset) { fromOffset = 0; }
+    if (stat.size === fromOffset) {
         return { entries: [], newOffset: fromOffset };
     }
 
     const fd = fs.openSync(filePath, 'r');
     const bufSize = stat.size - fromOffset;
     const buf = Buffer.alloc(bufSize);
-    fs.readSync(fd, buf, 0, bufSize, fromOffset);
-    fs.closeSync(fd);
+    let bytesRead: number;
+    try { bytesRead = fs.readSync(fd, buf, 0, bufSize, fromOffset); }
+    finally { fs.closeSync(fd); }
 
-    const chunk = buf.toString('utf-8');
-    const lines = chunk.split('\n').filter(l => l.trim());
+    const readBuffer = buf.subarray(0, bytesRead);
+    let completeBytes = readBuffer.lastIndexOf(10) + 1;
+    // Accept a complete final record without a newline, but retain a partial record for retry.
+    if (completeBytes < bytesRead) {
+        try { JSON.parse(readBuffer.subarray(completeBytes).toString('utf8')); completeBytes = bytesRead; } catch { /* Writer has not finished this record. */ }
+    }
+    const lines = readBuffer.subarray(0, completeBytes).toString('utf8').split('\n').filter(l => l.trim());
     const entries: LogEntry[] = [];
 
     for (const line of lines) {
@@ -1381,7 +1532,7 @@ export function readEntriesIncremental(filePath: string, fromOffset: number): { 
         }
     }
 
-    return { entries, newOffset: stat.size };
+    return { entries, newOffset: fromOffset + completeBytes };
 }
 
 export function formatNumber(n: number): string {
@@ -1395,4 +1546,9 @@ export function formatAic(nanoAiu: number): string {
 export function formatDuration(ms: number): string {
     if (ms < 1000) { return `${ms}ms`; }
     return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Missing counts are distinct from a recorded zero; partial aggregates retain known counts. */
+export function formatRecordedTokens(value: number, known?: boolean): string {
+    return known === false ? (value > 0 ? `${formatNumber(value)} recorded` : 'Not saved') : formatNumber(value);
 }

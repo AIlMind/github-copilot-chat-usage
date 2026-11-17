@@ -1,0 +1,37 @@
+{
+  "status": "passed",
+  "vscode": "1.146.0",
+  "sourceCommit": "69047191fc427f2f92828279aae1d90d8eeda7ab",
+  "node": "24.22.1",
+  "sdk": "1.0.30-preview.0",
+  "graphToolPassed": true,
+  "agentStores": 32,
+  "remappedAgentStores": 2,
+  "storesWithoutSavedUsage": 30,
+  "unreadableStores": 0,
+  "calls": 29,
+  "subagentCalls": 25,
+  "sdkLog": {
+    "nanoAiu": 3882857000,
+    "inputTokens": 1522615,
+    "outputTokens": 16124,
+    "cachedTokens": 1387462
+  },
+  "sdkIndex": {
+    "nanoAiu": 3882857000,
+    "inputTokens": 1522615,
+    "outputTokens": 16124,
+    "cachedTokens": 1387462
+  },
+  "saved": {
+    "nanoAiu": 3882857000,
+    "inputTokens": 1522615,
+    "outputTokens": 16124,
+    "cachedTokens": 1387462
+  },
+  "datedTurns": 1,
+  "unmatchedIndexCalls": 0,
+  "unmatchedLogCalls": 0,
+  "comparison": "Per-session, per-agent, per-model measured-usage multisets. Cross-store event identities are not equated.",
+  "scope": "Local Copilot stores visible to this process. Does not certify inaccessible remote/cloud hosts, unsaved calls, or Claude/Codex provider-specific history."
+}

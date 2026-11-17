@@ -7,19 +7,18 @@
  */
 
 import * as vscode from 'vscode';
-import { SessionSummary, parseCopilotSessionLog } from './parser';
+import { SessionSummary } from './parser';
+import type { SessionCandidate } from './scanner';
 import { SessionGraph } from './graph';
 
 // ---- Shared state ----
 
 let currentGraph: SessionGraph | undefined;
-const loadedGraphs = new Map<string, SessionGraph>();
 
-type SessionFinder = (daysBack?: number) => { id: string; mainJsonl: string; modifiedTime: number }[];
-type TitleResolver = (id: string) => string | undefined;
-
-let sessionFinder: SessionFinder = () => [];
-let titleResolver: TitleResolver = () => undefined;
+type SessionFinder = (daysBack?: number) => Promise<SessionCandidate[]>;
+type SessionLoader = (candidate: SessionCandidate) => Promise<SessionSummary | undefined>;
+let sessionFinder: SessionFinder = async () => [];
+let sessionLoader: SessionLoader = async () => undefined;
 
 function formatLocalDateTime(timestamp: number): string {
     return new Date(timestamp).toLocaleString(vscode.env.language || undefined);
@@ -28,7 +27,6 @@ function formatLocalDateTime(timestamp: number): string {
 export function setCurrentGraph(summary: SessionSummary): void {
     const graph = new SessionGraph(summary);
     currentGraph = graph;
-    loadedGraphs.set(summary.sessionId, graph);
 }
 
 export function getCurrentGraph(): SessionGraph | undefined {
@@ -44,10 +42,10 @@ interface SearchInput {
 }
 
 class SearchSessionsTool implements vscode.LanguageModelTool<SearchInput> {
-    invoke(options: vscode.LanguageModelToolInvocationOptions<SearchInput>): vscode.ProviderResult<vscode.LanguageModelToolResult> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<SearchInput>): Promise<vscode.LanguageModelToolResult> {
         const { query, daysBack = 3, limit = 25 } = options.input;
 
-        const sessions = sessionFinder(Math.max(daysBack, 2));
+        const sessions = await sessionFinder(Math.max(daysBack, 2));
         const cutoff = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
         const twoDayCutoff = Date.now() - (2 * 24 * 60 * 60 * 1000);
 
@@ -59,7 +57,7 @@ class SearchSessionsTool implements vscode.LanguageModelTool<SearchInput> {
             // Split query into words — each word is an OR wildcard match
             const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 0);
             searchResults = searchResults.filter(s => {
-                const title = (titleResolver(s.id) || '').toLowerCase();
+                const title = (s.title || '').toLowerCase();
                 const idLower = s.id.toLowerCase();
                 // Match if ANY word appears in title or id (OR logic, like wildcard)
                 return words.some(w => title.includes(w) || idLower.includes(w));
@@ -77,7 +75,7 @@ class SearchSessionsTool implements vscode.LanguageModelTool<SearchInput> {
         }
 
         const results = merged.slice(0, limit).map(s => {
-            const title = titleResolver(s.id);
+            const title = s.title;
             const date = formatLocalDateTime(s.modifiedTime);
             const isCurrent = currentGraph?.stats.sessionId === s.id;
             return `${isCurrent ? '→ [LOADED] ' : '  '}${title || s.id.slice(0, 8) + '...'} | ${date} | id:${s.id}`;
@@ -108,29 +106,21 @@ interface GetGraphInput {
 }
 
 class GetGraphTool implements vscode.LanguageModelTool<GetGraphInput> {
-    invoke(options: vscode.LanguageModelToolInvocationOptions<GetGraphInput>): vscode.ProviderResult<vscode.LanguageModelToolResult> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<GetGraphInput>): Promise<vscode.LanguageModelToolResult> {
         const { sessionId, includeMessages = true, maxMessages = 50 } = options.input;
 
         let graph: SessionGraph | undefined;
 
         if (sessionId) {
-            // Try exact match, then prefix match, then load from disk
-            graph = loadedGraphs.get(sessionId);
-            if (!graph) {
-                for (const [id, g] of loadedGraphs) {
-                    if (id.startsWith(sessionId)) { graph = g; break; }
-                }
-            }
-            if (!graph) {
-                const sessions = sessionFinder();
-                const match = sessions.find(s => s.id === sessionId || s.id.startsWith(sessionId));
-                if (match) {
-                    const summary = parseCopilotSessionLog(match.mainJsonl);
-                    if (summary) {
-                        summary.title = titleResolver(summary.sessionId);
-                        graph = new SessionGraph(summary);
-                        loadedGraphs.set(summary.sessionId, graph);
-                    }
+            // Re-resolve explicit requests from disk. An unselected background session can
+            // change without its graph ever receiving the current-session watcher events.
+            const sessions = await sessionFinder();
+            const match = sessions.find(s => s.id === sessionId) ?? sessions.find(s => s.id.startsWith(sessionId));
+            if (match) {
+                const summary = await sessionLoader(match);
+                if (summary) {
+                    summary.title = match.title || summary.title;
+                    graph = new SessionGraph(summary);
                 }
             }
         } else {
@@ -183,7 +173,7 @@ async function handleRequest(
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken
 ): Promise<vscode.ChatResult> {
-    if (!currentGraph && loadedGraphs.size === 0) {
+    if (!currentGraph && (await sessionFinder()).length === 0) {
         stream.markdown('No session data available. Load a session first using the **Copilot Usage** panel (dashboard icon in the activity bar).');
         return {};
     }
@@ -276,10 +266,10 @@ async function handleRequest(
 export function registerChatParticipant(
     context: vscode.ExtensionContext,
     findSessions: SessionFinder,
-    resolveTitle: TitleResolver
+    loadSession: SessionLoader
 ): void {
     sessionFinder = findSessions;
-    titleResolver = resolveTitle;
+    sessionLoader = loadSession;
 
     // Register tools (IDs must match /^[\w-]+$/ — no dots!)
     context.subscriptions.push(

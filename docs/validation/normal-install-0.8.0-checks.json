@@ -1,0 +1,48 @@
+{
+  "generatedAt": "2026-11-15T06:03:17.776Z",
+  "agentStores": 36,
+  "remappedAgentStores": 4,
+  "agentStoresWithoutUsage": 34,
+  "unreadableAgentStores": 0,
+  "sdkCalls": 29,
+  "indexedCalls": 29,
+  "indexedCallsWithoutMatchingLog": 0,
+  "logCallsWithoutMatchingIndex": 0,
+  "indexedSessionsWithoutEventFile": [],
+  "indexErrors": [],
+  "comparison": "Per-session, per-agent, per-model measured-usage multisets. Cross-store event identities are not equated.",
+  "scope": "Local Copilot stores visible to this process. Does not certify inaccessible remote/cloud hosts, unsaved calls, or Claude/Codex provider-specific history.",
+  "reconciliation": {
+    "saved": {
+      "nanoAiu": 3882857000,
+      "inputTokens": 1522615,
+      "outputTokens": 16124,
+      "cachedTokens": 1387462
+    },
+    "sdkLog": {
+      "nanoAiu": 3882857000,
+      "inputTokens": 1522615,
+      "outputTokens": 16124,
+      "cachedTokens": 1387462
+    },
+    "sdkIndex": {
+      "nanoAiu": 3882857000,
+      "inputTokens": 1522615,
+      "outputTokens": 16124,
+      "cachedTokens": 1387462
+    },
+    "calls": 29,
+    "subagentCalls": 25,
+    "datedTurns": 1,
+    "undatedTurns": 0,
+    "agrees": true,
+    "notes": [
+      "Saved usage is aggregated per user turn, including subagents."
+    ]
+  },
+  "installedProfiles": [
+    "Default",
+    ".net maui"
+  ],
+  "version": "0.8.0"
+}

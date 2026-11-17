@@ -11,11 +11,13 @@
 
 import {
     SessionSummary,
+    CallDiagnostics,
     UserMessageSummary,
     ModelTurnSummary,
     ToolCallSummary,
     PromptComposition,
     formatNumber,
+    formatRecordedTokens,
     formatAic,
     formatDuration,
     estimateTokens,
@@ -24,6 +26,9 @@ import {
 // ---- Public types (stable contract for consumers) ----
 
 export interface GraphMessage {
+    tokensKnown?: boolean;
+    durationKnown?: boolean;
+    contextKnown?: boolean;
     index: number;
     content: string; // capped at 100 words
     timestamp: number;
@@ -39,7 +44,8 @@ export interface GraphMessage {
     turns: GraphTurn[];
 }
 
-export interface GraphTurn {
+export interface GraphTurn extends CallDiagnostics {
+    ttftKnown?: boolean;
     index: number;
     model: string;
     debugName: string;
@@ -55,6 +61,7 @@ export interface GraphTurn {
 }
 
 export interface GraphSubagent {
+    tokensKnown?: boolean;
     sessionId: string;
     title?: string;
     inProgress: boolean;
@@ -71,6 +78,7 @@ export interface GraphSubagent {
 }
 
 export interface GraphToolCall {
+    status?: string;
     name: string;
     displayLabel: string;
     durationMs: number;
@@ -96,6 +104,10 @@ export interface CommandEntry {
 }
 
 export interface SessionStats {
+    tokensKnown?: boolean;
+    durationKnown?: boolean;
+    hookDurationMs?: number;
+    usageNotes?: string[];
     sessionId: string;
     title?: string;
     totalCostAic: number;
@@ -170,6 +182,7 @@ export class SessionGraph {
             const s = this.summary;
             const totalCost = s.totalNanoAiu / 1_000_000_000;
             this._stats = {
+                usageNotes: s.usageNotes,
                 sessionId: s.sessionId,
                 title: s.title,
                 totalCostAic: totalCost,
@@ -178,6 +191,7 @@ export class SessionGraph {
                 totalCachedTokens: s.totalCachedTokens,
                 totalTokens: s.totalTokens,
                 totalDurationMs: s.totalDurationMs,
+                tokensKnown: s.tokensKnown, durationKnown: s.durationKnown, hookDurationMs: s.hookDurationMs,
                 messageCount: s.userMessages.length,
                 modelTurnCount: s.modelTurnCount,
                 toolCallCount: this.countSummaryToolCalls(s),
@@ -264,10 +278,16 @@ export class SessionGraph {
 
         const s = this.stats;
         lines.push(`# Session: ${s.title || s.sessionId}`);
-        lines.push(`Cost: ${s.totalCostAic.toFixed(2)} AIC | Tokens: ${formatNumber(s.totalTokens)} (in:${formatNumber(s.totalInputTokens)} out:${formatNumber(s.totalOutputTokens)} cache:${formatNumber(s.totalCachedTokens)})`);
-        lines.push(`Messages: ${s.messageCount} | Turns: ${s.modelTurnCount} | Tool Calls: ${s.toolCallCount} | LLM Time: ${formatDuration(s.totalDurationMs)}`);
+        lines.push(`Cost: ${s.totalCostAic.toFixed(2)} AIC | Tokens: ${formatRecordedTokens(s.totalTokens, s.tokensKnown)} (in:${formatRecordedTokens(s.totalInputTokens, s.tokensKnown)} out:${formatRecordedTokens(s.totalOutputTokens, s.tokensKnown)} cache:${formatRecordedTokens(s.totalCachedTokens, s.tokensKnown)})`);
+        for (const note of s.usageNotes ?? []) { lines.push(`Usage note: ${note}`); }
+        lines.push(`Messages: ${s.messageCount} | Turns: ${s.modelTurnCount} | Tool Calls: ${s.toolCallCount} | LLM Time: ${s.durationKnown === false ? (s.totalDurationMs ? formatDuration(s.totalDurationMs) + ' recorded' : 'Not saved') : formatDuration(s.totalDurationMs)}`);
         lines.push(`Cache Hit: ${(s.cacheHitRatio * 100).toFixed(1)}% | Avg Cost/Message: ${s.avgCostPerMessage.toFixed(1)} AIC`);
         lines.push('');
+        for (const m of this.summary.modelSelections ?? []) { lines.push(`Selected model: ${m.model}, ${m.reasoningEffort ?? 'effort not saved'}, ${m.contextTier ?? 'context tier not saved'} (${m.source})`); }
+        for (const r of this.summary.routing ?? []) { lines.push(`Routing ${new Date(r.timestamp).toISOString()}: Fusion${r.tier ? ` (${r.tier})` : ''} -> ${r.chosenModel ?? 'not saved'}; ${r.reason ?? 'reason not saved'}; candidates ${r.candidates.join(', ')}; scores ${JSON.stringify(r.scores ?? {})}; latency ${r.latencyMs ?? 'not saved'} ms`); }
+        for (const a of this.summary.agents ?? []) { lines.push(`Subagent ${a.name} [${a.id}]: ${a.type ?? 'type not saved'}, ${a.model ?? 'model not saved'}, selection ${a.modelSelectionSource ?? 'not saved'}, elapsed ${a.durationMs === undefined ? 'not saved' : formatDuration(a.durationMs)}; ${a.toolCalls ?? 'unknown'} reported tools; ${a.tokens ?? 'unknown'} reported tokens. Included in parent totals.`); }
+        const checks = this.summary.permissionChecks ?? [];
+        if (checks.length) { lines.push(`Permission checks: ${checks.length} attempts, ${checks.filter(c=>c.retry).length} retries, ${checks.filter(c=>c.failed).length} failures. Diagnostic tokens and timing only; not additional billing.`); for (const c of checks) { lines.push(`  ${c.model}: ${c.failed ? 'failed' : 'completed'}, ${c.durationMs === undefined ? 'time not saved' : formatDuration(c.durationMs)}, ${c.listedFree ? 'listed free' : 'cost not recorded here'}; input ${c.inputTokens ?? 'not saved'}, output ${c.outputTokens ?? 'not saved'}, cache read ${c.cachedTokens ?? 'not saved'}, cache write ${c.cacheWriteTokens ?? 'not saved'}`); } }
 
         // Tool usage
         const tools = this.getToolsByUsage();
@@ -326,7 +346,22 @@ export class SessionGraph {
     private serializeTurn(turn: GraphTurn, indent: string, opts: ResolvedSerializeOptions, subagentDepth: number): string[] {
         const lines: string[] = [];
         const tools = turn.toolCalls.map(tc => this.formatToolCallLabel(tc)).join(', ');
-        lines.push(`${indent}Turn ${turn.index + 1}: ${turn.debugName} | ${turn.costAic.toFixed(1)} AIC | ${tools || 'response'}`);
+        const label = turn.usageKind === 'saved' || turn.usageKind === 'adjustment' ? 'Saved usage' : turn.usageKind === 'call' ? `Call ${turn.index + 1}` : `Turn ${turn.index + 1}`;
+        lines.push(`${indent}${label}: ${turn.usageKind ? turn.model : turn.debugName} | ${turn.costAic.toFixed(4)} AIC | ${tools || 'response'}`);
+        lines.push(`${indent}  Input ${formatRecordedTokens(turn.inputTokens, turn.tokensKnown)}; output ${formatRecordedTokens(turn.outputTokens, turn.tokensKnown)}; cache read ${formatRecordedTokens(turn.cachedTokens, turn.tokensKnown)}; cache write ${turn.cacheWriteTokens ?? 'not saved'}; duration ${turn.durationKnown === false ? 'not saved' : formatDuration(turn.durationMs)}; TTFT ${turn.ttftKnown === false ? 'not saved' : formatDuration(turn.ttftMs)}`);
+        const diagnostics: string[] = [];
+        if (turn.isAuto !== undefined) { diagnostics.push(`Auto ${turn.isAuto}`); }
+        if (turn.cachePreviouslyExpired) { diagnostics.push('previous cache expired before call'); }
+        if (turn.agentId) { diagnostics.push(`subagent ${turn.agentId}`); }
+        if (turn.maxPromptTokens) { diagnostics.push(`context ${formatRecordedTokens(turn.inputTokens, turn.tokensKnown)}/${turn.maxPromptTokens}`); }
+        if (turn.reasoningTokens !== undefined) { diagnostics.push(`reasoning ${turn.reasoningTokens} tokens (${turn.reasoningEffort ?? 'effort not saved'})`); }
+        if (turn.finishReason) { diagnostics.push(`finish ${turn.finishReason}`); }
+        if (turn.toolTokenCount !== undefined) { diagnostics.push(`tool definitions ${turn.toolTokenCount} tokens`); }
+        if (turn.cacheExpiresAt) { diagnostics.push(`cache expires ${turn.cacheExpiresAt}`); }
+        if (diagnostics.length) { lines.push(`${indent}  ${diagnostics.join('; ')}`); }
+        for (const detail of turn.tokenDetails ?? []) {
+            if (typeof detail.costPerBatch === 'number' && (detail.batchSize ?? 0) > 0) { lines.push(`${indent}  ${detail.tokenType}: ${detail.tokenCount} tokens, ${detail.tokenCount * detail.costPerBatch / detail.batchSize! / 1e9} AIC`); }
+        }
 
         if (!opts.includeSubagents) {
             return lines;
@@ -347,7 +382,7 @@ export class SessionGraph {
         const status = sub.inProgress ? 'in progress' : 'complete';
         const label = tc.displayLabel.replace(/^Subagent:\s*/i, '') || tc.displayLabel;
         const lines = [
-            `${indent}Subagent: ${label} [${status} | ${sub.costAic.toFixed(2)} AIC | tokens in:${formatNumber(sub.inputTokens)} out:${formatNumber(sub.outputTokens)} cache:${formatNumber(sub.cachedTokens)} | ${sub.messageCount} messages | ${sub.modelTurnCount} turns | ${sub.toolCallCount} tool calls]`,
+            `${indent}Subagent: ${label} [${status} | ${sub.costAic.toFixed(2)} AIC | tokens in:${formatRecordedTokens(sub.inputTokens, sub.tokensKnown)} out:${formatRecordedTokens(sub.outputTokens, sub.tokensKnown)} cache:${formatRecordedTokens(sub.cachedTokens, sub.tokensKnown)} | ${sub.messageCount} messages | ${sub.modelTurnCount} turns | ${sub.toolCallCount} tool calls]`,
         ];
 
         const messages = sub.messages.slice(0, opts.maxSubagentMessages);
@@ -366,6 +401,7 @@ export class SessionGraph {
 
     private formatToolCallLabel(tc: GraphToolCall): string {
         let label = tc.toolKind ? `${tc.displayLabel} [${tc.toolKind}]` : tc.displayLabel;
+        if (tc.status === 'interrupted' || tc.status === 'pending') { label += tc.status === 'interrupted' ? ' [interrupted]' : ' [completion not recorded]'; }
         if (tc.subagentInProgress) {
             label += ' [in progress]';
         } else if (tc.isSubagent && tc.subagentCostAic !== undefined) {
@@ -385,7 +421,8 @@ export class SessionGraph {
             cachedTokens: m.totalCachedTokens,
             totalTokens: m.totalTokens,
             durationMs: m.totalDurationMs,
-            turnCount: m.modelTurns.length,
+            tokensKnown: m.tokensKnown, durationKnown: m.durationKnown, contextKnown: m.contextKnown,
+            turnCount: m.modelTurns.filter(t => !t.usageKind || t.usageKind === 'call').length,
             toolCallCount: this.countMessageToolCalls(m),
             continuations: m.mergedMessages.length,
             turns: m.modelTurns.map((t, i) => this.buildGraphTurn(t, i, subagentDepth)),
@@ -404,6 +441,13 @@ export class SessionGraph {
             freshTokens: t.freshTokens,
             cacheHitRatio: t.cacheHitRatio,
             durationMs: t.durationMs,
+            isAuto: t.isAuto, provider: t.provider, cachePreviouslyExpired: t.cachePreviouslyExpired,
+            modelDisplayName: t.modelDisplayName, responseModel: t.responseModel, contextTier: t.contextTier, isByok: t.isByok, initiator: t.initiator,
+            tokensKnown: t.tokensKnown, usageKind: t.usageKind, durationKnown: t.durationKnown, ttftKnown: t.ttftKnown,
+            contextKnown: t.contextKnown, cacheWriteTokens: t.cacheWriteTokens, tokenDetails: t.tokenDetails,
+            cacheExpiresAt: t.cacheExpiresAt, reasoningTokens: t.reasoningTokens, reasoningEffort: t.reasoningEffort,
+            finishReason: t.finishReason, interTokenLatencyMs: t.interTokenLatencyMs, maxPromptTokens: t.maxPromptTokens,
+            toolTokenCount: t.toolTokenCount, availableToolCount: t.availableToolCount, premiumRequests: t.premiumRequests, agentId: t.agentId,
             ttftMs: t.ttftMs,
             toolCalls: t.toolCalls.map(tc => this.buildGraphToolCall(tc, subagentDepth)),
         };
@@ -414,6 +458,7 @@ export class SessionGraph {
             name: tc.name,
             displayLabel: tc.displayLabel.slice(0, 80),
             durationMs: tc.durationMs,
+            status: tc.status,
             isSubagent: tc.isSubagent,
             source: tc.source,
             toolKind: tc.toolKind,
@@ -433,7 +478,7 @@ export class SessionGraph {
         return {
             sessionId: summary.sessionId,
             title: summary.title,
-            inProgress: summary.inProgress || false,
+            tokensKnown: summary.tokensKnown, inProgress: summary.inProgress || false,
             costAic: summary.totalNanoAiu / 1_000_000_000,
             inputTokens: summary.totalInputTokens,
             outputTokens: summary.totalOutputTokens,

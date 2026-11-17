@@ -592,7 +592,8 @@ test('parseChatSessionLog - parses credit details but ignores multiplier details
     assertEqual(result.sourceType, 'chatSession', 'source type');
     assertEqual(result.modelTurnCount, 2, 'two model turns');
     assertEqual(result.totalNanoAiu, 2300000000, 'only credit details become AIC');
-    assertEqual(result.totalTokens, 165, 'token totals still parse');
+    assertEqual(result.totalTokens, 15, 'context input is excluded from consumption totals');
+    assert(result.usageNotes.some(note => note.includes('context-window')), 'context-only input is explained');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -783,7 +784,7 @@ test('computeSpendSummaryFromChatSessionDirs - ignores stale parser-version cent
     assertEqual(summary.today.nanoAiu, 5000000000, 'stale cache cost ignored');
     assertEqual(summary.today.inputTokens, 50, 'stale cache input tokens ignored');
     assertEqual(summary.today.outputTokens, 5, 'stale cache output tokens ignored');
-    assertEqual(JSON.parse(fs.readFileSync(cacheFile, 'utf-8')).version, 4, 'cache rewritten with current parser version');
+    assertEqual(JSON.parse(fs.readFileSync(cacheFile, 'utf-8')).version, 11, 'cache rewritten with current parser version');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

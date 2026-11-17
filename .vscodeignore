@@ -10,3 +10,6 @@ tsconfig.json
 **/.DS_Store
 images/usage-screenshot.png
 node_modules/**/.cache/**
+docs/validation/**
+docs/**
+scripts/**

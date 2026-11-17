@@ -3,7 +3,7 @@
   "publisher": "ailmind",
   "displayName": "GitHub Copilot Chat Usage",
   "description": "Analyze token usage and costs from GitHub Copilot Chat debug logs",
-  "version": "0.6.0",
+  "version": "0.8.5",
   "license": "MIT",
   "icon": "images/ailmind-icon-128.png",
   "homepage": "https://ailmind.com",
@@ -109,14 +109,18 @@
         "id": "copilot-usage-tracker.usage",
         "fullName": "Usage Analyzer",
         "name": "usage",
-        "description": "Analyze Copilot chat session data — costs, tool calls, commands, patterns. Ask about any session.",
+        "description": "Analyze Copilot chat session data \u2014 costs, tool calls, commands, patterns. Ask about any session.",
         "isSticky": false
       }
     ],
     "languageModelTools": [
       {
         "name": "usage-search-sessions",
-        "tags": ["copilot", "usage", "sessions"],
+        "tags": [
+          "copilot",
+          "usage",
+          "sessions"
+        ],
         "toolReferenceName": "searchSessions",
         "displayName": "Search Chat Sessions",
         "modelDescription": "Search recent Copilot Chat sessions by keyword (supports multiple words as OR match). Always returns the last 2 days of sessions as a safety net alongside search results. Use this FIRST before usage-get-graph unless the user explicitly says 'this session' or 'the current one'. Returns session IDs you can pass to usage-get-graph.",
@@ -125,7 +129,7 @@
           "properties": {
             "query": {
               "type": "string",
-              "description": "Keywords to match against session titles (space-separated, OR match — any word matching counts). Like a wildcard search."
+              "description": "Keywords to match against session titles (space-separated, OR match \u2014 any word matching counts). Like a wildcard search."
             },
             "daysBack": {
               "type": "number",
@@ -140,7 +144,11 @@
       },
       {
         "name": "usage-get-graph",
-        "tags": ["copilot", "usage", "analysis"],
+        "tags": [
+          "copilot",
+          "usage",
+          "analysis"
+        ],
         "toolReferenceName": "getGraph",
         "displayName": "Get Session Graph",
         "modelDescription": "Get the full data graph for a Copilot Chat session. Returns stats, messages, tool calls, nested subagent messages/turns, commands, and costs. Omit sessionId only when the user says 'this session' or 'the loaded one'. Otherwise call usage-search-sessions first to get the correct session ID. Analyze the returned data for risks, patterns, waste, repeated terminal commands, and tool usage.",
@@ -188,7 +196,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc --watch -p ./",
-    "test": "npm run compile && node test/parser.test.js",
+    "audit:coverage": "npm run compile && node scripts/audit-coverage.cjs",
+    "test": "npm run compile && node test/parser.test.js && node --test test/sources.test.js test/performance.test.js test/refresh.test.js test/background-detail.test.js test/workspace-model.test.js",
     "package": "vsce package"
   },
   "devDependencies": {
